@@ -5,11 +5,35 @@ using TvAIrPlugin;
 
 namespace AIrhythm.BasicPlugin;
 
-public sealed class BasicAnalysisPlugin : IAnalysisPlugin, IUiPlugin
+public sealed class BasicAnalysisPlugin : IAnalysisPlugin, IUiPlugin, IManifestPlugin
 {
+    private const string ProductVersion = "1.0.1";
     private IPluginContext? _context;
     public string Name => "AI-rhythm";
-    public string Version => "1.0.0";
+    public string Version => ProductVersion;
+
+    public PluginManifest Manifest { get; } = new()
+    {
+        Id = "airhythm.basic",
+        Name = "AI-rhythm",
+        Version = ProductVersion,
+        Route = "airhythm",
+        DefaultRoute = "airhythm",
+        Entry = "AIrhythm.BasicPlugin.BasicAnalysisPlugin",
+        Description = "予約・番組表分析プラグイン",
+        Vendor = "AI-rhythm Plugin Team",
+        HostContractVersion = TvAIrPluginSdkContract.HostContractVersion,
+        SdkVersion = TvAIrPluginSdkContract.SdkVersion,
+        MinimumSupportedHostContractVersion = TvAIrPluginSdkContract.MinimumSupportedHostContractVersion,
+        Capabilities = new[] { "ShowUi", "OpenPage", "ReadEpg", "ReadReservations" },
+        Tags = new[] { "official", "analysis", "page" },
+        PreferredOpenMode = "page",
+        DefaultMenuActionKind = "page",
+        DefaultMenuActionLabel = "AI-rhythm",
+        DefaultMenuActionPriority = 300,
+        Kind = new[] { "Analysis", "UI" },
+        Permissions = new[] { PluginPermission.ShowUi, PluginPermission.OpenPage, PluginPermission.ReadEpg, PluginPermission.ReadReservations }
+    };
 
     public PluginUiDescriptor Ui { get; } = new()
     {
@@ -199,7 +223,7 @@ public sealed class BasicAnalysisPlugin : IAnalysisPlugin, IUiPlugin
 <main class="air-dashboard">
   <div class="air-top">
     <div class="air-brand">
-      <div class="air-brand-row"><h1 class="air-title">AI-rhythm</h1><span class="air-version">v1.0.0</span></div>
+      <div class="air-brand-row"><h1 class="air-title">AI-rhythm</h1><span class="air-version">v1.0.1</span></div>
       <div class="air-sub">番組表からおすすめを表示します</div>
     </div>
     <div class="air-sync"><div class="air-sync-ring">{syncScore}</div><div><div class="air-sync-label">状態</div><div class="air-sync-text">{(syncScore >= 50 ? "良好" : "確認中")}</div></div></div>

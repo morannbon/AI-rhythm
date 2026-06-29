@@ -1,4 +1,4 @@
-AI-rhythm v1.0.0 README
+AI-rhythm v1.0.1 README
 
 ■プラグイン名
 
@@ -55,11 +55,11 @@ TvAIr\Plugins\AIrhythm.BasicPlugin.ini
 
 ■バージョン
 
-v1.0.0
+v1.0.1
 
 ■リリース日
 
-2026年6月22日 バージョン1.0.0リリース
+2026年6月28日 バージョン1.0.1リリース
 
 ■ライセンス
 

@@ -2,6 +2,6 @@ AI-rhythm third-party notices
 
 TvAIr Plugin SDK
 
-This repository includes TvAIr plugin SDK files under SDK/TvAIrPlugin for building the AI-rhythm plugin.
-The TvAIr plugin SDK files are governed by the distribution terms and license of TvAIr.
+This repository includes TvAIr Plugin SDK 1.0.0 source files under SDK/TvAIrPlugin for building the AI-rhythm plugin.
+The TvAIr Plugin SDK files are governed by the distribution terms and license of TvAIr.
 The MIT License in this repository applies to the AI-rhythm plugin source code, not to TvAIr itself or TvAIr SDK files unless separately permitted by their owner.

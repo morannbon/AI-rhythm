@@ -76,7 +76,7 @@ public enum PluginLogLevel { Debug, Info, Warning, Error }
 
 public enum PluginPermission
 {
-    // v0.10.22: 既存値の順序は互換性維持のため変更しない。新権限は末尾に追加する。
+    // 既存値の順序は互換性維持のため変更しない。新権限は末尾に追加する。
     ReadEpg,
     ReadReservations,
     WriteReservations,
@@ -107,25 +107,25 @@ public enum PluginPermission
     ControlWake,
     ShowNotifications,
 
-    // v0.10.23 読み取りAPI拡張。既存値を壊さず末尾に追加する。
+    // 読み取りAPI拡張。既存値を壊さず末尾に追加する。
     ReadSystemStatus,
     ReadEpgStatus,
     ReadKeywordRules,
     ReadProgramRules,
     ReadRecordingQuality,
 
-    // v0.10.39 番組表投影API。既存値を壊さず末尾に追加する。
+    // 番組表投影API。既存値を壊さず末尾に追加する。
     ReadProgramGuideProjection,
     ReadViewerSessions,
 
-    // v0.10.75 ViewerControl/API投影拡張。既存値を壊さず末尾に追加する。
+    // ViewerControl/API投影拡張。既存値を壊さず末尾に追加する。
     ReadViewerTuners,
     ReadViewerControlContracts,
 
-    // v0.11.16 リリース前API面の明文化。TVTestヘッダ由来の概念をTvAIr抽象契約として読むための権限。
+    // リリース前API面の明文化。TVTestヘッダ由来の概念をTvAIr抽象契約として読むための権限。
     ReadHostContracts,
 
-    // v0.11.315: 汎用Plugin Host Contract。新規プラグインはkindだけでなくcapability/permissionで明示する。
+    // 汎用Plugin Host Contract。新規プラグインはkindだけでなくcapability/permissionで明示する。
     OpenPage,
     OpenToolWindow,
     UseActionApi,
@@ -146,30 +146,32 @@ public sealed class PluginManifest
     public string Route { get; set; } = string.Empty;
     public string Entry { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
-    /// <summary>v0.11.315: 配布元/作者名。権限判定ではなく表示・監査用。</summary>
+    /// <summary>配布元/作者名。権限判定ではなく表示・監査用。</summary>
     public string Vendor { get; set; } = string.Empty;
-    /// <summary>v0.11.315: プラグインが前提にするTvAIr Plugin Host Contract。例: 0.11.315。</summary>
+    /// <summary>プラグインが前提にするTvAIr Plugin Host Contract。例: plugin-host-foundation。</summary>
     public string HostContractVersion { get; set; } = string.Empty;
-    /// <summary>v0.11.315: kindとは別の機能宣言。新規拡張はここに追加し、kind固定にしない。</summary>
+    public string SdkVersion { get; set; } = string.Empty;
+    public string MinimumSupportedHostContractVersion { get; set; } = string.Empty;
+    /// <summary>kindとは別の機能宣言。新規拡張はここに追加し、kind固定にしない。</summary>
     public IReadOnlyList<string> Capabilities { get; set; } = Array.Empty<string>();
-    /// <summary>v0.11.315: 汎用manifestの任意タグ。TvAIr本体は未知タグを拒否しない。</summary>
+    /// <summary>汎用manifestの任意タグ。TvAIr本体は未知タグを拒否しない。</summary>
     public IReadOnlyList<string> Tags { get; set; } = Array.Empty<string>();
-    /// <summary>v0.11.15: host-managed tool window の Form.Icon 用 .ico 名。HTML表示用assetとは別契約。</summary>
+    /// <summary>host-managed tool window の Form.Icon 用 .ico 名。HTML表示用assetとは別契約。</summary>
     public string Icon { get; set; } = string.Empty;
 
-    /// <summary>v0.10.75: プラグイン一覧から直接開く推奨モード。page / toolWindow / browser。</summary>
+    /// <summary>プラグイン一覧から直接開く推奨モード。page / toolWindow / browser。</summary>
     public string PreferredOpenMode { get; set; } = string.Empty;
     public string DefaultRoute { get; set; } = string.Empty;
     public int ToolWindowWidth { get; set; } = 620;
     public int ToolWindowHeight { get; set; } = 760;
-    /// <summary>v0.11.58: host-managed tool window の最小幅。fallback menu 経路でも本体が強制する。</summary>
+    /// <summary>host-managed tool window の最小幅。fallback menu 経路でも本体が強制する。</summary>
     public int ToolWindowMinWidth { get; set; } = 0;
-    /// <summary>v0.11.58: host-managed tool window の最小高。fallback menu 経路でも本体が強制する。</summary>
+    /// <summary>host-managed tool window の最小高。fallback menu 経路でも本体が強制する。</summary>
     public int ToolWindowMinHeight { get; set; } = 0;
     public bool ToolWindowReuseExisting { get; set; } = true;
     public bool ToolWindowActivateExisting { get; set; } = true;
 
-    /// <summary>v0.11.30: ハンバーガー/タスクトレイ共通プラグインメニューで実行する既定アクション。toolWindow / page / settings / versionDialog / statusDialog / none。</summary>
+    /// <summary>ハンバーガー/タスクトレイ共通プラグインメニューで実行する既定アクション。toolWindow / page / settings / versionDialog / statusDialog / none。</summary>
     public string DefaultMenuActionKind { get; set; } = string.Empty;
     public string DefaultMenuActionLabel { get; set; } = string.Empty;
     public int DefaultMenuActionPriority { get; set; } = 1000;
@@ -187,7 +189,7 @@ public interface IManifestPlugin : ITvAIrPlugin
 
 
 /// <summary>
-/// v0.10.22以降の拡張API方針。IPluginContext本体は破壊的変更せず、
+/// 以降の拡張API方針。IPluginContext本体は破壊的変更せず、
 /// 新機能は追加インターフェースとして提供する。
 /// </summary>
 public interface IPluginExtendedContextV1 : IPluginContext
@@ -284,7 +286,7 @@ public sealed class PluginViewerOperationResult
 
 
 /// <summary>
-/// v0.10.23: Phase 2 読み取りAPI拡張。
+/// Phase 2 読み取りAPI拡張。
 /// IPluginContext/IPluginExtendedContextV1は破壊せず、読み取り専用の追加契約として提供する。
 /// ローカルパスやOS操作は返さず、TvAIrが安全に正規化した情報だけを渡す。
 /// </summary>
@@ -300,7 +302,7 @@ public interface IPluginReadContextV2 : IPluginExtendedContextV1
 }
 
 /// <summary>
-/// v0.10.39: 本体番組表投影API。
+/// 本体番組表投影API。
 /// GetChannels の独自ソートとは切り離し、TvAIr本体番組表が使うチャンネル投影順をそのまま公開する。
 /// AIrCon等の視聴UIは局順・Now/Next・視聴状態を推定せず、この契約を正とする。
 /// </summary>
@@ -313,20 +315,20 @@ public interface IPluginReadContextV3 : IPluginReadContextV2
 }
 
 /// <summary>
-/// v0.10.75: ViewerControl/常駐視聴パネル向け。本体完成済みモジュールの公式投影API。
+/// ViewerControl/常駐視聴パネル向け。本体完成済みモジュールの公式投影API。
 /// 番組表フィルタ分類、視聴用チューナー候補、行イベント契約をプラグイン側推定なしで使う。
 /// </summary>
 public interface IPluginReadContextV4 : IPluginReadContextV3
 {
     IReadOnlyList<PluginViewerTunerInfo> GetViewerTuners(PluginViewerTunerQuery? query = null);
-    /// <summary>v0.10.88: ViewerControl局行用の公式identity投影。viewerStart用tripletはこのAPIを正とする。</summary>
+    /// <summary>ViewerControl局行用の公式identity投影。viewerStart用tripletはこのAPIを正とする。</summary>
     IReadOnlyList<PluginViewerControlChannelInfo> GetViewerControlChannels(PluginProgramGuideChannelQuery? query = null);
     IReadOnlyList<PluginProgramGuideWaveFilterInfo> GetProgramGuideWaveFilters();
     PluginViewerControlHostContract GetViewerControlHostContract();
 }
 
 /// <summary>
-/// v0.11.16: リリース前のプラグインAPI面確認契約。
+/// リリース前のプラグインAPI面確認契約。
 /// TVTestPlugin.h の概念をそのまま生の MESSAGE_* ブリッジとして公開せず、
 /// TvAIr本体が安全に抽象化したホスト能力・公開/非公開境界だけを返す。
 /// </summary>
@@ -337,8 +339,8 @@ public interface IPluginReadContextV5 : IPluginReadContextV4
 
 public sealed class PluginHostContractInfo
 {
-    public string ContractVersion { get; set; } = "0.11.315";
-    public string Source { get; set; } = "TvAIrPluginHostContract";
+    public string ContractVersion { get; set; } = TvAIrPluginSdkContract.HostContractVersion;
+    public string Source { get; set; } = "TvAIrPlugin";
     public string Purpose { get; set; } = "generic_plugin_host_contract";
     public IReadOnlyList<string> StableReadContracts { get; set; } = Array.Empty<string>();
     public IReadOnlyList<string> ControlledActionContracts { get; set; } = Array.Empty<string>();
@@ -355,7 +357,7 @@ public sealed class PluginHostContractInfo
 
 public sealed class PluginTvTestHeaderReferenceInfo
 {
-    public string SourceHeader { get; set; } = "TVTestPlugin.h ver.0.0.15-pre";
+    public string SourceHeader { get; set; } = string.Empty;
     public IReadOnlyList<string> AdoptedConcepts { get; set; } = Array.Empty<string>();
     public IReadOnlyList<string> IntentionallyNotMirrored { get; set; } = Array.Empty<string>();
     public string Reason { get; set; } = string.Empty;
@@ -365,7 +367,7 @@ public sealed class PluginTvTestHeaderReferenceInfo
 public sealed class PluginProgramGuideQuery
 {
     public string? DisplayGroup { get; set; }
-    /// <summary>v0.10.75: 番組表の放送波フィルタ分類。DisplayGroup互換だが、番組表ボタンの公式投影名。</summary>
+    /// <summary>番組表の放送波フィルタ分類。DisplayGroup互換だが、番組表ボタンの公式投影名。</summary>
     public string? ProgramGuideFilterGroup { get; set; }
     public string? AllocationGroup { get; set; }
     public bool IncludeNowNext { get; set; } = true;
@@ -375,7 +377,7 @@ public sealed class PluginProgramGuideQuery
 public class PluginProgramGuideChannelQuery
 {
     public string? DisplayGroup { get; set; }
-    /// <summary>v0.10.75: 番組表の放送波フィルタ分類。DisplayGroup互換だが、番組表ボタンの公式投影名。</summary>
+    /// <summary>番組表の放送波フィルタ分類。DisplayGroup互換だが、番組表ボタンの公式投影名。</summary>
     public string? ProgramGuideFilterGroup { get; set; }
     public string? AllocationGroup { get; set; }
     public ushort? NetworkId { get; set; }
@@ -392,7 +394,7 @@ public sealed class PluginProgramGuideNowNextQuery : PluginProgramGuideChannelQu
 public sealed class PluginViewerSessionQuery
 {
     public string? DisplayGroup { get; set; }
-    /// <summary>v0.10.75: 番組表の放送波フィルタ分類。DisplayGroup互換だが、番組表ボタンの公式投影名。</summary>
+    /// <summary>番組表の放送波フィルタ分類。DisplayGroup互換だが、番組表ボタンの公式投影名。</summary>
     public string? ProgramGuideFilterGroup { get; set; }
     public string? AllocationGroup { get; set; }
     public string? ClientId { get; set; }
@@ -410,7 +412,7 @@ public sealed class PluginProgramGuideChannel
 {
     public int ProgramGuideOrder { get; set; }
     public string DisplayGroup { get; set; } = string.Empty; // GR / BS / CS
-    /// <summary>v0.10.75: 番組表放送波フィルタボタンの分類をそのまま投影する公式field。</summary>
+    /// <summary>番組表放送波フィルタボタンの分類をそのまま投影する公式field。</summary>
     public string ProgramGuideFilterGroup { get; set; } = string.Empty; // GR / BS / CS
     public string ProgramGuideFilterKey { get; set; } = string.Empty;
     public string ProgramGuideFilterLabel { get; set; } = string.Empty;
@@ -423,11 +425,11 @@ public sealed class PluginProgramGuideChannel
     public ushort NetworkId { get; set; }
     public ushort TransportStreamId { get; set; }
     public ushort ServiceId { get; set; }
-    /// <summary>v0.10.88: NetworkId互換alias。公式fieldはNetworkId。</summary>
+    /// <summary>NetworkId互換alias。公式fieldはNetworkId。</summary>
     public ushort Nid { get; set; }
-    /// <summary>v0.10.88: TransportStreamId互換alias。公式fieldはTransportStreamId。</summary>
+    /// <summary>TransportStreamId互換alias。公式fieldはTransportStreamId。</summary>
     public ushort Tsid { get; set; }
-    /// <summary>v0.10.88: ServiceId互換alias。公式fieldはServiceId。</summary>
+    /// <summary>ServiceId互換alias。公式fieldはServiceId。</summary>
     public ushort Sid { get; set; }
     public int ChannelSpace { get; set; }
     public int ChannelIndex { get; set; }
@@ -482,7 +484,7 @@ public sealed class PluginViewerSessionInfo
 
 
 /// <summary>
-/// v0.10.88: ViewerControl局行用の公式identity投影。
+/// ViewerControl局行用の公式identity投影。
 /// AIrCon等は viewerStart safe event payload をこの投影から生成する。
 /// </summary>
 public sealed class PluginViewerControlChannelInfo
@@ -536,7 +538,7 @@ public sealed class PluginViewerTunerInfo
     public string BonDriverFileName { get; set; } = string.Empty;
     public string CurrentLeaseId { get; set; } = string.Empty;
 
-    // v0.10.88: Viewer availability projection for expected-denied handling.
+    // Viewer availability projection for expected-denied handling.
     // External TVTest occupation is surfaced as data, not as a plugin action error.
     public string Availability { get; set; } = string.Empty;
     public string OccupiedBy { get; set; } = string.Empty;
@@ -544,7 +546,7 @@ public sealed class PluginViewerTunerInfo
     public string ExternalBusyReason { get; set; } = string.Empty;
     public string AvailabilityMessage { get; set; } = string.Empty;
 
-    // v0.10.88: Last viewerStart result for tool-window state rendering.
+    // Last viewerStart result for tool-window state rendering.
     public string LastViewerActionState { get; set; } = string.Empty;
     public string LastViewerActionErrorCode { get; set; } = string.Empty;
     public string LastViewerActionMessage { get; set; } = string.Empty;
@@ -774,27 +776,27 @@ public sealed class PluginUiDescriptor
     public string RouteSegment { get; set; } = string.Empty;
     public string MenuText { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
-    /// <summary>v0.11.315: UI単位の任意capability。manifest側Capabilitiesが公式で、ここはUI投影補助。</summary>
+    /// <summary>UI単位の任意capability。manifest側Capabilitiesが公式で、ここはUI投影補助。</summary>
     public IReadOnlyList<string> Capabilities { get; set; } = Array.Empty<string>();
     public string Icon { get; set; } = string.Empty;
     public int DisplayOrder { get; set; } = 1000;
     public bool Enabled { get; set; } = true;
-    /// <summary>v0.10.75: plugin一覧カードの既定起動モード。空なら通常ページ。</summary>
+    /// <summary>plugin一覧カードの既定起動モード。空なら通常ページ。</summary>
     public string PreferredOpenMode { get; set; } = string.Empty;
 
-    /// <summary>v0.11.30: ハンバーガー/タスクトレイ共通プラグインメニューで実行する既定アクション。toolWindow / page / settings / versionDialog / statusDialog / none。</summary>
+    /// <summary>ハンバーガー/タスクトレイ共通プラグインメニューで実行する既定アクション。toolWindow / page / settings / versionDialog / statusDialog / none。</summary>
     public string DefaultMenuActionKind { get; set; } = string.Empty;
     public string DefaultMenuActionLabel { get; set; } = string.Empty;
     public int DefaultMenuActionPriority { get; set; } = 1000;
     public bool ToolWindowShowInTaskbar { get; set; } = false;
 
-    /// <summary>v0.11.63: host-managed tool window の推奨幅。ハンバーガー/トレイ/openWindow共通入口で参照する。</summary>
+    /// <summary>host-managed tool window の推奨幅。ハンバーガー/トレイ/openWindow共通入口で参照する。</summary>
     public int ToolWindowWidth { get; set; } = 0;
-    /// <summary>v0.11.63: host-managed tool window の推奨高さ。ハンバーガー/トレイ/openWindow共通入口で参照する。</summary>
+    /// <summary>host-managed tool window の推奨高さ。ハンバーガー/トレイ/openWindow共通入口で参照する。</summary>
     public int ToolWindowHeight { get; set; } = 0;
-    /// <summary>v0.11.63: host-managed tool window の最小幅。プラグイン名に依存せず共通入口で参照する。</summary>
+    /// <summary>host-managed tool window の最小幅。プラグイン名に依存せず共通入口で参照する。</summary>
     public int ToolWindowMinWidth { get; set; } = 0;
-    /// <summary>v0.11.63: host-managed tool window の最小高さ。プラグイン名に依存せず共通入口で参照する。</summary>
+    /// <summary>host-managed tool window の最小高さ。プラグイン名に依存せず共通入口で参照する。</summary>
     public int ToolWindowMinHeight { get; set; } = 0;
 }
 
@@ -810,10 +812,10 @@ public sealed class PluginViewerProfileInfo
     public string TvTestPathKey { get; set; } = string.Empty;
     public string Source { get; set; } = string.Empty;
     public string Note { get; set; } = string.Empty;
-    /// <summary>v0.11.69: 物理チューナー番号ではなく、放送波を跨いだTVTest枠番号。0は後方互換入力のみ。</summary>
+    /// <summary>物理チューナー番号ではなく、放送波を跨いだTVTest枠番号。0は後方互換入力のみ。</summary>
     public int TvTestFrameIndex { get; set; }
 
-    /// <summary>v0.11.72: このTVTest枠で選局可能な放送波。例: GR,BSCS。UIは本体projectionに従う。</summary>
+    /// <summary>このTVTest枠で選局可能な放送波。例: GR,BSCS。UIは本体projectionに従う。</summary>
     public string AvailableGroups { get; set; } = string.Empty;
 }
 
@@ -825,31 +827,31 @@ public sealed class PluginUiContext
     /// <summary>UIプラグインがボタン/ダブルクリック等を本体へ返すための正式Action endpoint。互換名。</summary>
     public string ActionEndpoint { get; set; } = string.Empty;
 
-    /// <summary>UIプラグインがフォーム/FetchでPOSTする本体Action route。v0.10.32の正式名。</summary>
+    /// <summary>UIプラグインがフォーム/FetchでPOSTする本体Action route。の正式名。</summary>
     public string ActionRoute { get; set; } = string.Empty;
 
-    /// <summary>v0.10.32互換名。AIrCon等が明示的にPlugin action routeとして検出するための別名。</summary>
+    /// <summary>互換名。AIrCon等が明示的にPlugin action routeとして検出するための別名。</summary>
     public string PluginActionRoute { get; set; } = string.Empty;
 
-    /// <summary>v0.10.32互換名。ActionEndpointと同値のPlugin action endpoint別名。</summary>
+    /// <summary>互換名。ActionEndpointと同値のPlugin action endpoint別名。</summary>
     public string PluginActionEndpoint { get; set; } = string.Empty;
 
     /// <summary>Action routeへ送信するHTTP method。標準はPOST。</summary>
     public string ActionMethod { get; set; } = "POST";
 
-    /// <summary>v0.10.32互換名。ActionMethodと同値のPlugin action method別名。</summary>
+    /// <summary>互換名。ActionMethodと同値のPlugin action method別名。</summary>
     public string PluginActionMethod { get; set; } = "POST";
 
     /// <summary>このUIで本体が受け付ける代表Action名。プラグイン側の出し分け用。</summary>
     public IReadOnlyList<string> SupportedActions { get; set; } = Array.Empty<string>();
 
-    /// <summary>v0.10.32互換名。SupportedActionsと同値のPlugin action一覧別名。</summary>
+    /// <summary>互換名。SupportedActionsと同値のPlugin action一覧別名。</summary>
     public IReadOnlyList<string> PluginSupportedActions { get; set; } = Array.Empty<string>();
 
     /// <summary>RenderHtmlごとに発行される短寿命トークン。プラグインHTMLからAction endpointへ同送する。</summary>
     public string ActionToken { get; set; } = string.Empty;
 
-    /// <summary>v0.10.32互換名。ActionTokenと同値のPlugin action token別名。</summary>
+    /// <summary>互換名。ActionTokenと同値のPlugin action token別名。</summary>
     public string PluginActionToken { get; set; } = string.Empty;
 
     /// <summary>本体が認識しているPlugin ID。manifest Idがあればそれを優先し、なければUI routeを使う。</summary>
@@ -858,108 +860,108 @@ public sealed class PluginUiContext
     /// <summary>現在表示中のプラグインroute。ログ・Action検証用。</summary>
     public string RouteSegment { get; set; } = string.Empty;
 
-    /// <summary>v0.10.32: HTML/JS側が名称揺れなく参照できるAction contract値。</summary>
+    /// <summary>HTML/JS側が名称揺れなく参照できるAction contract値。</summary>
     public IReadOnlyDictionary<string, string> ActionContract { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>v0.10.35: UIプラグインが本体管理の独立/フロートWindowを要求するための正式route。</summary>
+    /// <summary>UIプラグインが本体管理の独立/フロートWindowを要求するための正式route。</summary>
     public string WindowRoute { get; set; } = string.Empty;
 
-    /// <summary>v0.10.41: WindowRoute互換名。本体管理Window要求のendpoint。</summary>
+    /// <summary>WindowRoute互換名。本体管理Window要求のendpoint。</summary>
     public string WindowEndpoint { get; set; } = string.Empty;
 
-    /// <summary>v0.10.41: host-managed window state polling endpoint template。{windowId}を実WindowIdへ置換する。</summary>
+    /// <summary>host-managed window state polling endpoint template。{windowId}を実WindowIdへ置換する。</summary>
     public string WindowStateEndpointTemplate { get; set; } = string.Empty;
 
-    /// <summary>v0.10.41: host-managed window iframe内RenderHtmlで設定される現在WindowId。</summary>
+    /// <summary>host-managed window iframe内RenderHtmlで設定される現在WindowId。</summary>
     public string CurrentWindowId { get; set; } = string.Empty;
 
-    /// <summary>v0.10.41: CurrentWindowId互換名。HTML/JS側で名称揺れなく参照するための別名。</summary>
+    /// <summary>CurrentWindowId互換名。HTML/JS側で名称揺れなく参照するための別名。</summary>
     public string WindowId { get; set; } = string.Empty;
 
-    /// <summary>v0.10.41: host-managed window iframe内RenderHtmlでtrue。通常/plugin表示ではfalse。</summary>
+    /// <summary>host-managed window iframe内RenderHtmlでtrue。通常/plugin表示ではfalse。</summary>
     public bool IsHostManagedWindowContent { get; set; }
 
-    /// <summary>v0.10.41: 現在Windowのstate endpoint。CurrentWindowIdがある場合のみ設定される。</summary>
+    /// <summary>現在Windowのstate endpoint。CurrentWindowIdがある場合のみ設定される。</summary>
     public string CurrentWindowStateEndpoint { get; set; } = string.Empty;
 
-    /// <summary>v0.11.11: C# RenderHtml から直接読める現在Window stateの絶対URL。</summary>
+    /// <summary>C# RenderHtml から直接読める現在Window stateの絶対URL。</summary>
     public string CurrentWindowStateUrl { get; set; } = string.Empty;
 
-    /// <summary>v0.10.41: 現在Windowのhost URL。CurrentWindowIdがある場合のみ設定される。</summary>
+    /// <summary>現在Windowのhost URL。CurrentWindowIdがある場合のみ設定される。</summary>
     public string CurrentWindowUrl { get; set; } = string.Empty;
 
-    /// <summary>v0.11.11: C# RenderHtml から参照できる現在Window host URLの絶対URL。</summary>
+    /// <summary>C# RenderHtml から参照できる現在Window host URLの絶対URL。</summary>
     public string CurrentWindowAbsoluteUrl { get; set; } = string.Empty;
 
-    /// <summary>v0.11.13: RenderHtml中にHTTP自己呼び出しせず参照できる現在WindowのalwaysOnTop状態。</summary>
+    /// <summary>RenderHtml中にHTTP自己呼び出しせず参照できる現在WindowのalwaysOnTop状態。</summary>
     public bool CurrentWindowAlwaysOnTop { get; set; }
 
-    /// <summary>v0.11.13: RenderHtml中にHTTP自己呼び出しせず参照できる現在Windowのrevision。</summary>
+    /// <summary>RenderHtml中にHTTP自己呼び出しせず参照できる現在Windowのrevision。</summary>
     public int CurrentWindowRevision { get; set; }
 
-    /// <summary>v0.11.13: RenderHtml中にHTTP自己呼び出しせず参照できる現在Windowのhost alive状態。</summary>
+    /// <summary>RenderHtml中にHTTP自己呼び出しせず参照できる現在Windowのhost alive状態。</summary>
     public bool CurrentWindowHostAlive { get; set; }
 
-    /// <summary>v0.10.35: Window要求HTTP method。標準はPOST。</summary>
+    /// <summary>Window要求HTTP method。標準はPOST。</summary>
     public string WindowMethod { get; set; } = "POST";
 
-    /// <summary>v0.10.35: Window要求に同送する短寿命token。ActionTokenと同一レンダリング単位で発行される。</summary>
+    /// <summary>Window要求に同送する短寿命token。ActionTokenと同一レンダリング単位で発行される。</summary>
     public string WindowToken { get; set; } = string.Empty;
 
-    /// <summary>v0.10.35: 本体が受け付けるWindow action一覧。</summary>
+    /// <summary>本体が受け付けるWindow action一覧。</summary>
     public IReadOnlyList<string> SupportedWindowActions { get; set; } = Array.Empty<string>();
 
-    /// <summary>v0.10.35: HTML/JS側が名称揺れなく参照できるWindow contract値。</summary>
+    /// <summary>HTML/JS側が名称揺れなく参照できるWindow contract値。</summary>
     public IReadOnlyDictionary<string, string> WindowContract { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>v0.10.68: TvAIr本体管理Plugin Tool Window hostの能力。WebView2有無、fallback、reuse/state/close同期対応をプラグインが判断するための契約。</summary>
+    /// <summary>TvAIr本体管理Plugin Tool Window hostの能力。WebView2有無、fallback、reuse/state/close同期対応をプラグインが判断するための契約。</summary>
     public IReadOnlyDictionary<string, string> ToolWindowCapabilities { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>v0.10.75: ViewerControl mode向け。no-script制約下で本体が安全に扱う行イベント/視聴操作契約。</summary>
+    /// <summary>ViewerControl mode向け。no-script制約下で本体が安全に扱う行イベント/視聴操作契約。</summary>
     public IReadOnlyDictionary<string, string> ViewerControlActionContract { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
 
-    /// <summary>v0.11.69: TvAIr本体がViewing role構成からTVTest枠単位で動的生成したviewer profile一覧。/api/plugins/viewer-profilesと同一projection。</summary>
+    /// <summary>TvAIr本体がViewing role構成からTVTest枠単位で動的生成したviewer profile一覧。/api/plugins/viewer-profilesと同一projection。</summary>
     public IReadOnlyList<PluginViewerProfileInfo> ViewerProfiles { get; set; } = Array.Empty<PluginViewerProfileInfo>();
 
-    /// <summary>v0.11.69: UIで選択可能なviewer profile一覧。autoを含み、selector可視判定と同一projection。</summary>
+    /// <summary>UIで選択可能なviewer profile一覧。autoを含み、selector可視判定と同一projection。</summary>
     public IReadOnlyList<PluginViewerProfileInfo> SelectableViewerProfiles { get; set; } = Array.Empty<PluginViewerProfileInfo>();
 
-    /// <summary>v0.11.69: 既定viewer profile。通常はauto。</summary>
+    /// <summary>既定viewer profile。通常はauto。</summary>
     public string DefaultViewerProfile { get; set; } = "auto";
 
-    /// <summary>v0.11.69: auto以外の有効TVTest枠profile数。</summary>
+    /// <summary>auto以外の有効TVTest枠profile数。</summary>
     public int EnabledRealViewerProfileCount { get; set; }
 
-    /// <summary>v0.11.69: viewer profile selectorを表示すべきかの本体推奨。</summary>
+    /// <summary>viewer profile selectorを表示すべきかの本体推奨。</summary>
     public bool SelectorVisibleRecommended { get; set; }
 
-    /// <summary>v0.11.69: SelectorVisibleRecommendedの明示alias。</summary>
+    /// <summary>SelectorVisibleRecommendedの明示alias。</summary>
     public bool ViewerProfileSelectorVisibleRecommended { get; set; }
 
-    /// <summary>v0.11.69: selector非表示でも最大構成基準の最小幅を維持すべきか。</summary>
+    /// <summary>selector非表示でも最大構成基準の最小幅を維持すべきか。</summary>
     public bool MinWidthInvariantRequired { get; set; } = true;
 
-    /// <summary>v0.10.97: RenderHtmlを呼び出した現在のHTTP request path。通常ページ/host-managed tool window directContent共通。</summary>
+    /// <summary>RenderHtmlを呼び出した現在のHTTP request path。通常ページ/host-managed tool window directContent共通。</summary>
     public string CurrentRequestPath { get; set; } = string.Empty;
 
-    /// <summary>v0.10.97: RenderHtmlを呼び出した現在のHTTP query string。先頭の?を含む。queryなしは空文字。</summary>
+    /// <summary>RenderHtmlを呼び出した現在のHTTP query string。先頭の?を含む。queryなしは空文字。</summary>
     public string CurrentRequestQueryString { get; set; } = string.Empty;
 
-    /// <summary>v0.10.97: CurrentRequestPath + CurrentRequestQueryString。</summary>
+    /// <summary>CurrentRequestPath + CurrentRequestQueryString。</summary>
     public string CurrentRequestPathAndQuery { get; set; } = string.Empty;
 
-    /// <summary>v0.10.97: RenderHtml呼び出し時のquery key/value。wave等のUIフィルタ契約用。</summary>
+    /// <summary>RenderHtml呼び出し時のquery key/value。wave等のUIフィルタ契約用。</summary>
     public IReadOnlyDictionary<string, string> CurrentRequestQuery { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
 
-    /// <summary>v0.10.99: RenderHtml内で同梱小型画像等を参照するための同一オリジンasset base URL。例: /plugin-assets/aircon。</summary>
+    /// <summary>RenderHtml内で同梱小型画像等を参照するための同一オリジンasset base URL。例: /plugin-assets/aircon。</summary>
     public string PluginAssetBaseUrl { get; set; } = string.Empty;
 
-    /// <summary>v0.10.99: asset配信の詳細契約。許可拡張子、URL形式、sanitizer制約など。</summary>
+    /// <summary>asset配信の詳細契約。許可拡張子、URL形式、sanitizer制約など。</summary>
     public IReadOnlyDictionary<string, string> PluginAssetContract { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>v0.10.99: plugin asset URLを安全に組み立てる。assetNameはファイル名のみを想定し、TvAIr本体側のasset endpointへ解決する。</summary>
+    /// <summary>plugin asset URLを安全に組み立てる。assetNameはファイル名のみを想定し、TvAIr本体側のasset endpointへ解決する。</summary>
     public string ResolveAssetUrl(string assetName)
     {
         if (string.IsNullOrWhiteSpace(assetName) || string.IsNullOrWhiteSpace(PluginAssetBaseUrl)) return string.Empty;
@@ -970,7 +972,7 @@ public sealed class PluginUiContext
 }
 
 /// <summary>
-/// v0.10.32: UIプラグインからTvAIr本体へ安全な操作要求を返すためのAction契約。
+/// UIプラグインからTvAIr本体へ安全な操作要求を返すためのAction契約。
 /// プラグインはTVTest起動・DID決定・BonDriver決定を行わず、希望する操作と局IDだけを渡す。
 /// </summary>
 public sealed class PluginActionRequest
@@ -982,22 +984,22 @@ public sealed class PluginActionRequest
     public string ActionToken { get; set; } = string.Empty;
     public string Token { get; set; } = string.Empty;
 
-    /// <summary>v0.10.42: form POSTでJSON画面へ遷移しないための応答モード。json / refreshWindow / html / noContent。</summary>
+    /// <summary>form POSTでJSON画面へ遷移しないための応答モード。json / refreshWindow / html / noContent。</summary>
     public string ResponseMode { get; set; } = "json";
 
-    /// <summary>v0.10.42: responseMode=refreshWindow時に再描画するhost-managed window。</summary>
+    /// <summary>responseMode=refreshWindow時に再描画するhost-managed window。</summary>
     public string WindowId { get; set; } = string.Empty;
 
-    /// <summary>v0.10.42: responseMode=refreshWindow時の更新対象。標準はcontent。</summary>
+    /// <summary>responseMode=refreshWindow時の更新対象。標準はcontent。</summary>
     public string RefreshTarget { get; set; } = "content";
 
-    /// <summary>v0.10.42: responseMode=refreshWindow時にスクロール位置維持を要求する。</summary>
+    /// <summary>responseMode=refreshWindow時にスクロール位置維持を要求する。</summary>
     public bool PreserveScroll { get; set; } = true;
 
-    /// <summary>v0.11.27: host-managed tool window再描画後に可視化したい要素ID。CSS selectorではなくidのみ。</summary>
+    /// <summary>host-managed tool window再描画後に可視化したい要素ID。CSS selectorではなくidのみ。</summary>
     public string RefreshScrollTarget { get; set; } = string.Empty;
 
-    /// <summary>v0.11.27: refreshScrollTargetのスクロール方法。center / nearest / top。</summary>
+    /// <summary>refreshScrollTargetのスクロール方法。center / nearest / top。</summary>
     public string RefreshScrollMode { get; set; } = "center";
 }
 
@@ -1010,7 +1012,7 @@ public sealed class PluginActionResult
 
 /// <summary>
 /// 将来、プラグイン自身が本体からのActionを受ける場合の拡張点。
-/// v0.10.32では本体host dispatchを主系とし、このinterfaceはSDK上の契約名公開に留める。
+/// 本体host dispatchを主系とし、このinterfaceはSDK上の契約名公開に留める。
 /// </summary>
 public interface IUiActionPlugin
 {
@@ -1019,7 +1021,7 @@ public interface IUiActionPlugin
 
 
 /// <summary>
-/// v0.10.35: UIプラグインがTvAIr本体管理の独立/フロートWindowを要求するためのWindow契約。
+/// UIプラグインがTvAIr本体管理の独立/フロートWindowを要求するためのWindow契約。
 /// プラグインは外部プロセスや独自WebViewを直接起動せず、本体へWindow意図だけを渡す。
 /// </summary>
 public sealed class PluginWindowRequest
@@ -1041,27 +1043,27 @@ public sealed class PluginWindowRequest
     public string Target { get; set; } = "content";
     public bool PreserveScroll { get; set; } = true;
 
-    /// <summary>v0.11.27: refreshAfter/refreshWindow後にhost側で可視化したい要素ID。CSS selectorではなくidのみ。</summary>
+    /// <summary>refreshAfter/refreshWindow後にhost側で可視化したい要素ID。CSS selectorではなくidのみ。</summary>
     public string RefreshScrollTarget { get; set; } = string.Empty;
 
-    /// <summary>v0.11.27: refreshScrollTargetのスクロール方法。center / nearest / top。</summary>
+    /// <summary>refreshScrollTargetのスクロール方法。center / nearest / top。</summary>
     public string RefreshScrollMode { get; set; } = "center";
 
     public bool ForceReload { get; set; } = true;
 
-    /// <summary>v0.11.15: updateWindow成功後に同一host-managed windowのcontent再描画を本体へ要求する限定契約。</summary>
+    /// <summary>updateWindow成功後に同一host-managed windowのcontent再描画を本体へ要求する限定契約。</summary>
     public bool RefreshAfter { get; set; } = false;
 
-    /// <summary>v0.10.60: 同一 pluginId + routeSegment の既存ツールウィンドウを再利用する。</summary>
+    /// <summary>同一 pluginId + routeSegment の既存ツールウィンドウを再利用する。</summary>
     public bool ReuseExisting { get; set; } = false;
 
-    /// <summary>v0.10.60: 既存ツールウィンドウ再利用時に前面化する。</summary>
+    /// <summary>既存ツールウィンドウ再利用時に前面化する。</summary>
     public bool ActivateExisting { get; set; } = false;
 
-    /// <summary>v0.10.68: form POSTでJSON/白紙画面へ遷移しないための応答モード。json / redirect / redirectBack / hostHandled / toolWindow / toolWindowRedirectBack / hostWindow / html / noContent。</summary>
+    /// <summary>form POSTでJSON/白紙画面へ遷移しないための応答モード。json / redirect / redirectBack / hostHandled / toolWindow / toolWindowRedirectBack / hostWindow / html / noContent。</summary>
     public string ResponseMode { get; set; } = "json";
 
-    /// <summary>v0.10.68: responseMode=toolWindow後にPOST元画面へ戻すための相対URL。未指定時はRefererまたは /plugin/{routeSegment}。</summary>
+    /// <summary>responseMode=toolWindow後にPOST元画面へ戻すための相対URL。未指定時はRefererまたは /plugin/{routeSegment}。</summary>
     public string ReturnUrl { get; set; } = string.Empty;
 
     public Dictionary<string, string> Payload { get; set; } = new(StringComparer.OrdinalIgnoreCase);
@@ -1085,7 +1087,7 @@ public sealed class PluginWindowResult
     public int Revision { get; set; }
 }
 
-/// <summary>v0.10.68: /api/plugins/window/capabilities の応答契約。プラグインはtoolWindowを使うかredirect互換に落とすか判断できる。</summary>
+/// <summary>/api/plugins/window/capabilities の応答契約。プラグインはtoolWindowを使うかredirect互換に落とすか判断できる。</summary>
 public sealed class PluginToolWindowHostCapabilities
 {
     public bool Success { get; set; }
@@ -1113,7 +1115,7 @@ public sealed class PluginToolWindowHostCapabilities
     public IReadOnlyList<string> OpenWindowModes { get; set; } = Array.Empty<string>();
 }
 
-/// <summary>v0.10.68: /plugin-window/{windowId}/state の拡張応答契約。</summary>
+/// <summary>/plugin-window/{windowId}/state の拡張応答契約。</summary>
 public sealed class PluginWindowStateInfo
 {
     public bool Success { get; set; }
@@ -1154,7 +1156,7 @@ public sealed class PluginWindowStateInfo
 
 /// <summary>
 /// 将来、プラグイン自身が本体Window要求を処理する場合の拡張点。
-/// v0.10.35では本体host-managed window contractを主系とし、このinterfaceはSDK上の契約名公開に留める。
+/// 本体host-managed window contractを主系とし、このinterfaceはSDK上の契約名公開に留める。
 /// </summary>
 public interface IPluginWindowPlugin
 {

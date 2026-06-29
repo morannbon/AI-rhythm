@@ -2,5 +2,11 @@
   <PropertyGroup>
     <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)_obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
     <BaseOutputPath>$(MSBuildThisFileDirectory)_bin\$(MSBuildProjectName)\</BaseOutputPath>
+    <TvAIrPluginSdkVersion>1.0.0</TvAIrPluginSdkVersion>
+    <TvAIrPluginSdkAssemblyVersion>1.0.0.0</TvAIrPluginSdkAssemblyVersion>
+    <TvAIrPluginHostContractVersion>1.0.0</TvAIrPluginHostContractVersion>
+    <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
+    <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
+    <TvAIrLegacyPluginMajor>0</TvAIrLegacyPluginMajor>
   </PropertyGroup>
 </Project>

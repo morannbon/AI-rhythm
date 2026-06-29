@@ -4,27 +4,18 @@
 *.suo
 *.userosscache
 *.sln.docstates
-*.rsuser
 
 # Build outputs
 bin/
 obj/
 _bin/
 _obj/
-deploy/
 
-# NuGet and packages
+# Packages and temporary files
 *.nupkg
 *.snupkg
-packages/
-
-# Logs and test outputs
 *.log
 TestResults/
-
-# OS/editor files
-.DS_Store
-Thumbs.db
 
 # AI-rhythm local settings
 AIrhythm.BasicPlugin.ini
