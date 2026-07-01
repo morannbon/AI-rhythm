@@ -6,7 +6,6 @@
     <TvAIrPluginSdkAssemblyVersion>1.0.0.0</TvAIrPluginSdkAssemblyVersion>
     <TvAIrPluginHostContractVersion>1.0.0</TvAIrPluginHostContractVersion>
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
-    <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
     <TvAIrLegacyPluginMajor>0</TvAIrLegacyPluginMajor>
   </PropertyGroup>
 </Project>

@@ -151,7 +151,6 @@ public sealed class PluginManifest
     /// <summary>プラグインが前提にするTvAIr Plugin Host Contract。例: plugin-host-foundation。</summary>
     public string HostContractVersion { get; set; } = string.Empty;
     public string SdkVersion { get; set; } = string.Empty;
-    public string MinimumSupportedHostContractVersion { get; set; } = string.Empty;
     /// <summary>kindとは別の機能宣言。新規拡張はここに追加し、kind固定にしない。</summary>
     public IReadOnlyList<string> Capabilities { get; set; } = Array.Empty<string>();
     /// <summary>汎用manifestの任意タグ。TvAIr本体は未知タグを拒否しない。</summary>

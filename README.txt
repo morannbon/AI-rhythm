@@ -1,4 +1,4 @@
-AI-rhythm v1.0.1 README
+AI-rhythm v1.0.2 README
 
 ■プラグイン名
 
@@ -55,11 +55,19 @@ TvAIr\Plugins\AIrhythm.BasicPlugin.ini
 
 ■バージョン
 
-v1.0.1
+v1.0.2
 
 ■リリース日
 
-2026年6月28日 バージョン1.0.1リリース
+2026年7月1日 バージョン1.0.2リリース
+
+■リリースノート
+
+v1.0.2
+
+TvAIr本体同梱のTvAIrPlugin契約に合わせ、AI-rhythm側SDK参照とmanifest生成を調整しました。
+README.md、README.txt、画面表示、DLLメタデータのバージョン表記をv1.0.2に統一しました。
+インストール手順はDLLのみ必須の構成を維持しています。
 
 ■ライセンス
 

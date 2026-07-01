@@ -7,7 +7,7 @@ namespace AIrhythm.BasicPlugin;
 
 public sealed class BasicAnalysisPlugin : IAnalysisPlugin, IUiPlugin, IManifestPlugin
 {
-    private const string ProductVersion = "1.0.1";
+    private const string ProductVersion = "1.0.2";
     private IPluginContext? _context;
     public string Name => "AI-rhythm";
     public string Version => ProductVersion;
@@ -24,7 +24,6 @@ public sealed class BasicAnalysisPlugin : IAnalysisPlugin, IUiPlugin, IManifestP
         Vendor = "AI-rhythm Plugin Team",
         HostContractVersion = TvAIrPluginSdkContract.HostContractVersion,
         SdkVersion = TvAIrPluginSdkContract.SdkVersion,
-        MinimumSupportedHostContractVersion = TvAIrPluginSdkContract.MinimumSupportedHostContractVersion,
         Capabilities = new[] { "ShowUi", "OpenPage", "ReadEpg", "ReadReservations" },
         Tags = new[] { "official", "analysis", "page" },
         PreferredOpenMode = "page",
@@ -223,7 +222,7 @@ public sealed class BasicAnalysisPlugin : IAnalysisPlugin, IUiPlugin, IManifestP
 <main class="air-dashboard">
   <div class="air-top">
     <div class="air-brand">
-      <div class="air-brand-row"><h1 class="air-title">AI-rhythm</h1><span class="air-version">v1.0.1</span></div>
+      <div class="air-brand-row"><h1 class="air-title">AI-rhythm</h1><span class="air-version">v1.0.2</span></div>
       <div class="air-sub">番組表からおすすめを表示します</div>
     </div>
     <div class="air-sync"><div class="air-sync-ring">{syncScore}</div><div><div class="air-sync-label">状態</div><div class="air-sync-text">{(syncScore >= 50 ? "良好" : "確認中")}</div></div></div>

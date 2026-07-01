@@ -8,10 +8,10 @@
     <Platforms>AnyCPU;x64</Platforms>
     <RootNamespace>AIrhythm.BasicPlugin</RootNamespace>
     <AssemblyName>AIrhythm.BasicPlugin</AssemblyName>
-    <Version>1.0.1</Version>
-    <FileVersion>1.0.1.0</FileVersion>
-    <AssemblyVersion>1.0.1.0</AssemblyVersion>
-    <InformationalVersion>1.0.1</InformationalVersion>
+    <Version>1.0.2</Version>
+    <FileVersion>1.0.2.0</FileVersion>
+    <AssemblyVersion>1.0.2.0</AssemblyVersion>
+    <InformationalVersion>1.0.2</InformationalVersion>
     <OutputType>Library</OutputType>
   </PropertyGroup>
 
