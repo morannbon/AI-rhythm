@@ -3,5 +3,6 @@ AI-rhythm リリースノート
 ■v1.0.2
 
 TvAIr本体同梱のTvAIrPlugin契約に合わせ、AI-rhythm側SDK参照とmanifest生成を調整しました。
-README.md、README.txt、画面表示、DLLメタデータのバージョン表記をv1.0.2に統一しました。
+GitHub clone後にVisual Studio 2022でそのままビルドできる構成へ整理しました。
+buildフォルダ依存を撤去し、相対ProjectReferenceとplugin.json正本を維持する構成にしました。
 インストール手順はDLLのみ必須の構成を維持しています。

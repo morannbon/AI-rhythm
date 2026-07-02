@@ -1,0 +1,42 @@
+{
+  "id": "airhythm.basic",
+  "name": "AI-rhythm",
+  "version": "1.0.2",
+  "route": "airhythm",
+  "entry": "AIrhythm.BasicPlugin.BasicAnalysisPlugin",
+  "description": "TvAIrの番組表情報をもとにおすすめ候補と推薦理由を表示します。",
+  "vendor": "AI-rhythm Plugin Team",
+  "hostContractVersion": "1.0.0",
+  "sdkVersion": "1.0.0",
+  "capabilities": [
+    "ShowUi",
+    "OpenPage",
+    "ReadEpg",
+    "ReadReservations"
+  ],
+  "tags": [
+    "official",
+    "analysis",
+    "page"
+  ],
+  "preferredOpenMode": "page",
+  "defaultRoute": "airhythm",
+  "defaultMenuActionKind": "page",
+  "defaultMenuActionLabel": "AI-rhythm",
+  "defaultMenuActionPriority": 300,
+  "kind": [
+    "Analysis",
+    "UI"
+  ],
+  "permissions": [
+    "ShowUi",
+    "OpenPage",
+    "ReadEpg",
+    "ReadReservations"
+  ],
+  "ui": {
+    "mode": "page",
+    "route": "airhythm",
+    "label": "AI-rhythm"
+  }
+}

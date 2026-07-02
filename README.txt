@@ -10,6 +10,10 @@ AI-rhythmはTvAIrの番組表情報をもとにおすすめ候補と推薦理由
 
 ニックネーム、優先キーワード、除外キーワードなどの軽量設定に対応しています。
 
+■動作に必要なTvAIr
+
+TvAIr 1.0.8以降
+
 ■インストール方法
 
 Visual Studio 2022で以下のソリューションを開きます。
@@ -19,7 +23,8 @@ AIrhythm.BasicPlugin.sln
 構成をRelease x64にしてビルドします。
 ビルド後、以下のDLLをTvAIrのPluginsフォルダへコピーします。
 
-_bin\AIrhythm.BasicPlugin\Release\net8.0-windows\AIrhythm.BasicPlugin.dll
+AIrhythm.BasicPluginind\Release
+et8.0-windows\AIrhythm.BasicPlugin.dll
 
 TvAIr側の配置先は以下です。
 
@@ -41,7 +46,14 @@ TvAIr\Plugins\AIrhythm.BasicPlugin.ini
 
 Visual Studio 2022でRelease x64ビルドを行った場合、主な出力ファイルは以下に生成されます。
 
-_bin\AIrhythm.BasicPlugin\Release\net8.0-windows\AIrhythm.BasicPlugin.dll
+AIrhythm.BasicPluginind\Release
+et8.0-windows\AIrhythm.BasicPlugin.dll
+
+GitHub公開用のmanifest正本は以下に同梱しています。
+
+AIrhythm.BasicPlugin\plugin.json
+
+通常のインストールで必須なのはDLLです。
 
 ■TvAIrのプラグインパス
 
@@ -66,7 +78,8 @@ v1.0.2
 v1.0.2
 
 TvAIr本体同梱のTvAIrPlugin契約に合わせ、AI-rhythm側SDK参照とmanifest生成を調整しました。
-README.md、README.txt、画面表示、DLLメタデータのバージョン表記をv1.0.2に統一しました。
+GitHub clone後にVisual Studio 2022でそのままビルドできる構成へ整理しました。
+buildフォルダ依存を撤去し、相対ProjectReferenceとplugin.json正本を維持する構成にしました。
 インストール手順はDLLのみ必須の構成を維持しています。
 
 ■ライセンス

@@ -8,13 +8,18 @@
 # Build outputs
 bin/
 obj/
-_bin/
-_obj/
 
 # Packages and temporary files
 *.nupkg
 *.snupkg
+*.cache
 *.log
+*.bak
+*.tmp
+*.orig
+*.rej
+*.patch
+*.zip
 TestResults/
 
 # AI-rhythm local settings
