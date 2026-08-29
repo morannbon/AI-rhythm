@@ -1,26 +1,10 @@
-# Visual Studio
+# Visual Studio / .NET build output
 .vs/
+**/bin/
+**/obj/
 *.user
 *.suo
-*.userosscache
-*.sln.docstates
 
-# Build outputs
-bin/
-obj/
-
-# Packages and temporary files
-*.nupkg
-*.snupkg
-*.cache
+# Local development artifacts
 *.log
-*.bak
 *.tmp
-*.orig
-*.rej
-*.patch
-*.zip
-TestResults/
-
-# AI-rhythm local settings
-AIrhythm.BasicPlugin.ini

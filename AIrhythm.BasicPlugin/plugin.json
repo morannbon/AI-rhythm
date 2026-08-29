@@ -1,18 +1,17 @@
 {
   "id": "airhythm.basic",
   "name": "AI-rhythm",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "route": "airhythm",
-  "entry": "AIrhythm.BasicPlugin.BasicAnalysisPlugin",
-  "description": "TvAIrの番組表情報をもとにおすすめ候補と推薦理由を表示します。",
+  "entry": "AIrhythm.BasicPlugin.AIrhythmRuntimePlugin",
+  "description": "TvAIrの番組表、予約、録画実績をもとにおすすめ候補と推薦理由を表示します。",
   "vendor": "AI-rhythm Plugin Team",
-  "hostContractVersion": "1.0.0",
-  "sdkVersion": "1.0.0",
+  "hostContractVersion": "1.1.5",
+  "sdkVersion": "1.1.5",
   "capabilities": [
-    "ShowUi",
-    "OpenPage",
-    "ReadEpg",
-    "ReadReservations"
+    "DataSnapshotRead",
+    "StorageRead",
+    "StorageWrite"
   ],
   "tags": [
     "official",
@@ -31,8 +30,24 @@
   "permissions": [
     "ShowUi",
     "OpenPage",
-    "ReadEpg",
-    "ReadReservations"
+    "UseActionApi",
+    "UseAssetApi",
+    "UseSafeEvent",
+    "ReadTheme",
+    "ReadProgramGuideProjection",
+    "ReadChannels",
+    "ReadReservations",
+    "PreviewAllocation",
+    "WriteReservations",
+    "ReadRecordingHistory",
+    "ReadRecordingStatus",
+    "ReadTunerStatus",
+    "ReadPlaybackProgress",
+    "ReadMediaInsights",
+    "ReadContentDiscovery",
+    "WriteLogs",
+    "ReadPluginStorage",
+    "WritePluginStorage"
   ],
   "ui": {
     "mode": "page",
