@@ -74,3 +74,10 @@ internal static partial class AIrhythmDataState
     }
 }
 #endif
+
+#if !AIRHYTHM_DEVELOPER_DIAGNOSTICS
+internal static partial class AIrhythmDataState
+{
+    internal static void WriteDeveloperLog(string message) { }
+}
+#endif
