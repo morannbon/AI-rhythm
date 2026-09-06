@@ -36,6 +36,7 @@ public interface ITvAirPluginContext
     ITvAirExternalJobsApi ExternalJobs { get; }
     ITvAirHostsApi Hosts { get; }
     ITvAirPluginsApi Plugins { get; }
+    ITvAirExternalLookupApi ExternalLookup { get; }
 }
 
 // Runtime plugin implementations receive ITvAirPluginContext through
@@ -1505,7 +1506,8 @@ public enum TvAirEventType
     ReservationConflictChanged,
     RecordingResultFinalized,
     ViewerSessionChanged,
-    RuntimeWindowLifecycleChanged
+    RuntimeWindowLifecycleChanged,
+    PluginPermissionChanged
 }
 
 /// <summary>共通イベント包絡。追加プロパティは既存プラグインとのバイナリ互換を維持する。</summary>
