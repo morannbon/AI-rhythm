@@ -11,9 +11,10 @@ permissions:
 
 jobs:
   build-and-draft:
-    uses: morannbon/TvAIr-Actions/.github/workflows/reusable-build-release.yml@v1.0.1
+    uses: morannbon/TvAIr-Actions/.github/workflows/reusable-build-release.yml@v1.0.2
     with:
       product_name: AI-rhythm
       solution: AIrhythm.BasicPlugin.sln
       package_script: .github/scripts/package.ps1
       platforms_json: '["x64","x86"]'
+      package_platforms_json: '["x64"]'
