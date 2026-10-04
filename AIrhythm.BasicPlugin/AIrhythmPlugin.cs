@@ -8806,7 +8806,7 @@ internal static partial class AIrhythmRecommendationEngine
 
         // Row 2: the factual all-title ranking is intentionally the left/main card; genre composition is beside it.
         html.Append($"<article class='chart-card dashboard-span-3 total-ranking-card chart-accent-blue'><div class='chart-head'><h3>総合録画 Top10</h3><span>録画本数</span></div>{RankedBars(totalTop10, palette, "録画した番組がまだありません", true, false, totalRecordingCount, 10)}</article>");
-        html.Append($"<article class='chart-card dashboard-span-3 genre-ranking-card chart-accent-green'><div class='chart-head'><h3>よく録画するジャンル Top10</h3><span>本数・割合</span></div>{VerticalBars(genreTop10, palette.Reverse().ToArray(), "ジャンル別の録画情報がまだありません", totalRecordingCount, 10)}</article>");
+        html.Append($"<article class='chart-card dashboard-span-3 genre-ranking-card chart-accent-green'><div class='chart-head'><h3>よく録画するジャンル Top10</h3><span>本数・割合</span></div>{VerticalBars(genreTop10, System.Linq.Enumerable.Reverse(palette).ToArray(), "ジャンル別の録画情報がまだありません", totalRecordingCount, 10)}</article>");
 
         // Rows 3-4: top six genres, three equal cards per row, each with factual title Top10.
         for (var i = 0; i < topGenres.Length; i++)
