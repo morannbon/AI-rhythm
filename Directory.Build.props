@@ -1,14 +1,20 @@
-﻿<Project>
+<Project>
   <PropertyGroup>
-    <TvAIrProductVersion>1.2.1</TvAIrProductVersion>
-    <TvAIrFileVersion>1.2.1.0</TvAIrFileVersion>
-    <TvAIrAssemblyVersion>1.2.1.0</TvAIrAssemblyVersion>
-    <TvAIrPluginSdkVersion>1.1.6</TvAIrPluginSdkVersion>
+    <TvAIrProductVersion>1.2.2</TvAIrProductVersion>
+    <TvAIrFileVersion>1.2.2.0</TvAIrFileVersion>
+    <TvAIrAssemblyVersion>1.2.2.0</TvAIrAssemblyVersion>
+    <TvAIrPluginSdkVersion>1.1.12</TvAIrPluginSdkVersion>
     <TvAIrPluginSdkAssemblyVersion>1.0.0.0</TvAIrPluginSdkAssemblyVersion>
-    <TvAIrPluginHostContractVersion>1.1.6</TvAIrPluginHostContractVersion>
+    <TvAIrPluginHostContractVersion>1.1.12</TvAIrPluginHostContractVersion>
     <TvAIrPublicContractName>release_contract</TvAIrPublicContractName>
     <TvAIrPluginHostContractName>plugin-host-foundation</TvAIrPluginHostContractName>
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
+    <!--
+      Developer diagnostics are controlled by a single compile-time boundary.
+      Diagnostic-only processing is excluded when disabled; product behavior and user-facing operational logs remain unchanged.
+    -->
+    <TvAIrDeveloperDiagnostics>false</TvAIrDeveloperDiagnostics>
+    <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
 </Project>

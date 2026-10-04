@@ -1,21 +1,7 @@
-﻿/* Theme colors are owned by TvAIr and injected on the root element. */
+/* Theme colors are owned by TvAIr and injected on the root element. */
 :root{
   --radius:10px;
   --space:16px;
-  --shadow:0 10px 30px rgba(15,23,42,.08);
-  --hero-a:#2563eb;
-  --hero-b:#7c3aed;
-  --chart-grid:rgba(100,116,139,.18);
-  --on-hero:#fff;
-  --on-hero-soft:rgba(255,255,255,.18);
-  --on-hero-line:rgba(255,255,255,.45);
-  --viz-blue:#5b8ff9;--viz-blue-line:#5b8ff966;--viz-blue-soft:#5b8ff914;
-  --viz-green:#34d399;--viz-green-line:#34d39966;--viz-green-soft:#34d39914;
-  --viz-yellow:#f6bd16;--viz-orange:#f59e0b;--viz-orange-line:#f59e0b88;--viz-orange-soft:#f59e0b18;
-  --viz-amber:#f97316;--viz-purple:#8b5cf6;--viz-cyan:#06b6d4;--viz-red:#ef4444;--viz-red-line:#ef444466;
-  --viz-pink:#ec4899;--viz-blue2:#3b82f6;--viz-green2:#22c55e;--viz-teal:#5ad8a6;
-  --summary-blue:#60a5fa55;--summary-purple:#a78bfa22;--summary-green:#34d39955;--summary-cyan:#22d3ee22;
-  --summary-orange:#f59e0b55;--summary-red:#fb718522;
   font-family:"Segoe UI","Yu Gothic UI",sans-serif
 }
 .airhythm-root,.airhythm-root *{box-sizing:border-box}
@@ -39,7 +25,7 @@ header p{color:var(--muted);margin-top:4px}
 .summary span{color:var(--muted)}
 .panel{margin-top:14px}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:14px}
-.card{border:1px solid var(--line);border-radius:8px;padding:14px;background:linear-gradient(145deg,var(--surface-bg),var(--subtle-bg));color:var(--text);box-shadow:0 5px 16px rgba(15,23,42,.06);transition:transform .16s ease,border-color .16s ease}
+.card{border:1px solid var(--line);border-radius:8px;padding:14px;background:linear-gradient(145deg,var(--surface-bg),var(--subtle-bg));color:var(--text);box-shadow:var(--card-shadow);transition:transform .16s ease,border-color .16s ease}
 .card-top{display:flex;justify-content:space-between;gap:12px;min-width:0}
 .card-top>div{min-width:0;flex:1 1 auto}
 .card-top>.score{flex:0 0 auto}
@@ -138,10 +124,6 @@ header h1,header p{color:var(--on-hero)} header button{background:var(--on-hero-
 
 
 
-/* external information setting */
-.external-lookup-setting{display:block;margin:0;padding:0}
-.external-lookup-copy{min-width:0}.external-lookup-copy strong{display:block;color:var(--text);font-size:13px}.external-lookup-control{display:block;margin-top:7px;text-align:left}.airhythm-root button.external-lookup-toggle{display:block;min-width:72px;font-weight:800}.airhythm-root button.external-lookup-toggle.is-on{background:var(--selected-bg);color:var(--selected-text);border-color:var(--selected-border)}.external-lookup-status{display:block;margin:5px 0 0;color:var(--muted);font-size:11px;line-height:1.4}
-@media(max-width:640px){.external-lookup-control{margin-top:7px}}
 
 /* settings actions */
 .airhythm-root button.learning-reset{background:var(--danger-bg);color:var(--danger-text);border-color:var(--danger-border)}
@@ -167,7 +149,6 @@ header h1,header p{color:var(--on-hero)} header button{background:var(--on-hero-
 .settings-section{display:block;box-sizing:border-box;width:auto;max-width:100%;margin:8px 0 0;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--subtle-bg)}
 .recommendation-settings-section{width:520px}
 .learning-data-section{width:250px}
-.external-info-section{width:360px}
 .data-protection-section{width:410px}
 .settings-section-head{display:block;margin:0 0 8px}
 .settings-section-head>strong{display:block;margin:0;font-size:15px;line-height:1.4;color:var(--text)}
@@ -182,16 +163,15 @@ header h1,header p{color:var(--on-hero)} header button{background:var(--on-hero-
 .data-maintenance-actions button+button{margin-left:7px}
 .complete-reset-action{margin-top:9px;padding-top:9px;border-top:1px solid var(--line)}
 @media(max-width:640px){
-  .settings-section,.recommendation-settings-section,.learning-data-section,.external-info-section,.data-protection-section{width:100%}
+  .settings-section,.recommendation-settings-section,.learning-data-section,.data-protection-section{width:100%}
   .settings-actions,.data-maintenance-actions{display:block}
   .settings-actions button,.data-maintenance-actions button,.complete-reset-action button,.learning-data-section button{box-sizing:border-box;width:100%;margin-left:0}
   .settings-actions button+button,.data-maintenance-actions button+button{margin-top:7px}
 }
 
-/* Program title overflow reveal.
-   The outer title element is the stable hover owner and keeps the release-baseline
-   dimensions. Only the pointer-transparent motion layer moves, preventing hover
-   self-invalidation and layout feedback. */
+/* Program title overflow reveal. The outer title remains the stable hover owner;
+   only the pointer-transparent motion layer moves, preventing hover self-invalidation
+   and layout feedback. */
 .airhythm-title-scroll-owner{position:relative;display:block;max-width:100%;overflow:hidden}
 .airhythm-title-scroll-owner>.airhythm-title-static,
 .airhythm-title-scroll-owner>.airhythm-title-motion{
@@ -249,10 +229,9 @@ header h1,header p{color:var(--on-hero)} header button{background:var(--on-hero-
 }
 
 
-/* ExternalLookup visibility follows the diagnostics compilation boundary. */
 .card-actions{gap:8px;flex-wrap:wrap;align-items:center}.reservation-status{font-size:12px;color:var(--muted);margin-right:auto}
 /* Page hierarchy: KPI summary -> recording trends -> discovery -> recommendations.
-   Discovery keeps one shared two-column axis; dashboard rows use the existing shared six-column grid. */
+   Discovery keeps one shared two-column axis; dashboard rows use the shared six-column grid. */
 .analytics{margin-bottom:14px}
 .discovery-primary{margin-top:0}
 .discovery-primary .discovery-hub{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}

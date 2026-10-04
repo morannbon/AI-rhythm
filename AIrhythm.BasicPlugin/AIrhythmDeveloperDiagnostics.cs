@@ -1,4 +1,5 @@
-﻿using TvAIrPlugin;
+using System.Diagnostics;
+using TvAIrPlugin;
 using TvAIrPlugin.Runtime;
 
 namespace AIrhythm.BasicPlugin;
@@ -24,9 +25,10 @@ internal static partial class AIrhythmDataState
             WriteDeveloperLog("external lookup capability result=UNAVAILABLE");
             return;
         }
-        var providers = string.Join(",", capability.Providers.Select(provider =>
-            $"{provider.ProviderId}:[{string.Join("/", provider.Operations)}]"));
-        WriteDeveloperLog($"external lookup capability result=OK declared={capability.PluginDeclaredPermission} hostAllowed={capability.UserAllowed} available={capability.Available} providers={capability.Providers.Count} contracts=[{providers}]");
+        var tvMaze = capability.Providers.FirstOrDefault(provider =>
+            string.Equals(provider.ProviderId, AIrhythmExternalLookupAdapter.TvMazeProviderId, StringComparison.OrdinalIgnoreCase));
+        var operations = tvMaze is null ? string.Empty : string.Join("/", tvMaze.Operations);
+        WriteDeveloperLog($"external lookup capability result=OK declared={capability.PluginDeclaredPermission} hostAllowed={capability.UserAllowed} available={capability.Available} provider=tvmaze providerAvailable={tvMaze is not null} operations=[{operations}] policy=host_network_and_plugin_permission_only");
     }
 
     private static void LogExternalLookupResult(string providerId, string operation, TvAirExternalLookupResultCode code, int evidenceCount, bool localFallback)
@@ -56,6 +58,7 @@ internal static partial class AIrhythmDataState
         catch { }
     }
 
+    [Conditional("AIRHYTHM_DEVELOPER_DIAGNOSTICS")]
     internal static void WriteDeveloperLog(string message)
     {
         ITvAirPluginRuntimeContext? context;
@@ -73,11 +76,10 @@ internal static partial class AIrhythmDataState
         catch { }
     }
 }
-#endif
-
-#if !AIRHYTHM_DEVELOPER_DIAGNOSTICS
+#else
 internal static partial class AIrhythmDataState
 {
+    [Conditional("AIRHYTHM_DEVELOPER_DIAGNOSTICS")]
     internal static void WriteDeveloperLog(string message) { }
 }
 #endif

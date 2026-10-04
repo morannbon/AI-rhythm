@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <Import Project="..\AIrhythm.Version.props" />
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
     <Platforms>x86;x64</Platforms>
     <Prefer32Bit>false</Prefer32Bit>
-    <AIrhythmDeveloperDiagnostics Condition="'$(AIrhythmDeveloperDiagnostics)' == ''">false</AIrhythmDeveloperDiagnostics>
+    <AIrhythmDeveloperDiagnostics>false</AIrhythmDeveloperDiagnostics>
     <RootNamespace>AIrhythm.BasicPlugin</RootNamespace>
     <AssemblyName>AIrhythm.BasicPlugin</AssemblyName>
     <Version>$(AIrhythmVersion)</Version>
