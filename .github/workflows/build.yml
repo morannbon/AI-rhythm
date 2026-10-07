@@ -40,7 +40,7 @@ jobs:
         shell: pwsh
         working-directory: source
         run: |
-          msbuild AIrhythm.BasicPlugin.sln /restore /t:Rebuild /m /nr:false /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:TvAIrDeveloperDiagnostics=false /p:TvAirPluginDeveloperDiagnostics=false /p:AIrConDeveloperDiagnostics=false /p:AIrhythmDeveloperDiagnostics=false /p:CopyLocalLockFileAssemblies=true /warnaserror
+          msbuild AIrhythm.BasicPlugin.sln /restore /t:Rebuild /m /nr:false /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:LangVersion=12.0 /p:TvAIrDeveloperDiagnostics=false /p:TvAirPluginDeveloperDiagnostics=false /p:AIrConDeveloperDiagnostics=false /p:AIrhythmDeveloperDiagnostics=false /p:CopyLocalLockFileAssemblies=true /warnaserror
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed or produced warnings' }
       - name: Prepare binary package
         shell: pwsh
