@@ -11,10 +11,15 @@
     <TvAIrPluginCompatibilityMajor>1</TvAIrPluginCompatibilityMajor>
     <TvAIrMinimumSupportedPluginHostContractVersion>1.0.0</TvAIrMinimumSupportedPluginHostContractVersion>
     <!--
-      Developer diagnostics are controlled by a single compile-time boundary.
-      Diagnostic-only processing is excluded when disabled; product behavior and user-facing operational logs remain unchanged.
+      Developer Diagnostics canonical build boundary:
+      - Development source keeps diagnostics available.
+      - Normal deliverables keep diagnostics enabled (default true).
+      - Only an explicitly requested public-release deliverable sets TvAIrDeveloperDiagnostics=false.
+      - OFF means no developer-log generation/retention/exposure and no diagnostic-only side work.
+      - User operational logs are a separate responsibility and remain enabled.
+      - Do not reintroduce per-log release-time deletion, runtime flags, or a mandatory release-generator workflow.
     -->
-    <TvAIrDeveloperDiagnostics>false</TvAIrDeveloperDiagnostics>
+    <TvAIrDeveloperDiagnostics Condition="'$(TvAIrDeveloperDiagnostics)' == ''">false</TvAIrDeveloperDiagnostics>
     <DefineConstants Condition="'$(TvAIrDeveloperDiagnostics)' == 'true'">$(DefineConstants);TVAIR_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
 </Project>

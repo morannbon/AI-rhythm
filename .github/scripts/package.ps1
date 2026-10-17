@@ -4,7 +4,7 @@ param(
     [string]$SourceRoot='.'
 )
 $ErrorActionPreference='Stop'
-$spec=ConvertFrom-Json '{"Docs":["README.md","README.txt","LICENSE","THIRD_PARTY_NOTICES.txt"],"Version":"1.0.5","Host":"1.2.2","Dll":"AIrhythm.BasicPlugin.dll","Project":"AIrhythm.BasicPlugin","Framework":"net8.0-windows","Solution":"AIrhythm.BasicPlugin.sln","Name":"AI-rhythm"}'
+$spec=ConvertFrom-Json '{"Docs":["README.md","README.txt","LICENSE","THIRD_PARTY_NOTICES.txt"],"Version":"1.0.6","Host":"1.2.12","Dll":"AIrhythm.BasicPlugin.dll","Project":"AIrhythm.BasicPlugin","Framework":"net8.0-windows","Solution":"AIrhythm.BasicPlugin.sln","Name":"AI-rhythm"}'
 $root=(Resolve-Path -LiteralPath $SourceRoot).Path
 [xml]$project=Get-Content -LiteralPath (Join-Path $root "$($spec.Project)/$($spec.Project).csproj")
 if($spec.Name -eq 'AI-rhythm') {

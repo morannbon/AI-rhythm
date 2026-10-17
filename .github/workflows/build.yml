@@ -6,7 +6,7 @@ on:
       source_tag:
         description: Published version tag to build
         required: true
-        default: v1.0.5
+        default: v1.0.6
   push:
     tags:
       - 'v*.*.*'
@@ -54,3 +54,4 @@ jobs:
           name: AI-rhythm-${{ matrix.platform }}-package
           path: package/*.zip
           if-no-files-found: error
+

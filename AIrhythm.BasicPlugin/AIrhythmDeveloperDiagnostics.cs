@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using TvAIrPlugin;
 using TvAIrPlugin.Runtime;
 
@@ -58,7 +57,6 @@ internal static partial class AIrhythmDataState
         catch { }
     }
 
-    [Conditional("AIRHYTHM_DEVELOPER_DIAGNOSTICS")]
     internal static void WriteDeveloperLog(string message)
     {
         ITvAirPluginRuntimeContext? context;
@@ -79,7 +77,6 @@ internal static partial class AIrhythmDataState
 #else
 internal static partial class AIrhythmDataState
 {
-    [Conditional("AIRHYTHM_DEVELOPER_DIAGNOSTICS")]
     internal static void WriteDeveloperLog(string message) { }
 }
 #endif

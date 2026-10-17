@@ -1,4 +1,5 @@
-﻿using System.Globalization;
+﻿using System.Collections.Concurrent;
+using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -857,6 +858,7 @@ internal sealed record AIrhythmExternalLookupTrace(
     TvAirExternalLookupResultCode Code,
     IReadOnlyList<string> CandidateTitles);
 #endif
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
 internal sealed record AIrhythmRuntimeDiagnostics(
     int ProgramRaw,
     int ProgramAccepted,
@@ -867,6 +869,7 @@ internal sealed record AIrhythmRuntimeDiagnostics(
     int ChannelRaw,
     int ChannelAccepted,
     IReadOnlyList<string> FailedStages);
+#endif
 
 internal sealed record AIrhythmAdvancedSnapshot(
     IReadOnlyList<TvAirRecordingSessionDto> ActiveRecordings);
@@ -884,8 +887,11 @@ internal sealed record AIrhythmRuntimeSnapshot(
     IReadOnlyList<TvAirTunerStatusDto> Tuners,
     AIrhythmAdvancedSnapshot Advanced,
     AIrhythmSettings Settings,
-    long? SettingsRevision,
-    AIrhythmRuntimeDiagnostics Diagnostics);
+    long? SettingsRevision
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+    , AIrhythmRuntimeDiagnostics Diagnostics
+#endif
+    );
 internal sealed record AIrhythmSaveResult(bool Success, string Message, bool Changed = true);
 internal sealed record AIrhythmBackupEnvelope(
     int FormatVersion,
@@ -932,7 +938,12 @@ internal sealed record AIrhythmUserModelObservation(
     bool LearnGenre = true,
     bool LearnTerms = true,
     bool LearnService = true,
-    bool LearnHour = true)
+    bool LearnHour = true,
+    double WorkEvidenceWeight = 1.0d,
+    double GenreEvidenceWeight = 1.0d,
+    double TermsEvidenceWeight = 1.0d,
+    double ServiceEvidenceWeight = 1.0d,
+    double HourEvidenceWeight = 1.0d)
 {
     internal bool HasBaseLearningAxis => LearnWork || LearnGenre || LearnTerms || LearnService || LearnHour;
 }
@@ -950,6 +961,13 @@ internal readonly record struct AIrhythmBehaviorEvidenceAxes(
     internal bool HasBaseAxis => Work || Genre || Terms || Service || Hour;
 }
 
+// Audit-only provenance for new weighted observations. Historical aggregate weights are
+// deliberately not reverse-engineered from present-day keyword rules.
+internal sealed record AIrhythmBaseEvidenceLedgerEntry(
+    double Work, double Genre, double Terms, double Service, double Hour,
+    string WorkKey, string GenreKey, string ServiceKey,
+    string[]? TermKeys = null, string HourKey = "");
+
 internal sealed record AIrhythmLearnedUserModelState(
     int SchemaVersion,
     long ObservationCount,
@@ -963,7 +981,14 @@ internal sealed record AIrhythmLearnedUserModelState(
     Dictionary<string, double>? ContributorWeights = null,
     string[]? SeenContributorObservationIds = null,
     int ContributorLogicVersion = 0,
-    int BasePreferenceLogicVersion = 0);
+    int BasePreferenceLogicVersion = 0,
+    Dictionary<string, string>? ContributorFactWorkKeys = null,
+    Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>? BaseEvidenceLedger = null)
+{
+    // Runtime-only baseline for same-candidate Developer comparison. Never serialized.
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Dictionary<string, double>? PreCalibrationContributorWeights { get; init; }
+}
 
 // The recommendation engine keeps the factual local evidence axes separate until the
 // final internal-strength composition. This is intentionally a value type so the hot
@@ -3030,13 +3055,41 @@ internal static partial class AIrhythmRecommendationEngine
 
     internal static AIrhythmEvidenceIdentityContext BuildEvidenceIdentityContext(AIrhythmRuntimeSnapshot snapshot)
     {
-        var numeric = BuildNumericParenthesizedLocalSequenceValuesByService(snapshot.Events);
+        var epgNumeric = BuildNumericParenthesizedLocalSequenceValuesByService(snapshot.Events);
         var numericEvidence = BuildNumericParenthesizedEvidenceValuesByService(snapshot);
+        // The EPG is a moving window. Successful recordings and established reservations are
+        // independent historical corroboration of a same-service episode sequence. Retain
+        // both evidence sets before resolving any Work identity; neither changes the fact count.
+        var numeric = MergeNumericWorkSequenceEvidence(epgNumeric, numericEvidence);
         var aliases = BuildLocalWorkAliases(snapshot, numeric);
         var externalCanonicalTitles = AIrhythmDataState.GetExternalPreEvaluationCanonicalTitles();
         var normalizationPromotions = AIrhythmDataState.GetNormalizationPromotions();
         return new AIrhythmEvidenceIdentityContext(numeric, numericEvidence, aliases, externalCanonicalTitles, normalizationPromotions);
     }
+
+    private static IReadOnlyDictionary<string, int[]> MergeNumericWorkSequenceEvidence(
+        IReadOnlyDictionary<string, int[]> epg,
+        IReadOnlyDictionary<string, int[]> historical)
+    {
+        var result = epg.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in historical)
+        {
+            if (result.TryGetValue(entry.Key, out var previous))
+                result[entry.Key] = previous.Concat(entry.Value).Distinct().OrderBy(x => x).ToArray();
+            else
+                result[entry.Key] = entry.Value;
+        }
+        return result;
+    }
+
+    // Pure title transforms are reused across render snapshots. Manual external-evidence refresh
+    // invalidates the score snapshot, but it must not force the same title-only normalization and
+    // canonical parsing work to allocate again for every EPG row. These caches contain no
+    // reservation/history/provider decision state, so reuse cannot change recommendation semantics.
+    // The soft cap prevents long-running hosts from retaining an unbounded catalogue of old titles.
+    private const int SharedTitleTransformCacheLimit = 24576;
+    private static readonly ConcurrentDictionary<string, string> SharedExternalPreEvaluationTitleKeys = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, string> SharedEvidenceSeriesKeys = new(StringComparer.Ordinal);
 
     private static string PreEvaluationTitle(string? title, AIrhythmEvidenceIdentityContext context)
     {
@@ -3052,10 +3105,21 @@ internal static partial class AIrhythmRecommendationEngine
     }
 
     internal static string ExternalPreEvaluationTitleKey(string? title)
-        => new((title ?? string.Empty).Normalize(NormalizationForm.FormKC)
+    {
+        var source = title ?? string.Empty;
+        if (source.Length == 0)
+            return string.Empty;
+        if (SharedExternalPreEvaluationTitleKeys.TryGetValue(source, out var cached))
+            return cached;
+
+        var computed = new string(source.Normalize(NormalizationForm.FormKC)
             .Where(char.IsLetterOrDigit)
             .Select(char.ToLowerInvariant)
             .ToArray());
+        if (SharedExternalPreEvaluationTitleKeys.Count < SharedTitleTransformCacheLimit)
+            SharedExternalPreEvaluationTitleKeys.TryAdd(source, computed);
+        return computed;
+    }
 
     private static bool LocalWorkKeyRequiresServiceScope(string value)
     {
@@ -3096,13 +3160,37 @@ internal static partial class AIrhythmRecommendationEngine
     internal static string CanonicalWorkKey(string? title, AIrhythmServiceIdentity service, AIrhythmEvidenceIdentityContext context)
     {
         var analysisTitle = PreEvaluationTitle(title, context);
+        return CanonicalWorkIdentity(analysisTitle, service, context);
+    }
+
+    // All fact projections and direct lookups must resolve the SAME Work identity.
+    // Previously title lookups applied learner promotions while recording/reservation/event
+    // facts did not, so dashboard and recommendation could disagree on an identical title.
+    private static string CanonicalWorkIdentity(
+        string analysisTitle,
+        AIrhythmServiceIdentity service,
+        AIrhythmEvidenceIdentityContext context)
+    {
         var canonical = CanonicalizeLocalWorkKey(LocalWorkKeyCached(analysisTitle, service, context), service, context.WorkAliases);
         var promotionKey = CompactIdentity(NormalizationLearnerComparableTitle(analysisTitle));
-        return promotionKey.Length > 0
+        if (promotionKey.Length > 0
             && context.NormalizationPromotions.TryGetValue(promotionKey, out var promoted)
-            && !string.IsNullOrWhiteSpace(promoted)
-                ? promoted
-                : canonical;
+            && !string.IsNullOrWhiteSpace(promoted))
+        {
+            // A cross-day learner promotion must not undo a locally corroborated episode
+            // boundary. The same-service sequence consists of distinct recording facts,
+            // while the parenthesized number is presentation/episode identity, not Work.
+            // This is a general precedence contract, not a per-programme alias.
+            // Preserve canonical even when the learner proposes a longer title containing
+            // the episode suffix; no persisted promotion or recording fact is mutated.
+            if (canonical.Length > 0
+                && !string.Equals(canonical, promoted, StringComparison.OrdinalIgnoreCase)
+                && IsCorroboratedParenthesizedWorkSequence(
+                    analysisTitle, service, context.NumericLocalValuesByService))
+                return canonical;
+            return promoted;
+        }
+        return canonical;
     }
 
     internal static string CanonicalWorkKey(TvAirProgramEventDto item, AIrhythmEvidenceIdentityContext context)
@@ -3174,7 +3262,7 @@ internal static partial class AIrhythmRecommendationEngine
         var canonicalAfterLocalWorkKey = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalLocalWorkKeyBytes += canonicalAfterLocalWorkKey - canonicalAfterPreEvaluation;
 #endif
-        var canonicalWorkKey = CanonicalizeLocalWorkKey(localWorkKey, service, context.WorkAliases);
+        var canonicalWorkKey = CanonicalWorkIdentity(analysisTitle, service, context);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var canonicalAfterAliasResolution = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalAliasResolutionBytes += canonicalAfterAliasResolution - canonicalAfterLocalWorkKey;
@@ -3264,7 +3352,7 @@ internal static partial class AIrhythmRecommendationEngine
         var service = ServiceIdentityOf(item);
         var analysisTitle = PreEvaluationTitle(item.ProgramTitle, context);
         var localWorkKey = LocalWorkKey(analysisTitle, service, context.NumericLocalValuesByService);
-        var canonicalWorkKey = CanonicalizeLocalWorkKey(localWorkKey, service, context.WorkAliases);
+        var canonicalWorkKey = CanonicalWorkIdentity(analysisTitle, service, context);
 
         var displayTitle = SeriesDisplayTitle(item.ProgramTitle);
         if (IsCorroboratedParenthesizedWorkSequence(item.ProgramTitle, service, context.NumericLocalValuesByService)
@@ -3877,7 +3965,7 @@ internal static partial class AIrhythmRecommendationEngine
             return cached.HasIdentity;
         }
 
-        // Preserve the cheap rejection path for a first-seen ordinary title.
+        // Preserve previous build's cheap rejection path for a first-seen ordinary title.
         // Prove that no supported episode shape can exist before normalization/Regex work.
         // Explicit episodes require #/話/回/EP, parenthesized evidence requires parentheses, and
         // alias-corroborated repeated episode numbers require at least two numeric runs.
@@ -4036,6 +4124,21 @@ internal static partial class AIrhythmRecommendationEngine
             && ordered.All(fullKey => fullKey.Length > common.Length && char.IsDigit(fullKey[common.Length])))
         {
             common = common[..^1].TrimEnd();
+        }
+
+        // A stable text prefix must never end inside a numbered chapter/episode marker.
+        // Kanji numerals have shared leading characters (第二十章 / 第二十一章), so a
+        // character-level LCP can falsely learn "第二十" as part of the programme identity.
+        // Accept the boundary only when every observed variant has a *complete* ordinal
+        // followed by its explicit episode/chapter unit, not a series/edition label.
+        var partialOrdinal = Regex.Match(common, @"第[一二三四五六七八九十百千零〇0-9]+$");
+        if (partialOrdinal.Success
+            && ordered.All(fullKey =>
+                fullKey.Length > partialOrdinal.Index
+                && Regex.IsMatch(fullKey[partialOrdinal.Index..],
+                    @"^第[一二三四五六七八九十百千零〇0-9]+(?:章|話)(?=$|[^一二三四五六七八九十百千零〇0-9])")))
+        {
+            common = common[..partialOrdinal.Index].TrimEnd();
         }
 
         if (common.Length < initialPrefix.Length)
@@ -4845,33 +4948,174 @@ internal static partial class AIrhythmRecommendationEngine
         return compact;
     }
 
+    private static readonly Regex ContributorExplicitVoiceCreditRegex = new(
+        @"^.+?[（(]\s*(?:CV|ＣＶ|声|声優|声の出演)\s*[:：]\s*(?<person>[^()（）:：]+)\s*[）)]$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+    // Aggregate only; never log raw personal metadata or alter the contributor identity contract.
+    private static long _contributorParsedPairs;
+    private static long _contributorAcceptedTokens;
+    private static long _contributorRejectedTokens;
+    private static long _contributorExplicitVoiceCredits;
+    private static long _contributorColonCredits;
+    private static long _contributorRolePairs;
+    private static long _contributorDeferredMultipleChunks;
+    private static long _contributorDeferredMixedScript;
+    private static long _contributorDeferredInvalidLength;
+    private static long _contributorDeferredNonEntity;
+    private static long _contributorExplicitSeparatorGroups;
+    private static long _contributorExplicitSeparatorPersons;
+    private static readonly object ContributorDeferredSamplesGate = new();
+    private static readonly Dictionary<string, List<string>> ContributorDeferredSamples = new(StringComparer.Ordinal);
+
+    // Developer-only bounded samples preserve the original parser input for diagnosis.
+    // Never persist these values or emit uncontrolled newlines / control characters.
+    private static void CaptureContributorDeferredSample(string reason, string role, string? raw)
+    {
+        lock (ContributorDeferredSamplesGate)
+        {
+            if (!ContributorDeferredSamples.TryGetValue(reason, out var samples))
+                ContributorDeferredSamples[reason] = samples = new List<string>(4);
+            if (samples.Count >= 4) return;
+            var safe = Regex.Replace(raw ?? string.Empty, @"[\p{Cc}\p{Cf}]", " ")
+                .Replace('|', '／').Trim();
+            if (safe.Length > 100) safe = safe[..100] + "…";
+            var sample = $"role={role},length={(raw ?? string.Empty).Length},raw={safe}";
+            if (!samples.Contains(sample, StringComparer.Ordinal)) samples.Add(sample);
+        }
+    }
+
+
+
+    internal static void LogContributorExtractionDiagnostics()
+    {
+        AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_EXTRACTION_DIAGNOSTIC rolePairs={System.Threading.Interlocked.Read(ref _contributorRolePairs)} rawTokens={System.Threading.Interlocked.Read(ref _contributorParsedPairs)} acceptedTokens={System.Threading.Interlocked.Read(ref _contributorAcceptedTokens)} deferredTokens={System.Threading.Interlocked.Read(ref _contributorRejectedTokens)} deferredMultipleChunks={System.Threading.Interlocked.Read(ref _contributorDeferredMultipleChunks)} deferredMixedScript={System.Threading.Interlocked.Read(ref _contributorDeferredMixedScript)} deferredInvalidLength={System.Threading.Interlocked.Read(ref _contributorDeferredInvalidLength)} deferredNonEntity={System.Threading.Interlocked.Read(ref _contributorDeferredNonEntity)} explicitSeparatorGroups={System.Threading.Interlocked.Read(ref _contributorExplicitSeparatorGroups)} explicitSeparatorPersons={System.Threading.Interlocked.Read(ref _contributorExplicitSeparatorPersons)} explicitVoiceCredits={System.Threading.Interlocked.Read(ref _contributorExplicitVoiceCredits)} colonCredits={System.Threading.Interlocked.Read(ref _contributorColonCredits)} unit=parser_invocations cumulativeSincePluginLoad=True storageMutation=False scoreMutation=False");
+        lock (ContributorDeferredSamplesGate)
+        {
+            foreach (var reason in ContributorDeferredSamples.Keys.OrderBy(x => x, StringComparer.Ordinal))
+            {
+                foreach (var sample in ContributorDeferredSamples[reason])
+                    AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_DEFERRED_SAMPLE reason={reason} {sample} sampleScope=first_four_distinct_parser_inputs developerOnly=True storageMutation=False scoreMutation=False");
+            }
+        }
+
+    }
+#endif
+
+    // A middle dot is also used *inside* a single transliterated name. Split only
+    // clearly labelled multi-person credits with at least three structurally distinct
+    // segments, including a Latin full name between Japanese names. Ambiguous inputs
+    // remain deferred rather than becoming merged persistent contributor identities.
+    private static IReadOnlyList<string> ContributorExplicitlyDelimitedParts(string role, string raw)
+    {
+        var value = (raw ?? string.Empty).Trim();
+        if (role != "music" && role != "cast" && role != "voice" && role != "artist")
+            return new[] { value };
+        var label = Regex.Match(value, @"^【\s*(?<label>[^】]+)\s*】\s*(?<body>.+)$", RegexOptions.CultureInvariant);
+        if (!label.Success || !ContributorRoleMap.TryGetValue(label.Groups["label"].Value.Trim(), out var labelledRole)
+            || !string.Equals(labelledRole, role, StringComparison.Ordinal))
+            return new[] { value };
+        var body = label.Groups["body"].Value.Trim();
+        var parts = body.Split('・', StringSplitOptions.TrimEntries);
+        if (parts.Length < 3 || parts.Length > 8 || parts.Any(x => x.Length < 2))
+            return new[] { value };
+        var hasLatin = parts.Any(x => Regex.IsMatch(x, @"[A-Za-z]", RegexOptions.CultureInvariant));
+        var hasJapanese = parts.Any(x => Regex.IsMatch(x, @"[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]", RegexOptions.CultureInvariant));
+        if (!hasLatin || !hasJapanese)
+            return new[] { value };
+        // Do not infer a split if a segment still contains a second unmarked person.
+        if (parts.Any(x => Regex.IsMatch(x, @"[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}].*\s+.*[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]", RegexOptions.CultureInvariant)))
+            return new[] { value };
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        System.Threading.Interlocked.Increment(ref _contributorExplicitSeparatorGroups);
+        System.Threading.Interlocked.Add(ref _contributorExplicitSeparatorPersons, parts.Length);
+#endif
+        return parts;
+    }
+
     private static string NormalizeContributorMetadataValue(string role, string raw)
     {
-        var value = ContributorTrailingNoteRegex.Replace((raw ?? string.Empty).Trim(), string.Empty).Trim();
+        var value = (raw ?? string.Empty).Trim();
+        // A parenthesized, explicitly labelled voice credit carries reliable person identity.
+        // Resolve that label before removing trailing parentheses; otherwise the character
+        // name survives and is incorrectly learned as the performer.
+        if (role is "cast" or "voice")
+        {
+            var voiceCredit = ContributorExplicitVoiceCreditRegex.Match(value);
+            if (voiceCredit.Success)
+            {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                System.Threading.Interlocked.Increment(ref _contributorExplicitVoiceCredits);
+#endif
+                value = voiceCredit.Groups["person"].Value.Trim();
+            }
+        }
+        value = ContributorTrailingNoteRegex.Replace(value, string.Empty).Trim();
         // Broadcasters sometimes repeat a role label inside the value, e.g.
         // "出演者：出演：山田太郎" or "音楽：音楽：山田太郎". Strip only known role labels.
         for (var i = 0; i < 2 && ContributorNestedRolePrefixRegex.IsMatch(value); i++)
             value = ContributorNestedRolePrefixRegex.Replace(value, string.Empty, 1).Trim();
 
-        // Some broadcasters encode "character performer" as two whitespace-separated chunks
-        // without a structural separator. Do not guess which chunk is the person: ambiguous
-        // metadata is safer to ignore than to persist a concatenated contributor identity.
-        if ((role == "cast" || role == "voice")
-            && !value.Contains(':') && !value.Contains('：')
+        // The host supplies text, not structured contributor identities. Whitespace between
+        // independent text chunks is not evidence that those chunks name ONE contributor.
+        // Reject ambiguous multi-chunk values for every role (including music/staff), rather
+        // than compacting them into one persistent person identity. Explicitly labelled
+        // character:performer values are handled below, before identity compaction.
+        // An ordinary Latin full name has internal word spaces; those spaces alone
+        // are not proof of multiple contributors. Keep the entity as a single identity.
+        // This is deliberately Latin-only: Japanese names and mixed-script text still
+        // require an explicit source-level boundary instead of a guessed split.
+        var explicitLatinFullName = Regex.IsMatch(value,
+            @"^[A-Za-z][A-Za-z'’.-]*(?:[ ]+[A-Za-z][A-Za-z'’.-]*){1,3}$",
+            RegexOptions.CultureInvariant);
+        if (!explicitLatinFullName && !value.Contains(':') && !value.Contains('：')
             && Regex.IsMatch(value, @"\S+[\s　]+\S+", RegexOptions.CultureInvariant))
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            System.Threading.Interlocked.Increment(ref _contributorDeferredMultipleChunks);
+            CaptureContributorDeferredSample("multiple_chunks", role, raw);
+#endif
             return string.Empty;
+        }
+
+        // Multiple scripts run together without a separator are ambiguous (e.g. a Japanese
+        // credit followed immediately by a Latin credit). Do not infer identity boundaries.
+        // A single script transition can be a legitimate person's name, so only reject
+        // Japanese -> Latin -> Japanese sequences with no structural separator.
+        if (Regex.IsMatch(value, @"[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}][A-Za-z][A-Za-z .'-]*[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]", RegexOptions.CultureInvariant))
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            System.Threading.Interlocked.Increment(ref _contributorDeferredMixedScript);
+            CaptureContributorDeferredSample("mixed_script", role, raw);
+#endif
+            return string.Empty;
+        }
 
         // Cast/voice metadata often uses "役名：演者". A contributor axis must learn the person,
         // not a concatenated character+person token, so prefer the final labeled segment.
         if ((role == "cast" || role == "voice") && (value.Contains(':') || value.Contains('：')))
         {
             var segments = value.Split(new[] { ':', '：' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            if (segments.Length >= 2) value = segments[^1];
+            if (segments.Length >= 2)
+            {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                System.Threading.Interlocked.Increment(ref _contributorColonCredits);
+#endif
+                value = segments[^1];
+            }
         }
 
         value = ContributorTrailingNoteRegex.Replace(value.Trim(), string.Empty).Trim();
         var compact = ContributorEntityKey(value);
-        if (compact.Length < 2 || compact.Length > 80) return string.Empty;
+        if (compact.Length < 2 || compact.Length > 80)
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            System.Threading.Interlocked.Increment(ref _contributorDeferredInvalidLength);
+            CaptureContributorDeferredSample("invalid_length", role, raw);
+#endif
+            return string.Empty;
+        }
         foreach (var roleLabel in ContributorRoleMap.Keys.OrderByDescending(x => x.Length))
         {
             var compactRole = ContributorEntityKey(roleLabel);
@@ -4881,9 +5125,22 @@ internal static partial class AIrhythmRecommendationEngine
                 break;
             }
         }
-        if (compact.Length < 2 || compact.Length > 80) return string.Empty;
-        if (ContributorNonEntityTokens.Any(x => string.Equals(ContributorEntityKey(x), compact, StringComparison.OrdinalIgnoreCase)))
+        if (compact.Length < 2 || compact.Length > 80)
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            System.Threading.Interlocked.Increment(ref _contributorDeferredInvalidLength);
+            CaptureContributorDeferredSample("invalid_length", role, raw);
+#endif
             return string.Empty;
+        }
+        if (ContributorNonEntityTokens.Any(x => string.Equals(ContributorEntityKey(x), compact, StringComparison.OrdinalIgnoreCase)))
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            System.Threading.Interlocked.Increment(ref _contributorDeferredNonEntity);
+            CaptureContributorDeferredSample("non_entity", role, raw);
+#endif
+            return string.Empty;
+        }
         return compact;
     }
 
@@ -4907,10 +5164,26 @@ internal static partial class AIrhythmRecommendationEngine
         {
             if (!match.Success || !ContributorRoleMap.TryGetValue(match.Groups["role"].Value.Trim(), out var role))
                 continue;
-            foreach (var raw in ContributorNameSplitRegex.Split(match.Groups["value"].Value))
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            System.Threading.Interlocked.Increment(ref _contributorRolePairs);
+#endif
+            foreach (var rawGroup in ContributorNameSplitRegex.Split(match.Groups["value"].Value))
+            foreach (var raw in ContributorExplicitlyDelimitedParts(role, rawGroup))
             {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                System.Threading.Interlocked.Increment(ref _contributorParsedPairs);
+#endif
                 var value = NormalizeContributorMetadataValue(role, raw);
-                if (value.Length == 0) continue;
+                if (value.Length == 0)
+                {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                    System.Threading.Interlocked.Increment(ref _contributorRejectedTokens);
+#endif
+                    continue;
+                }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                System.Threading.Interlocked.Increment(ref _contributorAcceptedTokens);
+#endif
                 var key = ContributorRoleKey(role, value);
                 if (key.Length == 0) continue;
                 result ??= new List<string>(16);
@@ -4968,22 +5241,44 @@ internal static partial class AIrhythmRecommendationEngine
         return result is null ? Array.Empty<string>() : result;
     }
 
-    private static AIrhythmBehaviorEvidenceAxes BehaviorEvidenceAxesForReservation(
+    // Every meaningful reservation leaves positive factual evidence. Provenance changes
+    // the *weight*, not the existence, of that evidence. These are uniform policy
+    // coefficients, never person/title-specific overrides.
+    private const double IncidentalPreferenceWeight = 0.25d;
+    private const double UnknownProvenancePreferenceWeight = 0.15d;
+
+    private static (double Work, double Genre, double Terms, double Service, double Hour) PreferenceWeightsForReservation(
         TvAirReservationDto reservation,
         IReadOnlyDictionary<int, TvAirKeywordRuleDto> rulesById)
     {
         if (!AIrhythmDataState.IsUsefulReservation(reservation)
             || reservation.Intent is TvAirReservationIntent.System or TvAirReservationIntent.ProgramTimeSlot)
-            return AIrhythmBehaviorEvidenceAxes.None;
+            return (0, 0, 0, 0, 0);
+        if (reservation.Intent == TvAirReservationIntent.InteractiveProgramEvent)
+            return (1, 1, 1, 1, 1);
+        if (reservation.Intent is TvAirReservationIntent.AutomaticSearch or TvAirReservationIntent.KeywordRule)
+        {
+            if (reservation.SourceRuleId is int ruleId && rulesById.TryGetValue(ruleId, out var rule))
+            {
+                return (rule.SearchTitle ? 1 : IncidentalPreferenceWeight,
+                    !string.IsNullOrWhiteSpace(rule.TargetGenres) ? 1 : IncidentalPreferenceWeight,
+                    IncidentalPreferenceWeight, IncidentalPreferenceWeight, IncidentalPreferenceWeight);
+            }
+            return (UnknownProvenancePreferenceWeight, UnknownProvenancePreferenceWeight,
+                UnknownProvenancePreferenceWeight, UnknownProvenancePreferenceWeight, UnknownProvenancePreferenceWeight);
+        }
+        return (UnknownProvenancePreferenceWeight, UnknownProvenancePreferenceWeight,
+            UnknownProvenancePreferenceWeight, UnknownProvenancePreferenceWeight, UnknownProvenancePreferenceWeight);
+    }
 
-        // Natural behavior is additive.  A programme chosen from the guide, a keyword-rule result,
-        // and an automatic-search result all contribute +1 factual evidence to the programme's
-        // observable axes.  Rule provenance can add a second independent +1 (for example SearchCast),
-        // but never suppresses the programme facts themselves.  ExcludePattern/NOT is only a matching
-        // constraint and therefore contributes neither positive nor negative preference evidence.
-        // A ProgramTimeSlot reservation is intentionally left at zero because the programme-level
-        // selection intent cannot be established from that reservation mode alone.
-        return AIrhythmBehaviorEvidenceAxes.DirectSelection;
+    private static AIrhythmBehaviorEvidenceAxes BehaviorEvidenceAxesForReservation(
+        TvAirReservationDto reservation,
+        IReadOnlyDictionary<int, TvAirKeywordRuleDto> rulesById)
+    {
+        var weights = PreferenceWeightsForReservation(reservation, rulesById);
+        return new AIrhythmBehaviorEvidenceAxes(weights.Work > 0, weights.Genre > 0,
+            weights.Terms > 0, weights.Service > 0, weights.Hour > 0,
+            reservation.Intent != TvAirReservationIntent.System);
     }
 
     private static IReadOnlyList<AIrhythmContributorObservation> ContributorObservationsForReservation(
@@ -4991,15 +5286,14 @@ internal static partial class AIrhythmRecommendationEngine
         TvAirProgramEventDto? eventRow,
         IReadOnlyDictionary<int, TvAirKeywordRuleDto> activeSearchCastRulesById)
     {
-        if (eventRow is null)
-            return Array.Empty<AIrhythmContributorObservation>();
+        if (eventRow is null) return Array.Empty<AIrhythmContributorObservation>();
+        // Metadata is a true observation even when the person was not the search motive.
         var weights = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         foreach (var key in MetadataContributorKeys(eventRow.ExtendedItems))
-            weights[key] = Math.Max(weights.TryGetValue(key, out var current) ? current : 0.0d, 1.0d);
+            weights[key] = IncidentalPreferenceWeight;
 
-        // If an automatic reservation was caused by a SearchCast rule and that same rule actually
-        // matches ExtendedItems, preserve that provenance as strong explicit contributor evidence.
-        if (reservation.SourceRuleId is int sourceRuleId
+        var automatic = reservation.Intent is TvAirReservationIntent.AutomaticSearch or TvAirReservationIntent.KeywordRule;
+        if (automatic && reservation.SourceRuleId is int sourceRuleId
             && activeSearchCastRulesById.TryGetValue(sourceRuleId, out var rule)
             && ContributorRuleServiceAllowed(rule, eventRow)
             && !string.IsNullOrWhiteSpace(eventRow.ExtendedItems)
@@ -5010,7 +5304,12 @@ internal static partial class AIrhythmRecommendationEngine
             foreach (var tracked in ContributorTrackedRuleKeys(rule, eventRow.ExtendedItems!))
                 weights[tracked] = 1.0d;
         }
-        return weights.Select(x => new AIrhythmContributorObservation(x.Key, x.Value)).Take(24).ToArray();
+        // An explicit search target must not be displaced by the metadata limit.
+        // Keep one positive observation per distinct contributor key.
+        return weights.OrderByDescending(x => x.Value)
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(24)
+            .Select(x => new AIrhythmContributorObservation(x.Key, x.Value)).ToArray();
     }
 
     private static Dictionary<(int NetworkId, int TransportStreamId, int ServiceId, int EventNumber), TvAirProgramEventDto> BuildReservationEventLookup(
@@ -5075,8 +5374,7 @@ internal static partial class AIrhythmRecommendationEngine
             }
             IReadOnlyList<AIrhythmContributorObservation> contributors = ContributorObservationsForReservation(reservation, matchedEvent, activeSearchCastRulesById);
             var axes = BehaviorEvidenceAxesForReservation(reservation, rulesById);
-            if (!axes.Contributor)
-                contributors = Array.Empty<AIrhythmContributorObservation>();
+            var preferenceWeights = PreferenceWeightsForReservation(reservation, rulesById);
 
             if (axes.HasBaseAxis) baseEligibleReservations++;
             if (!axes.HasBaseAxis && contributors.Count > 0) contributorOnlyReservations++;
@@ -5098,7 +5396,12 @@ internal static partial class AIrhythmRecommendationEngine
                 LearnGenre: axes.Genre,
                 LearnTerms: axes.Terms,
                 LearnService: axes.Service,
-                LearnHour: axes.Hour));
+                LearnHour: axes.Hour,
+                WorkEvidenceWeight: preferenceWeights.Work,
+                GenreEvidenceWeight: preferenceWeights.Genre,
+                TermsEvidenceWeight: preferenceWeights.Terms,
+                ServiceEvidenceWeight: preferenceWeights.Service,
+                HourEvidenceWeight: preferenceWeights.Hour));
         }
 
         var interestSignals = AIrhythmDataState.GetInterestSignals();
@@ -5129,7 +5432,7 @@ internal static partial class AIrhythmRecommendationEngine
         }
 
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-        AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_SOURCE_SUMMARY baseEligibleReservations={baseEligibleReservations} contributorOnlyReservations={contributorOnlyReservations} provenanceDeferredReservations={provenanceDeferredReservations} interests={interestSignals.Count} basePreference=additive_natural_behavior automaticReservationLearning=all_programme_axes_plus_rule_match searchCastContributorLearning=metadata_plus_rule_double_count repeatedRuleEpisodes=independent_programme_facts programTimeSlotLearning=zero notConditionLearning=zero");
+        AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_SOURCE_SUMMARY baseEligibleReservations={baseEligibleReservations} contributorOnlyReservations={contributorOnlyReservations} provenanceDeferredReservations={provenanceDeferredReservations} interests={interestSignals.Count} basePreference=causal_weighted_positive_evidence automaticReservationLearning=all_observed_axes_weighted_by_provenance searchCastContributorLearning=originating_rule_strong_metadata_incidental repeatedRuleEpisodes=independent_programme_facts programTimeSlotLearning=zero notConditionLearning=zero");
         var activeSearchCastRules = snapshot.KeywordRules.Where(x => x.Enabled && x.SearchCast).ToArray();
         AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_RULE_SUMMARY activeSearchCastRules={activeSearchCastRules.Length} regexRules={activeSearchCastRules.Count(x => x.UseRegex)} semantics=current_explicit_intent_scored_on_matching_extendeditems persistence=reservation_provenance_only missingMatchNotNegative=True");
         foreach (var rule in activeSearchCastRules.Take(16))
@@ -5405,6 +5708,15 @@ internal static partial class AIrhythmRecommendationEngine
         var now = DateTimeOffset.Now;
         var learnedUserModel = BuildOrUpdateLearnedUserModel(snapshot, identityContext);
         var learnedAffinityContext = BuildLearnedAffinityContext(learnedUserModel);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        // Same snapshot / same learned model, with ONLY the contributor weight projection reverted.
+        var baselineLearnedAffinityContext = BuildLearnedAffinityContext(learnedUserModel with
+        {
+            ContributorWeights = learnedUserModel.PreCalibrationContributorWeights ?? learnedUserModel.ContributorWeights
+        });
+        var contributorComparisonAffinities = new Dictionary<AIrhythmEventIdentity, double>();
+        var contributorExplicitIntentsPreserved = 0;
+#endif
         var activeSearchCastRules = snapshot.KeywordRules
             .Where(rule => rule.Enabled && rule.SearchCast)
             .ToArray();
@@ -6047,6 +6359,11 @@ internal static partial class AIrhythmRecommendationEngine
             var learnedAffinity = LearnedUserAffinityBreakdown(learnedAffinityContext, facts, contributorKeys);
             var learnedUserAffinity = learnedAffinity.Overall;
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            var baselineBreakdown = LearnedUserAffinityBreakdown(baselineLearnedAffinityContext, facts, contributorKeys);
+            contributorComparisonAffinities[identity] = baselineBreakdown.Overall;
+            if (contributorKeys.Any(key => key.StartsWith("tracked|", StringComparison.OrdinalIgnoreCase))
+                && Math.Abs(baselineBreakdown.Contributor - learnedAffinity.Contributor) < 0.0000001d)
+                contributorExplicitIntentsPreserved++;
             var identityProvenance = AIrhythmEvidenceProvenance.None;
             if (historySeriesCount > 0) identityProvenance |= AIrhythmEvidenceProvenance.WorkHistory;
             if (reservationSeriesWeight > 0) identityProvenance |= AIrhythmEvidenceProvenance.WorkReservation;
@@ -6322,6 +6639,50 @@ internal static partial class AIrhythmRecommendationEngine
             ? 0.0d
             : scored.Average(x => Math.Pow(x.LearnedUserAffinity - learnedAffinityMean, 2.0d));
         var learnedAffinityStd = Math.Sqrt(Math.Max(0.0d, learnedAffinityVariance));
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        // Both sides use the final deduplicated, accepted candidates and their respective
+        // population z-score. Ranking is over learned-adjusted deviation coordinates only;
+        // final shelf selection is not falsely claimed to be equivalent to this rank.
+        var compared = scored.Select(item => new
+        {
+            Item = item,
+            BaselineAffinity = item.EventIdentity is not null
+                && contributorComparisonAffinities.TryGetValue(item.EventIdentity, out var oldAffinity)
+                    ? oldAffinity : item.LearnedUserAffinity
+        }).ToArray();
+        var baselineMean = compared.Length == 0 ? 0.0d : compared.Average(x => x.BaselineAffinity);
+        var baselineStd = Math.Sqrt(compared.Length == 0 ? 0.0d
+            : Math.Max(0.0d, compared.Average(x => Math.Pow(x.BaselineAffinity - baselineMean, 2.0d))));
+        static double DiagnosticAdjustment(double affinity, double mean, double std, double maturity)
+            => maturity > 0.0d && std > 0.000001d
+                ? Math.Clamp((affinity - mean) / std, -2.5d, 2.5d) * maturity : 0.0d;
+        var comparisons = compared.Select((x, index) => new
+        {
+            Index = index, x.Item,
+            OldAffinity = x.BaselineAffinity,
+            NewAffinity = x.Item.LearnedUserAffinity,
+            OldAdjustment = DiagnosticAdjustment(x.BaselineAffinity, baselineMean, baselineStd, learnedUserModelMaturity),
+            NewAdjustment = DiagnosticAdjustment(x.Item.LearnedUserAffinity, learnedAffinityMean, learnedAffinityStd, learnedUserModelMaturity)
+        }).ToArray();
+        var oldRanking = comparisons.OrderByDescending(x => x.Item.DeviationRawScore + x.OldAdjustment)
+            .ThenBy(x => x.Index).Select((x, rank) => (x.Index, Rank: rank + 1))
+            .ToDictionary(x => x.Index, x => x.Rank);
+        var newRanking = comparisons.OrderByDescending(x => x.Item.DeviationRawScore + x.NewAdjustment)
+            .ThenBy(x => x.Index).Select((x, rank) => (x.Index, Rank: rank + 1))
+            .ToDictionary(x => x.Index, x => x.Rank);
+        var affinityChanged = comparisons.Count(x => Math.Abs(x.NewAffinity - x.OldAffinity) > 0.0000001d);
+        var adjustmentChanged = comparisons.Count(x => Math.Abs(x.NewAdjustment - x.OldAdjustment) > 0.0000001d);
+        var rankChanged = comparisons.Count(x => oldRanking[x.Index] != newRanking[x.Index]);
+        var top20Old = oldRanking.Where(x => x.Value <= 20).Select(x => x.Key).ToHashSet();
+        var top20New = newRanking.Where(x => x.Value <= 20).Select(x => x.Key).ToHashSet();
+        AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SCORE_AB result=OBSERVED candidates={comparisons.Length} affinityChanged={affinityChanged} adjustmentChanged={adjustmentChanged} rankChanged={rankChanged} top20Entrants={top20New.Except(top20Old).Count()} top20Exits={top20Old.Except(top20New).Count()} explicitTrackedEqual={contributorExplicitIntentsPreserved} oldAffinityMean={baselineMean:0.000000} newAffinityMean={learnedAffinityMean:0.000000} meanAbsAdjustmentDelta={(comparisons.Length == 0 ? 0.0d : comparisons.Average(x => Math.Abs(x.NewAdjustment - x.OldAdjustment))):0.000000} maxAbsRankDelta={(comparisons.Length == 0 ? 0 : comparisons.Max(x => Math.Abs(oldRanking[x.Index] - newRanking[x.Index])))} baseline=pre_work_calibration_post_legacy_quarantine population=identical_accepted_candidates ranking=pre_shelf_adjusted_deviation storageMutation=False scoreMutation=False");
+        foreach (var x in comparisons.OrderByDescending(x => Math.Abs(oldRanking[x.Index] - newRanking[x.Index]))
+            .ThenByDescending(x => Math.Abs(x.NewAdjustment - x.OldAdjustment)).Take(12))
+        {
+            if (oldRanking[x.Index] == newRanking[x.Index] && Math.Abs(x.NewAdjustment - x.OldAdjustment) < 0.0000001d) continue;
+            AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SCORE_AB_SAMPLE work={x.Item.SeriesKey} oldRank={oldRanking[x.Index]} newRank={newRanking[x.Index]} oldAffinity={x.OldAffinity:0.000000} newAffinity={x.NewAffinity:0.000000} oldAdjustment={x.OldAdjustment:0.000000} newAdjustment={x.NewAdjustment:0.000000}");
+        }
+#endif
         if (learnedUserModelMaturity > 0.0d && learnedAffinityStd > 0.000001d)
         {
             scored = scored.Select(item =>
@@ -6452,7 +6813,7 @@ internal static partial class AIrhythmRecommendationEngine
         var postDeviationDiagnosticsBytes = scoreAllocatedAfterPostDeviationDiagnostics - scoreAllocatedAfterDeviation;
         var candidateSubphaseAccountedBytes = candidateCanonicalTextFilterBytes + candidateSeriesGenreBytes + candidateTermsBytes + candidateContextInterestBytes + candidateLocalExternalBytes + candidateRecommendationBytes;
         AIrhythmDataState.WriteDeveloperLog(
-            $"SCORE_CANDIDATE_ALLOCATION_PHASES canonicalTextFilterBytes={candidateCanonicalTextFilterBytes} seriesGenreBytes={candidateSeriesGenreBytes} termsBytes={candidateTermsBytes} contextInterestBytes={candidateContextInterestBytes} localExternalBytes={candidateLocalExternalBytes} recommendationBytes={candidateRecommendationBytes} accountedBytes={candidateSubphaseAccountedBytes} candidateLoopBytes={candidateLoopBytes} unaccountedBytes={candidateLoopBytes - candidateSubphaseAccountedBytes} visited={candidateLoopVisited} excluded={candidateLoopExcluded} deduped={candidateLoopDeduped} belowMinimum={candidateLoopBelowMinimum} scored={deviationScored.Count} scope=current_thread_exact measurement=aggregate_only_no_midphase_logging semantics=unchanged");
+            $"SCORE_CANDIDATE_ALLOCATION_PHASES canonicalTextFilterBytes={candidateCanonicalTextFilterBytes} seriesGenreBytes={candidateSeriesGenreBytes} termsBytes={candidateTermsBytes} contextInterestBytes={candidateContextInterestBytes} localExternalBytes={candidateLocalExternalBytes} recommendationBytes={candidateRecommendationBytes} accountedBytes={candidateSubphaseAccountedBytes} candidateLoopBytes={candidateLoopBytes} unaccountedBytes={candidateLoopBytes - candidateSubphaseAccountedBytes} visited={candidateLoopVisited} excluded={candidateLoopExcluded} deduped={candidateLoopDeduped} belowMinimum={candidateLoopBelowMinimum} scored={deviationScored.Count} scope=current_thread_exact checkpoints=aggregate_only_no_midphase_logging semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
             $"SCORE_CANDIDATE_CANONICAL_DETAIL canonicalFactsBytes={candidateCanonicalFactsBytes} textBuildBytes={candidateTextBuildBytes} excludedFilterBytes={candidateExcludedFilterBytes} parentBytes={candidateCanonicalTextFilterBytes} accountedBytes={candidateCanonicalFactsBytes + candidateTextBuildBytes + candidateExcludedFilterBytes} unaccountedBytes={candidateCanonicalTextFilterBytes - (candidateCanonicalFactsBytes + candidateTextBuildBytes + candidateExcludedFilterBytes)} visited={candidateLoopVisited} excluded={candidateLoopExcluded} scope=current_thread_exact semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
@@ -6460,9 +6821,9 @@ internal static partial class AIrhythmRecommendationEngine
         AIrhythmDataState.WriteDeveloperLog(
             $"SCORE_CANDIDATE_LOCAL_EXTERNAL_DETAIL dedupeBytes={candidateDedupeBytes} localContinuityBytes={candidateLocalContinuityBytes} localShadowBytes={candidateLocalShadowBytes} broadcastIdentityBytes={candidateBroadcastIdentityBytes} externalProjectionBytes={candidateExternalProjectionBytes} localAggregateAdjustmentBytes={candidateLocalAggregateAdjustmentBytes} parentBytes={candidateLocalExternalBytes} accountedBytes={candidateDedupeBytes + candidateLocalContinuityBytes + candidateLocalShadowBytes + candidateBroadcastIdentityBytes + candidateExternalProjectionBytes + candidateLocalAggregateAdjustmentBytes} unaccountedBytes={candidateLocalExternalBytes - (candidateDedupeBytes + candidateLocalContinuityBytes + candidateLocalShadowBytes + candidateBroadcastIdentityBytes + candidateExternalProjectionBytes + candidateLocalAggregateAdjustmentBytes)} deduped={candidateLoopDeduped} belowMinimum={candidateLoopBelowMinimum} scored={deviationScored.Count} scope=current_thread_exact semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
-            $"SCORE_ALLOCATION_PHASES setupBytes={setupBytes} candidateLoopBytes={candidateLoopBytes} preDeviationDiagnosticsBytes={preDeviationDiagnosticsBytes} deviationBytes={deviationBytes} postDeviationDiagnosticsBytes={postDeviationDiagnosticsBytes} accountedBytes={setupBytes + candidateLoopBytes + preDeviationDiagnosticsBytes + deviationBytes + postDeviationDiagnosticsBytes} scope=current_thread_exact measurement=no_midphase_logging semantics=unchanged");
+            $"SCORE_ALLOCATION_PHASES setupBytes={setupBytes} candidateLoopBytes={candidateLoopBytes} preDeviationDiagnosticsBytes={preDeviationDiagnosticsBytes} deviationBytes={deviationBytes} postDeviationDiagnosticsBytes={postDeviationDiagnosticsBytes} accountedBytes={setupBytes + candidateLoopBytes + preDeviationDiagnosticsBytes + deviationBytes + postDeviationDiagnosticsBytes} scope=current_thread_exact checkpoints=no_midphase_logging interpretation=diagnostic_only_not_regression_gate semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
-            $"SCORE_ALLOCATION allocatedBytes={scoreAllocatedBytes} events={snapshot.Events.Count} scored={deviationScored.Count} termWeights={termWeights.Count} interestSignals={preparedInterestSignals.Length} scope=current_thread_exact candidateTextLowerCopy=removed termMatchMaterialization=single_pass_top3 interestSignalNormalization=single_pass phaseBreakdown=enabled semantics=unchanged");
+            $"SCORE_ALLOCATION allocatedBytes={scoreAllocatedBytes} events={snapshot.Events.Count} scored={deviationScored.Count} termWeights={termWeights.Count} interestSignals={preparedInterestSignals.Length} scope=current_thread_exact candidateTextLowerCopy=removed termMatchMaterialization=single_pass_top3 interestSignalNormalization=single_pass phaseBreakdown=enabled evaluation=total_allocated_bytes_primary phaseBreakdownInterpretation=diagnostic_only semantics=unchanged");
 #endif
         return deviationScored;
     }
@@ -6881,7 +7242,9 @@ internal static partial class AIrhythmRecommendationEngine
             => left.EventIdentity is not null && right.EventIdentity is not null && left.EventIdentity.Equals(right.EventIdentity);
 
         var pageLearnedSelections = new List<AIrhythmRecommendation>(24);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var setSelectionDiagnostics = new List<(string Shelf, AIrhythmRecommendation Item, double BaseUtility, double ShelfSimilarity, double PageSimilarity, double MarginalUtility)>();
+#endif
 
         AIrhythmRecommendation[] SelectLearnedSet(
             string shelf,
@@ -6922,7 +7285,9 @@ internal static partial class AIrhythmRecommendationEngine
                 if (ranked is null) break;
                 selected.Add(ranked.Candidate);
                 pageLearnedSelections.Add(ranked.Candidate);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 setSelectionDiagnostics.Add((shelf, ranked.Candidate, ranked.BaseUtility, ranked.ShelfSimilarity, ranked.PageSimilarity, ranked.Marginal));
+#endif
                 remaining.Remove(ranked.Candidate);
             }
             return selected.ToArray();
@@ -6976,7 +7341,21 @@ internal static partial class AIrhythmRecommendationEngine
         });
         var replayFinds = SelectLearnedSet("replay", replayPool, ReplayObjective, 6);
 
+        // A short programme promoting a different work is not itself a new work to discover.
+        // This is a structural title classification, not a per-title blacklist. Keep
+        // editorial recaps and ordinary episodes eligible; apply only to discovery shelves.
+        bool IsPromotionOnlyProgramme(AIrhythmRecommendation item)
+        {
+            var title = (item.Title ?? string.Empty).Normalize(System.Text.NormalizationForm.FormKC);
+            return System.Text.RegularExpressions.Regex.IsMatch(
+                title,
+                @"(?:^|[\s\u3000\[\]【】「」])PR(?:$|[\s\u3000\[\]【】「」])",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        }
+
         var firstSeenPool = discoveryAxisRows
+            .Where(x => !IsPromotionOnlyProgramme(x.Item))
             .Where(x => x.Axes.Knownness <= 0.10d)
             .Where(x => x.Axes.Novelty >= 0.60d)
             .Where(x => x.Axes.Plausibility >= 0.20d)
@@ -6992,6 +7371,7 @@ internal static partial class AIrhythmRecommendationEngine
             .ToHashSet();
 
         var surprisePool = discoveryAxisRows
+            .Where(x => !IsPromotionOnlyProgramme(x.Item))
             .Where(x => x.Item.EventIdentity is null || !firstSeenIdentities.Contains(x.Item.EventIdentity))
             .Where(x => x.Axes.Knownness <= 0.45d)
             .Where(x => x.Axes.Novelty >= 0.58d)
@@ -7015,6 +7395,43 @@ internal static partial class AIrhythmRecommendationEngine
                 $"DISCOVERY_MODEL_SAMPLE shelf={(firstSeenItems.Contains(item) ? "first_seen" : "surprise")} work={item.SeriesKey} knownness={axes.Knownness:0.000} novelty={axes.Novelty:0.000} plausibility={axes.Plausibility:0.000} learnedAffinity={item.LearnedUserAffinity:0.000} modelAdjustment={item.LearnedUserModelAdjustment:0.000} modelMaturity={item.LearnedUserModelMaturity:0.000} serviceNovelty={ServiceNovelty(item):0.000} genreNovelty={GenreNovelty(item):0.000} ruleTracked={IsTrackedByKeywordRule(item)} score={item.Score} rawScore={item.RawScore}");
         }
 
+        // Evaluate the actual 24 shelf selections, not a second synthetic candidate ranking.
+        // Developer-only: never changes selection, preferences, or persistent storage.
+        var qualityShelves = new (string Name, IReadOnlyList<AIrhythmRecommendation> Items)[]
+        {
+            ("tonight", tonight), ("replay", replayFinds),
+            ("first_seen", firstSeen), ("surprise", surprise)
+        };
+        var qualityTotal = 0;
+        var qualityWeakPlausibility = 0;
+        var qualityNoReasons = 0;
+        var qualityRepeatedWorks = 0;
+        var qualitySeenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var qualityWeakReasons = new List<string>();
+        foreach (var group in qualityShelves)
+        {
+            var groupBelowThreshold = 0;
+            foreach (var item in group.Items)
+            {
+                var axes = DiscoveryAxes(item);
+                var minimumPlausibility = group.Name == "first_seen" ? 0.20d : group.Name == "surprise" ? 0.28d : 0.0d;
+                var belowGate = minimumPlausibility > 0.0d && axes.Plausibility + 0.0000001d < minimumPlausibility;
+                if (belowGate) { qualityWeakPlausibility++; groupBelowThreshold++; }
+                if (item.Reasons.Count == 0) qualityNoReasons++;
+                if (!string.IsNullOrWhiteSpace(item.SeriesKey) && !qualitySeenKeys.Add(item.SeriesKey)) qualityRepeatedWorks++;
+                qualityTotal++;
+                // The real card reasons are reported alongside the model axes so a reviewer can
+                // distinguish explainable behavior from merely high novelty or generic fallback text.
+                AIrhythmDataState.WriteDeveloperLog(
+                    $"RECOMMENDATION_QUALITY_SAMPLE shelf={group.Name} station={item.ServiceName} title={item.Title} start={item.Start:yyyy-MM-ddTHH:mm:sszzz} work={item.SeriesKey} knownness={axes.Knownness:0.000} novelty={axes.Novelty:0.000} plausibility={axes.Plausibility:0.000} affinity={item.LearnedUserAffinity:0.000} score={item.Score} reasons=[{string.Join(" / ", item.Reasons.Take(2))}] discoveryBelowGate={belowGate} observationOnly=True");
+                if (belowGate && qualityWeakReasons.Count < 6)
+                    qualityWeakReasons.Add($"{group.Name}:{item.ServiceName}/{item.Title}");
+            }
+            AIrhythmDataState.WriteDeveloperLog(
+                $"RECOMMENDATION_QUALITY_SHELF shelf={group.Name} selected={group.Items.Count} belowPlausibilityGate={groupBelowThreshold} model=real_selected_cards observationOnly=True");
+        }
+        AIrhythmDataState.WriteDeveloperLog(
+            $"RECOMMENDATION_QUALITY_SUMMARY selected={qualityTotal} uniqueWorks={qualitySeenKeys.Count} repeatedWorks={qualityRepeatedWorks} missingCardReasons={qualityNoReasons} discoveryBelowPlausibilityGate={qualityWeakPlausibility} weakSamples=[{string.Join(";", qualityWeakReasons)}] criteria=actual_selection_reason_trace_and_discovery_guardrails outcome=requires_human_relevance_review scoreMutation=False storageMutation=False");
         var learnedPage = pageLearnedSelections.ToArray();
         var pairSimilarities = new List<double>();
         for (var i = 0; i < learnedPage.Length; i++)
@@ -7237,6 +7654,15 @@ internal static partial class AIrhythmRecommendationEngine
         // here when none of the existing parser branches can change Work.
         var normalized = NormalizeCanonicalWhitespace(value.Normalize(NormalizationForm.FormKC));
 
+        // A numbered event round is structurally significant even if the title contains
+        // no episode/session/stage tokens. The canonical parser separates "第N戦" into
+        // Event, but the inert fast path previously treated such titles as plain text,
+        // leaving the round and venue inside Work and fragmenting historical rankings.
+        // This is a generic parser-contract guard, never a sport/title-specific alias.
+        if (normalized.IndexOf('第') >= 0 && normalized.IndexOf('戦') >= 0
+            && Regex.IsMatch(normalized, @"第\s*[0-9０-９]{1,3}\s*戦"))
+            return false;
+
         // Any bracket/quote/container/episode/route marker can activate an established structural
         // branch or broadcast-annotation stripping. Fall back rather than duplicating that logic.
         if (normalized.IndexOf('[') >= 0 || normalized.IndexOf(']') >= 0
@@ -7329,14 +7755,26 @@ internal static partial class AIrhythmRecommendationEngine
         if (string.IsNullOrWhiteSpace(value))
             return string.Empty;
 
+        // EvidenceSeriesKey is a pure title-only transform. Keep its result across render
+        // snapshots so an external-evidence generation change does not discard bf252's Work
+        // Identity allocation savings. Dynamic aliases/promotions are applied after this key.
+        if (SharedEvidenceSeriesKeys.TryGetValue(value, out var cached))
+            return cached;
+
+        string computed;
         if (TrySimpleEvidenceSeriesKeyFastPath(value, out var simpleKey))
-            return simpleKey;
+            computed = simpleKey;
+        else if (TryStructurallyInertEvidenceSeriesKeyFastPath(value, out var inertKey))
+            computed = inertKey;
+        else
+        {
+            var parts = ParseCanonicalTitleParts(value);
+            computed = CompactIdentity(parts.Work);
+        }
 
-        if (TryStructurallyInertEvidenceSeriesKeyFastPath(value, out var inertKey))
-            return inertKey;
-
-        var parts = ParseCanonicalTitleParts(value);
-        return CompactIdentity(parts.Work);
+        if (SharedEvidenceSeriesKeys.Count < SharedTitleTransformCacheLimit)
+            SharedEvidenceSeriesKeys.TryAdd(value, computed);
+        return computed;
     }
 
     private static readonly string[] BroadcastContainerSuffixes =
@@ -7644,6 +8082,35 @@ internal static partial class AIrhythmRecommendationEngine
             }
         }
 
+        // 明示された番組種別を作品名から分ける。「アニメ 作品名」等は
+        // 引用符がない場合も ContentType として扱う。作品名そのものが「アニメ」で
+        // 始まる連続語（「アニメーション...」等）には適用しない。
+        if (contentType.Length == 0 && container.Length == 0)
+        {
+            var typedPrefix = Regex.Match(workRoot,
+                @"^(?<type>アニメ|ドラマ|映画|ドキュメンタリー)\s+(?<work>\S.+)$",
+                RegexOptions.IgnoreCase);
+            if (typedPrefix.Success && typedPrefix.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 2)
+            {
+                contentType = typedPrefix.Groups["type"].Value;
+                workRoot = typedPrefix.Groups["work"].Value.Trim();
+            }
+        }
+
+        // 明示的な曜日 + 編成ジャンル + NIGHT の末尾は放送枠ラベル。
+        // 独立した空白境界を必須とし、作品固有の副題や英語の固有名は残す。
+        if (container.Length == 0)
+        {
+            var trailingSlot = Regex.Match(workRoot,
+                @"^(?<work>.+?)\s+(?<slot>(?:MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\s+(?:ANIME|DRAMA|MOVIE)\s+NIGHT)$",
+                RegexOptions.IgnoreCase);
+            if (trailingSlot.Success && trailingSlot.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 3)
+            {
+                container = trailingSlot.Groups["slot"].Value;
+                workRoot = trailingSlot.Groups["work"].Value.Trim();
+            }
+        }
+
         // Container 分離後に「映画『作品』」等の型ラベルが残る場合は、型ラベルを Work へ混ぜない。
         if (container.Length > 0 && (workRoot.IndexOf('「') >= 0 || workRoot.IndexOf('『') >= 0))
         {
@@ -7791,25 +8258,40 @@ internal static partial class AIrhythmRecommendationEngine
             }
         }
 
-        // 11) 「第N戦 ... セッション」を Work / Event / Stage に分離する。
-        //    年や競技名は Work 側へ残す。個別大会名やチーム名には依存しない。
-        var mayContainRoundStage = workRoot.IndexOf('戦') >= 0
-            && (workRoot.Contains("フリー走行", StringComparison.OrdinalIgnoreCase)
-                || workRoot.Contains("FP", StringComparison.OrdinalIgnoreCase)
-                || workRoot.Contains("予選", StringComparison.OrdinalIgnoreCase)
-                || workRoot.Contains("決勝", StringComparison.OrdinalIgnoreCase)
-                || workRoot.Contains("スプリント", StringComparison.OrdinalIgnoreCase));
-        var roundStage = mayContainRoundStage
-            ? Regex.Match(
-                workRoot,
-                @"^(?<work>.+?)\s+(?<event>第\s*[0-9０-９]+\s*戦(?:\s+.+?)?)\s+(?<stage>フリー走行\s*[0-9０-９]+|FP\s*[0-9０-９]+|予選|決勝|スプリント(?:予選|シュートアウト)?|準々決勝|準決勝)\s*$",
+        // 11) 大会の「第N戦」を Work と Event に分離する。
+        //    作品名と「第N戦」の間の空白を必須境界とする一方、「戦」と開催地が
+        //    密着する表記も認める（「第16戦バーレーン」など）。後方の空白を境界条件に
+        //    すると、同一大会のセッションだけが異なる作品へ分裂する。
+        //    独立した作品名の前方境界・十分な文字数・非数字条件は維持する。
+        //    特定競技や作品名の辞書・例外は使用しない。
+        var mayContainRound = workRoot.IndexOf('戦') >= 0
+            && workRoot.IndexOf('第') >= 0;
+        var round = mayContainRound
+            ? Regex.Match(workRoot,
+                @"^(?<work>.+?[\p{L}\p{N}])\s+第\s*(?<number>[0-9０-９]{1,3})\s*戦(?<tail>.*)$",
                 RegexOptions.IgnoreCase)
             : Match.Empty;
-        if (roundStage.Success)
+        if (round.Success)
         {
-            workRoot = roundStage.Groups["work"].Value.Trim();
-            eventName = roundStage.Groups["event"].Value.Trim();
-            stage = roundStage.Groups["stage"].Value.Trim();
+            var candidateWork = round.Groups["work"].Value.Trim();
+            // Numeric-only programme prefixes (e.g. a broadcast year alone) are not works.
+            if (candidateWork.Count(char.IsLetterOrDigit) >= 4
+                && candidateWork.Any(char.IsLetter))
+            {
+                workRoot = candidateWork;
+                var tail = round.Groups["tail"].Value.Trim(' ', ':', '：', '・', '/', '／');
+                var session = Regex.Match(tail,
+                    @"(?:^|[\s:：・/／（(【\[「『])(?<stage>フリー走行\s*[0-9０-９]+|FP\s*[0-9０-９]+|予選|決勝|スプリント(?:予選|シュートアウト)?|準々決勝|準決勝)(?=$|[\s:：・/／）)】\]」』])",
+                    RegexOptions.IgnoreCase);
+                if (session.Success)
+                {
+                    stage = session.Groups["stage"].Value.Trim();
+                    tail = (tail[..session.Index] + " " + tail[(session.Index + session.Length)..]).Trim();
+                }
+                eventName = "第" + round.Groups["number"].Value + "戦";
+                if (tail.Length > 0)
+                    eventName += " " + tail;
+            }
         }
 
         // 12) 明示的な話数だけを Episode として分離する。
@@ -7846,6 +8328,21 @@ internal static partial class AIrhythmRecommendationEngine
             if (prefix.Count(char.IsLetterOrDigit) >= 2
                 && prefix.Any(char.IsLetter))
                 workRoot = prefix;
+        }
+
+        // 第十八話・第二十章など漢数字の話数・章番号を Episode に分離する。
+        // 章だけを根拠にシリーズ名を削らず、先行する作品名と明示の「第」が
+        // ある終端構造に限定する。
+        if (episode.Length == 0)
+        {
+            var kanjiEpisode = Regex.Match(workRoot,
+                @"^(?<work>.+?)\s+第[一二三四五六七八九十百千零〇]+(?:話|章)(?:\s*[:：].*)?$",
+                RegexOptions.IgnoreCase);
+            if (kanjiEpisode.Success && kanjiEpisode.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 3)
+            {
+                episode = workRoot[kanjiEpisode.Groups["work"].Length..].Trim();
+                workRoot = kanjiEpisode.Groups["work"].Value.Trim();
+            }
         }
 
         // 13) 第N部 / 前編 / 後編は原則 Part 側。独立作品か不明な場合に Work を壊さないよう、
@@ -8796,6 +9293,95 @@ internal static partial class AIrhythmRecommendationEngine
             (Label: "日", Day: DayOfWeek.Sunday)
         }.Select(x => (x.Label, Value: weekdayCounts.TryGetValue(x.Day, out var count) ? count : 0)).ToArray();
 
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        var corroboratedHistory = snapshot.History
+            .Where(item => IsCorroboratedParenthesizedWorkSequence(
+                item.ProgramTitle, ServiceIdentityOf(item), identityContext.NumericLocalValuesByService))
+            .Select(item => new
+            {
+                Key = CanonicalWorkKey(item, identityContext),
+                Title = CanonicalWorkDisplayTitle(item, identityContext),
+                Raw = item.ProgramTitle
+            })
+            .Where(item => item.Key.Length > 0)
+            .ToArray();
+        var corroboratedGroups = corroboratedHistory
+            .GroupBy(item => item.Key, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(12)
+            .Select(group => $"{CompactIdentity(group.First().Title)}:{group.Count()}");
+        // This audit includes every successful recording, even when no sequence was corroborated.
+        // It exposes fragmented work identities without rewriting historical facts or learning.
+        var recordingIdentityGroups = snapshot.History
+            .Select(item => new
+            {
+                Raw = item.ProgramTitle,
+                Work = CanonicalWorkKey(item, identityContext),
+                Genre = CanonicalEvidenceFacts(item, identityContext).GenreKey
+            })
+            .Where(item => item.Work.Length > 0)
+            .GroupBy(item => item.Work, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(24)
+            .Select(group => $"{group.Key}:{group.Count()}");
+        // Exact, read-only stage trace for EVERY persisted successful recording.
+        // Output is batched to bound log event count; no title filter, guessed sibling,
+        // display-only remapping, fact mutation, or additional normalization policy.
+        // All keys are emitted per fact so an apparent ranking split can be traced
+        // to the exact stage without needing access to the user's private store.
+        var recordingTrace = snapshot.History.Select((item, ordinal) =>
+        {
+            var service = ServiceIdentityOf(item);
+            var raw = item.ProgramTitle ?? string.Empty;
+            var evaluation = PreEvaluationTitle(raw, identityContext);
+            var local = LocalWorkKeyCached(evaluation, service, identityContext);
+            var alias = CanonicalizeLocalWorkKey(local, service, identityContext.WorkAliases);
+            var promotionLookup = CompactIdentity(NormalizationLearnerComparableTitle(evaluation));
+            string? candidate = null;
+            var hasPromotion = promotionLookup.Length > 0
+                && identityContext.NormalizationPromotions.TryGetValue(promotionLookup, out candidate)
+                && !string.IsNullOrWhiteSpace(candidate);
+            var final = CanonicalWorkKey(item, identityContext);
+            var chosen = hasPromotion && string.Equals(final, candidate, StringComparison.OrdinalIgnoreCase)
+                ? "promotion" : string.Equals(final, alias, StringComparison.OrdinalIgnoreCase)
+                    ? "local_or_alias" : "other";
+            return new
+            {
+                n = ordinal,
+                station = item.ServiceName,
+                service = service.ToString(),
+                start = (item.ActualStart ?? item.Start).ToString("O"),
+                raw,
+                evaluation,
+                local,
+                alias,
+                promotionLookup,
+                promotion = hasPromotion ? candidate : string.Empty,
+                selected = chosen,
+                final,
+                display = CanonicalWorkDisplayTitle(item, identityContext)
+            };
+        }).ToArray();
+        const int traceBatchSize = 16;
+        for (var offset = 0; offset < recordingTrace.Length; offset += traceBatchSize)
+        {
+            var batch = recordingTrace.Skip(offset).Take(traceBatchSize).ToArray();
+            AIrhythmDataState.WriteDeveloperLog(
+                $"CANONICAL_RECORDING_IDENTITY_STAGE_TRACE range={offset}-{offset + batch.Length - 1} " +
+                $"rows={JsonSerializer.Serialize(batch)} storageMutation=False");
+        }
+        AIrhythmDataState.WriteDeveloperLog(
+            $"CANONICAL_RECORDING_IDENTITY_STAGE_TRACE_SUMMARY traced={recordingTrace.Length} " +
+            $"total={snapshot.History.Count} groups={recordingTotals.Count} batchSize={traceBatchSize} " +
+            $"scope=all_persisted_success_facts exactStageKeys=True readonly=True");
+        AIrhythmDataState.WriteDeveloperLog(
+            $"CANONICAL_RECORDING_ALL_FACT_IDENTITY_AUDIT total={snapshot.History.Count} grouped={recordingTotals.Sum(x => x.RecordingCount)} uniqueWorks={recordingTotals.Count} top24=[{string.Join(",", recordingIdentityGroups)}] numericEpgServices={BuildNumericParenthesizedLocalSequenceValuesByService(snapshot.Events).Count} numericHistoryServices={identityContext.NumericEvidenceValuesByService.Count} numericMergedServices={identityContext.NumericLocalValuesByService.Count} storageMutation=False");
+        AIrhythmDataState.WriteDeveloperLog(
+            $"CANONICAL_RECORDING_EPISODE_IDENTITY_AUDIT corroboratedFacts={corroboratedHistory.Length} uniqueWorks={corroboratedHistory.Select(x => x.Key).Distinct(StringComparer.OrdinalIgnoreCase).Count()} top=[{string.Join(",", corroboratedGroups)}] historyTotal={totalRecordingCount} purpose=detect_numeric_episode_fragmentation_no_title_rules storageMutation=False");
+#endif
+
         AIrhythmDataState.WriteDeveloperLog(
             $"CANONICAL_RECORDING_DASHBOARD_SUMMARY total={totalRecordingCount} totalTop10=[{string.Join(",", recordingTotals.Take(10).Select(x => $"{CompactIdentity(x.DisplayTitle)}:{x.RecordingCount}"))}] genreTop10=[{string.Join(",", recordingAggregates.Take(10).Select(x => $"{x.GenreKey}:{x.RecordingCount}"))}] expandedGenres=[{string.Join(",", topGenres.Select(x => x.GenreKey))}] titleIdentity=common_canonical_work recordingCount=persistent_success_recording_facts layout=station_donut_weekday_line,total_horizontal_genre_vertical,genre1_6x10");
 
@@ -8806,7 +9392,7 @@ internal static partial class AIrhythmRecommendationEngine
 
         // Row 2: the factual all-title ranking is intentionally the left/main card; genre composition is beside it.
         html.Append($"<article class='chart-card dashboard-span-3 total-ranking-card chart-accent-blue'><div class='chart-head'><h3>総合録画 Top10</h3><span>録画本数</span></div>{RankedBars(totalTop10, palette, "録画した番組がまだありません", true, false, totalRecordingCount, 10)}</article>");
-        html.Append($"<article class='chart-card dashboard-span-3 genre-ranking-card chart-accent-green'><div class='chart-head'><h3>よく録画するジャンル Top10</h3><span>本数・割合</span></div>{VerticalBars(genreTop10, System.Linq.Enumerable.Reverse(palette).ToArray(), "ジャンル別の録画情報がまだありません", totalRecordingCount, 10)}</article>");
+        html.Append($"<article class='chart-card dashboard-span-3 genre-ranking-card chart-accent-green'><div class='chart-head'><h3>よく録画するジャンル Top10</h3><span>本数・割合</span></div>{VerticalBars(genreTop10, palette.Reverse().ToArray(), "ジャンル別の録画情報がまだありません", totalRecordingCount, 10)}</article>");
 
         // Rows 3-4: top six genres, three equal cards per row, each with factual title Top10.
         for (var i = 0; i < topGenres.Length; i++)
@@ -9394,6 +9980,20 @@ internal static class AIrhythmExternalLookupAdapter
 
 }
 
+// Immutable recording-attempt evidence for indefinite recovery; never used for preferences.
+internal sealed record AIrhythmRecoveryAttempt(
+    string Identity, string ServiceName, string ProgramTitle,
+    ushort NetworkId, ushort TransportStreamId, ushort ServiceId, ushort EventId,
+    DateTimeOffset ScheduledStartTime, DateTimeOffset Start, DateTimeOffset End,
+    string Result, string EndReason, bool? FileCreated,
+    long? DropCount, long? ErrorCount, long? ScrambleCount,
+    bool QualityDataAvailable, string QualitySource);
+
+// Non-authoritative compact lookup. The original recoveryAttempts monthly chunks remain the sole source of truth.
+internal sealed record AIrhythmRecoveryLookupEntry(string Identity, string Month, string EpisodeKey, DateTimeOffset ScheduledStartTime);
+internal sealed record AIrhythmRecoveryMonthFingerprint(string Month, int RowCount, string Sha256);
+internal sealed record AIrhythmRecoveryLookupManifest(int SchemaVersion, AIrhythmRecoveryLookupEntry[] Entries, AIrhythmRecoveryMonthFingerprint[]? Months = null);
+
 internal sealed record AIrhythmRecordingFact(
     string Identity,
     string ReservationId,
@@ -9414,7 +10014,13 @@ internal sealed record AIrhythmRecordingFact(
     string Result,
     string EndReason,
     bool? FileCreated,
-    bool ResultFinalized);
+    bool ResultFinalized,
+    long? DropCount = null,
+    long? ErrorCount = null,
+    long? ScrambleCount = null,
+    bool QualityDataAvailable = false,
+    string QualityCompleteness = "",
+    string QualitySource = "");
 
 internal sealed record NormalizationLearnerLongTermSignal(
     string HypothesisKey,
@@ -9504,6 +10110,23 @@ internal sealed record AIrhythmNormalizationPromotionState(
 
 internal static partial class AIrhythmDataState
 {
+    // Reversible scoring-only quarantine for legacy unseparated multi-person credits.
+    // Never rewrite the stored contributor map or observation IDs: the original evidence
+    // remains recoverable if a later, stronger parser can resolve the identity.
+    private static bool IsStructurallyAmbiguousPersistedContributor(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key) || key.StartsWith("tracked|", StringComparison.OrdinalIgnoreCase))
+            return false;
+        var separator = key.IndexOf('|');
+        if (separator <= 0 || separator >= key.Length - 1) return false;
+        var entity = key[(separator + 1)..];
+        // Mixed Japanese -> Latin -> Japanese without delimiters cannot safely denote
+        // a single contributor. Do not split it into guessed identities.
+        return Regex.IsMatch(entity,
+            @"[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}][A-Za-z][A-Za-z.'-]*[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]",
+            RegexOptions.CultureInvariant);
+    }
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
@@ -9541,6 +10164,20 @@ internal static partial class AIrhythmDataState
     private static readonly HashSet<string> UsageRecentRecordingIds = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Queue<string> UsageRecentRecordingOrder = new();
     private const string RecordingFactStorageNamespace = "recordingFacts";
+    private const string RecoveryAttemptStorageNamespace = "recoveryAttempts";
+    private const string RecoveryLookupStorageNamespace = "recoveryLookup";
+    private const string RecoveryLookupStorageKey = "manifest-v1";
+    private static bool _recoveryLookupChecked;
+    private static bool _recoveryLazyIndexed;
+    private static int _recoveryIndexedTotal;
+    // A verified snapshot of the expendable lookup; never authoritative for persistence.
+    private static AIrhythmRecoveryLookupEntry[] _verifiedRecoveryLookup = Array.Empty<AIrhythmRecoveryLookupEntry>();
+    private static readonly Dictionary<string, AIrhythmRecoveryAttempt> RecoveryAttempts = new(StringComparer.OrdinalIgnoreCase);
+    // Non-authoritative month buckets: accelerate changed-month persistence without rescanning all historical attempts.
+    // The original identity dictionary and on-disk JSON are unchanged.
+    private static readonly Dictionary<string, Dictionary<string, AIrhythmRecoveryAttempt>> RecoveryAttemptsByMonth = new(StringComparer.Ordinal);
+    private static bool _recoveryAttemptsLoaded;
+    private static readonly HashSet<string> _recoveryDirtyMonths = new(StringComparer.Ordinal);
     private static readonly Dictionary<string, AIrhythmRecordingFact> RecordingFacts = new(StringComparer.OrdinalIgnoreCase);
     private static bool _recordingFactsLoaded;
     private static DateTimeOffset? _dataResetCutoff;
@@ -9703,6 +10340,14 @@ internal static partial class AIrhythmDataState
             UsageRecentRecordingIds.Clear();
             UsageRecentRecordingOrder.Clear();
             RecordingFacts.Clear();
+            RecoveryAttempts.Clear();
+            RecoveryAttemptsByMonth.Clear();
+            _recoveryLazyIndexed = false;
+            _recoveryIndexedTotal = 0;
+            _recoveryAttemptsLoaded = false;
+            _recoveryLookupChecked = false;
+            _verifiedRecoveryLookup = Array.Empty<AIrhythmRecoveryLookupEntry>();
+            _recoveryDirtyMonths.Clear();
             _recordingFactsLoaded = false;
             _dataResetCutoff = null;
             _dataResetCutoffLoaded = false;
@@ -9762,6 +10407,14 @@ internal static partial class AIrhythmDataState
             UsageRecentRecordingIds.Clear();
             UsageRecentRecordingOrder.Clear();
             RecordingFacts.Clear();
+            RecoveryAttempts.Clear();
+            RecoveryAttemptsByMonth.Clear();
+            _recoveryLazyIndexed = false;
+            _recoveryIndexedTotal = 0;
+            _recoveryAttemptsLoaded = false;
+            _recoveryLookupChecked = false;
+            _verifiedRecoveryLookup = Array.Empty<AIrhythmRecoveryLookupEntry>();
+            _recoveryDirtyMonths.Clear();
             _recordingFactsLoaded = false;
             _dataResetCutoff = null;
             _dataResetCutoffLoaded = false;
@@ -9885,6 +10538,19 @@ internal static partial class AIrhythmDataState
         catch { }
     }
 
+    private static bool IsRecordingFailureForRecovery(TvAirRecordingHistoryDto item)
+    {
+        var state = $"{item.Result} {item.EndReason}";
+        if (state.Contains("cancel", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("abort", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("取消", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("中止", StringComparison.OrdinalIgnoreCase)) return false;
+        return state.Contains("fail", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("error", StringComparison.OrdinalIgnoreCase)
+            || state.Contains("失敗", StringComparison.OrdinalIgnoreCase)
+            || item.FileCreated == false;
+    }
+
     private static string UsageRecordingIdentity(TvAirRecordingHistoryDto item)
     {
         if (!string.IsNullOrWhiteSpace(item.RecordingId))
@@ -9909,7 +10575,10 @@ internal static partial class AIrhythmDataState
             item.Result ?? string.Empty,
             item.EndReason ?? string.Empty,
             item.FileCreated,
-            item.ResultFinalized);
+            item.ResultFinalized,
+            item.DropCount, item.ErrorCount, item.ScrambleCount,
+            item.QualityDataAvailable, item.QualityCompleteness ?? string.Empty,
+            item.QualitySource ?? string.Empty);
 
     private static TvAirRecordingHistoryDto FromRecordingFact(AIrhythmRecordingFact fact)
         => new()
@@ -9932,7 +10601,13 @@ internal static partial class AIrhythmDataState
             Result = fact.Result,
             EndReason = fact.EndReason,
             FileCreated = fact.FileCreated,
-            ResultFinalized = fact.ResultFinalized
+            ResultFinalized = fact.ResultFinalized,
+            DropCount = fact.DropCount,
+            ErrorCount = fact.ErrorCount,
+            ScrambleCount = fact.ScrambleCount,
+            QualityDataAvailable = fact.QualityDataAvailable,
+            QualityCompleteness = fact.QualityCompleteness,
+            QualitySource = fact.QualitySource
         };
 
     private static string RecordingFactMonthKey(AIrhythmRecordingFact fact)
@@ -10046,12 +10721,686 @@ internal static partial class AIrhythmDataState
             {
                 var json = JsonSerializer.Serialize(pair.Value, JsonOptions);
                 context.Storage.Set(RecordingFactStorageNamespace, pair.Key, json, expectedRevision: null);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                // One bounded readback per changed month, never the whole history.
+                var readback = context.Storage.Get(RecordingFactStorageNamespace, pair.Key);
+                var confirmed = readback.Succeeded && string.Equals(readback.Value?.Value?.ToString(), json, StringComparison.Ordinal);
+                WriteDeveloperLog($"RECORDING_QUALITY_CHUNK_READBACK result={(confirmed ? "MATCH" : "MISMATCH")} month={pair.Key} rows={pair.Value.Length} bytes={json.Length} mutation=none");
+#endif
             }
             catch (Exception ex)
             {
                 WriteDeveloperLog($"recording fact store persist failed chunk={pair.Key} type={ex.GetType().Name}");
             }
         }
+    }
+
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+    // Snapshot-only diagnostics: no new timers, no additional full-history storage scan.
+    // Never log recording IDs or absolute file paths.
+    private static void ReportRecordingQualityPersistence(
+        IReadOnlyList<TvAirRecordingHistoryDto> persisted,
+        IReadOnlyList<TvAirRecordingHistoryDto> host,
+        IReadOnlyList<TvAirRecordingHistoryDto> recovery)
+    {
+        var available = 0;
+        var abnormal = 0;
+        var unavailable = 0;
+        var samples = new List<TvAirRecordingHistoryDto>(6);
+        foreach (var fact in persisted)
+        {
+            if (!fact.QualityDataAvailable) { unavailable++; continue; }
+            available++;
+            if ((fact.DropCount ?? 0) <= 0 && (fact.ErrorCount ?? 0) <= 0 && (fact.ScrambleCount ?? 0) <= 0)
+                continue;
+            abnormal++;
+            // Bounded recent samples, not a title-specific watch list.
+            if (samples.Count < 6) samples.Add(fact);
+        }
+        var hostAvailable = host.Count(x => x.QualityDataAvailable);
+        WriteDeveloperLog($"RECORDING_QUALITY_PERSISTENCE result=OBSERVED persisted={persisted.Count} qualityAvailable={available} qualityUnknown={unavailable} abnormal={abnormal} host={host.Count} hostQualityAvailable={hostAvailable} recoveryCandidates={recovery.Count} sampling=first_six_recent_abnormal action=diagnostic_only");
+        foreach (var item in samples)
+        {
+            var date = (item.ActualStart ?? item.Start).ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+            WriteDeveloperLog($"RECORDING_QUALITY_PERSISTENCE_SAMPLE station={item.ServiceName} programme={item.ProgramTitle} started={date} drop={item.DropCount?.ToString(CultureInfo.InvariantCulture) ?? "unknown"} cc={item.ErrorCount?.ToString(CultureInfo.InvariantCulture) ?? "unknown"} scramble={item.ScrambleCount?.ToString(CultureInfo.InvariantCulture) ?? "unknown"} source={item.QualitySource} action=diagnostic_only");
+        }
+    }
+#endif
+
+    // Each attempted recording is immutable evidence. Keep all attempts, even after a future
+    // clean replacement; a separate indexed resolution state will be implemented later.
+    // Storage is partitioned by year/month; only months changed by Host are rewritten.
+    // This key is deliberately conservative. A missing/multiple episode marker has no safe
+    // episode identity and must never turn into a guessed match or an automatic reservation.
+    private static bool TryRecoveryEpisodeKey(string? title, out string key)
+    {
+        key = string.Empty;
+        if (string.IsNullOrWhiteSpace(title)) return false;
+        var normalized = title.Normalize(NormalizationForm.FormKC);
+        // A broadcast carrying several episodes is not a single-episode identity.
+        // In particular #1-12, #1~12, #1,2, #1/#2 and 第1～3話 must not
+        // silently degrade to episode 1. Do not expand ranges into separate
+        // recovery matches: they require independent recording-quality evidence.
+        if (Regex.IsMatch(normalized,
+            @"(?:[#＃]\s*\d{1,4}|第\s*\d{1,4}\s*(?:話|章)?)\s*(?:[-~〜～–—－]|[,，、/／&＆+＋])\s*(?:[#＃]\s*|第\s*)?\d{1,4}"))
+            return false;
+        var matches = Regex.Matches(normalized,
+            @"(?:[#＃]\s*(?<number>[0-9]{1,4})(?![0-9])|第\s*(?<number>[0-9]{1,4})\s*(?:話|章))");
+        // Multiple individually stated episodes (e.g. 第1話・第2話) are also
+        // ambiguous for an episode-specific repair attempt.
+        if (matches.Count != 1) return false;
+        var match = matches[0];
+        if (!int.TryParse(match.Groups["number"].Value, NumberStyles.None,
+                CultureInfo.InvariantCulture, out var number) || number < 1)
+            return false;
+        var stem = normalized[..match.Index];
+        // Keep season and edition markers in the stem: never merge an episode
+        // from a different season because its numeric episode happens to match.
+        var compact = new string(stem.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+        if (compact.Length < 4) return false;
+        key = compact + "#" + number.ToString(CultureInfo.InvariantCulture);
+        return true;
+    }
+
+    // A multi-episode EPG listing is a *coverage hint* only. It is never proof of
+    // episode-level recording quality and cannot close or reserve a recovery case.
+    // Do not expand arbitrary lists or titles containing a second episode marker.
+    private static bool TryRecoveryMultiEpisodeRange(string? title, out string stem, out int first, out int last)
+    {
+        stem = string.Empty;
+        first = last = 0;
+        if (string.IsNullOrWhiteSpace(title)) return false;
+        var normalized = title.Normalize(NormalizationForm.FormKC);
+        var range = Regex.Match(normalized,
+            @"(?:[#＃]\s*(?<a>[0-9]{1,4})|第\s*(?<a>[0-9]{1,4})\s*(?:話|章)?)\s*[-~〜～–—－]\s*(?:[#＃]\s*|第\s*)?(?<b>[0-9]{1,4})(?:\s*(?:話|章))?");
+        if (!range.Success || !int.TryParse(range.Groups["a"].Value, out first)
+            || !int.TryParse(range.Groups["b"].Value, out last)
+            || first < 1 || last <= first || last - first > 99) return false;
+        // If additional episode markers exist, the title is structurally ambiguous.
+        var remainder = normalized.Remove(range.Index, range.Length);
+        if (Regex.IsMatch(remainder, @"(?:[#＃]\s*\d{1,4}|第\s*\d{1,4}\s*(?:話|章))")) return false;
+        stem = new string(normalized[..range.Index]
+            .Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+        return stem.Length >= 4;
+    }
+
+    // Read-only recovery candidate detection. Construct a snapshot-local hash index of
+    // future EPG events; never reserve, resolve, or mutate recovery evidence here.
+    // No extra I/O, timers, background tasks, or network requests.
+    private static void AuditRecoveryEpgCandidates(ITvAirPluginRuntimeContext context, IReadOnlyList<TvAirProgramEventDto> futureEvents)
+    {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        AIrhythmRecoveryAttempt[] attempts = Array.Empty<AIrhythmRecoveryAttempt>();
+        AIrhythmRecoveryLookupEntry[] lookup;
+        bool usedVerifiedLookup;
+        int journalCount;
+        lock (Gate)
+        {
+            if (!_recoveryAttemptsLoaded) return;
+            journalCount = _recoveryLazyIndexed ? _recoveryIndexedTotal + RecoveryAttempts.Values.Count(x => !_verifiedRecoveryLookup.Any(e => string.Equals(e.Identity, x.Identity, StringComparison.OrdinalIgnoreCase))) : RecoveryAttempts.Count;
+            usedVerifiedLookup = _recoveryLookupChecked && _verifiedRecoveryLookup.Length == journalCount
+                && (_recoveryLazyIndexed || _verifiedRecoveryLookup.All(e => RecoveryAttempts.ContainsKey(e.Identity)));
+            lookup = usedVerifiedLookup ? _verifiedRecoveryLookup.ToArray() : Array.Empty<AIrhythmRecoveryLookupEntry>();
+            if (!usedVerifiedLookup) attempts = RecoveryAttempts.Values.ToArray();
+        }
+        var byEpisode = new Dictionary<string, List<TvAirProgramEventDto>>(StringComparer.Ordinal);
+        var indexedEvents = 0;
+        foreach (var programme in futureEvents)
+        {
+            if (!TryRecoveryEpisodeKey(programme.Title, out var episode)) continue;
+            if (!byEpisode.TryGetValue(episode, out var matches))
+                byEpisode[episode] = matches = new List<TvAirProgramEventDto>(1);
+            matches.Add(programme);
+            indexedEvents++;
+        }
+        // Narrow the verified index using only compact episode keys before materializing
+        // any canonical record. A match with a range is only a coverage hint, not a repair.
+        var ranges = new Dictionary<string, List<(TvAirProgramEventDto Event, int First, int Last)>>(StringComparer.Ordinal);
+        foreach (var programme in futureEvents)
+        {
+            if (!TryRecoveryMultiEpisodeRange(programme.Title, out var stem, out var first, out var last)) continue;
+            if (!ranges.TryGetValue(stem, out var collection))
+                ranges[stem] = collection = new List<(TvAirProgramEventDto, int, int)>();
+            collection.Add((programme, first, last));
+        }
+        var indexedIdentified = lookup.Count(e => e.EpisodeKey.Length != 0);
+        var indexedUnresolved = lookup.Length - indexedIdentified;
+        var fetchedMonths = 0;
+        var fetchedRows = 0;
+        if (usedVerifiedLookup)
+        {
+            var possibleRows = lookup.Where(e => e.EpisodeKey.Length != 0 &&
+                ((byEpisode.TryGetValue(e.EpisodeKey, out var programmes) &&
+                    programmes.Any(x => x.Start > e.ScheduledStartTime)) ||
+                 (e.EpisodeKey.LastIndexOf('#') is var cut && cut > 0 &&
+                    int.TryParse(e.EpisodeKey[(cut + 1)..], out var episodeNumber) &&
+                    ranges.TryGetValue(e.EpisodeKey[..cut], out var coveredRanges) &&
+                    coveredRanges.Any(x => episodeNumber >= x.First && episodeNumber <= x.Last &&
+                        x.Event.Start > e.ScheduledStartTime)))).ToArray();
+            if (possibleRows.Length != 0)
+            {
+                try
+                {
+                    // Fetch only months containing possible matches; validate every requested
+                    // identity against the already verified index. Never trust a sidecar alone.
+                    var selected = new List<AIrhythmRecoveryAttempt>();
+                    foreach (var group in possibleRows.GroupBy(x => x.Month, StringComparer.Ordinal))
+                    {
+                        var stored = context.Storage.Get(RecoveryAttemptStorageNamespace, group.Key);
+                        if (!stored.Succeeded || stored.Value?.Value is null)
+                            throw new InvalidOperationException("Recovery month selective read failed");
+                        var rows = JsonSerializer.Deserialize<AIrhythmRecoveryAttempt[]>(
+                            stored.Value.Value.ToString() ?? "", JsonOptions)
+                            ?? throw new InvalidOperationException("Recovery month invalid");
+                        fetchedMonths++;
+                        fetchedRows += rows.Length;
+                        var byId = rows.Where(x => !string.IsNullOrWhiteSpace(x.Identity))
+                            .GroupBy(x => x.Identity, StringComparer.OrdinalIgnoreCase)
+                            .ToDictionary(x => x.Key, x => x.Last(), StringComparer.OrdinalIgnoreCase);
+                        foreach (var entry in group)
+                        {
+                            if (!byId.TryGetValue(entry.Identity, out var record) ||
+                                record.ScheduledStartTime != entry.ScheduledStartTime ||
+                                !string.Equals(TryRecoveryEpisodeKey(record.ProgramTitle, out var key) ? key : "",
+                                    entry.EpisodeKey, StringComparison.Ordinal))
+                                throw new InvalidOperationException("Recovery selective identity mismatch");
+                            selected.Add(record);
+                        }
+                    }
+                    attempts = selected.ToArray();
+                }
+                catch (Exception ex)
+                {
+                    // A partial month cannot make an old attempt disappear.
+                    usedVerifiedLookup = false;
+                    lock (Gate) attempts = RecoveryAttempts.Values.ToArray();
+                    // A failed lazy read cannot silently hide old attempts.
+                    // Disable this diagnostic pass until the full canonical path is available.
+                    if (_recoveryLazyIndexed) return;
+                    WriteDeveloperLog($"RECOVERY_MONTH_SELECTIVE result=FALLBACK type={ex.GetType().Name} selection=canonical_all");
+                }
+            }
+        }
+        WriteDeveloperLog($"RECOVERY_MONTH_SELECTIVE result=OBSERVED selection={(usedVerifiedLookup ? "verified_filtered" : "canonical_fallback")} indexedAttempts={journalCount} prefilterCandidates={(usedVerifiedLookup ? attempts.Length : -1)} loadedMonths={fetchedMonths} loadedRows={fetchedRows} canonicalResident={(!_recoveryLazyIndexed).ToString()} noReservation=True noResolution=True");
+        var identified = usedVerifiedLookup ? indexedIdentified : 0;
+        var unresolved = usedVerifiedLookup ? indexedUnresolved : 0;
+        var possible = 0;
+        var distinctCandidates = new HashSet<string>(StringComparer.Ordinal);
+        var reported = 0;
+        foreach (var attempt in attempts)
+        {
+            if (!TryRecoveryEpisodeKey(attempt.ProgramTitle, out var episode))
+            {
+                if (!usedVerifiedLookup) unresolved++;
+                continue;
+            }
+            if (!usedVerifiedLookup) identified++;
+            if (!byEpisode.TryGetValue(episode, out var matches)) continue;
+            foreach (var candidate in matches)
+            {
+                // Never infer a replacement from the original broadcast or an earlier airing.
+                if (candidate.Start <= attempt.ScheduledStartTime) continue;
+                var unique = episode + "|" + candidate.NetworkId + ":" + candidate.TransportStreamId
+                    + ":" + candidate.ServiceId + ":" + candidate.EventNumber + ":" + candidate.Start.UtcTicks;
+                if (!distinctCandidates.Add(unique)) continue;
+                possible++;
+                if (reported++ < 6)
+                    WriteDeveloperLog($"RECOVERY_EPG_CANDIDATE sourceStation={attempt.ServiceName} sourceProgramme={attempt.ProgramTitle} sourceScheduled={attempt.ScheduledStartTime:yyyy-MM-dd HH:mm} candidateStation={candidate.ServiceName} candidateProgramme={candidate.Title} candidateStart={candidate.Start:yyyy-MM-dd HH:mm} identity={episode} status=UNVERIFIED noReservation=True noResolution=True");
+            }
+        }
+        // Separate coverage-only hints from exact single-episode candidates.
+        // This scan is bounded to the already loaded future EPG snapshot and does
+        // not cross-join the full recording history with each programme.
+        var covered = 0;
+        var coverageSamples = 0;
+        var coveredUnique = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var attempt in attempts)
+        {
+            if (!TryRecoveryEpisodeKey(attempt.ProgramTitle, out var episode)) continue;
+            var cut = episode.LastIndexOf('#');
+            if (cut <= 0 || !int.TryParse(episode[(cut + 1)..], out var number)
+                || !ranges.TryGetValue(episode[..cut], out var collection)) continue;
+            foreach (var range in collection)
+            {
+                if (number < range.First || number > range.Last || range.Event.Start <= attempt.ScheduledStartTime) continue;
+                var unique = episode + "|" + range.Event.NetworkId + ":" + range.Event.TransportStreamId
+                    + ":" + range.Event.ServiceId + ":" + range.Event.EventNumber + ":" + range.Event.Start.UtcTicks;
+                if (!coveredUnique.Add(unique)) continue;
+                covered++;
+                if (coverageSamples++ < 6)
+                    WriteDeveloperLog($"RECOVERY_EPG_MULTIPART_SAMPLE sourceStation={attempt.ServiceName} sourceProgramme={attempt.ProgramTitle} sourceScheduled={attempt.ScheduledStartTime:yyyy-MM-dd HH:mm} candidateStation={range.Event.ServiceName} candidateProgramme={range.Event.Title} candidateStart={range.Event.Start:yyyy-MM-dd HH:mm} includedEpisode={number} status=COVERAGE_HINT_ONLY qualityPerEpisode=UNKNOWN noReservation=True noResolution=True");
+            }
+        }
+        WriteDeveloperLog($"RECOVERY_EPG_MULTIPART result=OBSERVED indexedRangeProgrammes={ranges.Values.Sum(x => x.Count)} indexedStems={ranges.Count} coverageHints={covered} action=diagnostic_only automaticReservation=False recoveryMutation=False");
+        WriteDeveloperLog($"RECOVERY_EPG_INDEX result=OBSERVED recoveryAttempts={journalCount} lookupSelection={(usedVerifiedLookup ? "verified" : "canonical_fallback")} identified={identified} unresolved={unresolved} futureEvents={futureEvents.Count} indexedEvents={indexedEvents} indexedEpisodeKeys={byEpisode.Count} possibleCandidates={possible} sampleLimit=6 scope=snapshot_only matching=exact_episode_stem_number ambiguity=defer automaticReservation=False recoveryMutation=False preferenceMutation=False");
+#endif
+    }
+
+    // Index-only startup: all canonical month bytes are SHA-256-checked before accepting
+    // an index; no old month is deserialized into a long-lived object. Any mismatch
+    // returns to the complete canonical loader (which is still the authoritative path).
+    private static bool TryLoadVerifiedRecoveryManifest(ITvAirPluginRuntimeContext context)
+    {
+        try
+        {
+            var result = context.Storage.Get(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey);
+            if (!result.Succeeded || result.Value?.Value is null) return false;
+            var manifest = JsonSerializer.Deserialize<AIrhythmRecoveryLookupManifest>(result.Value.Value.ToString() ?? "", JsonOptions);
+            if (manifest?.SchemaVersion != 2 || manifest.Entries is null || manifest.Months is null) return false;
+            var allMonths = context.Storage.ListKeys(RecoveryAttemptStorageNamespace).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+            var expectedMonths = manifest.Months.OrderBy(x => x.Month, StringComparer.Ordinal).ToArray();
+            if (allMonths.Length != expectedMonths.Length ||
+                !allMonths.SequenceEqual(expectedMonths.Select(x => x.Month), StringComparer.Ordinal)) return false;
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in manifest.Entries)
+            {
+                if (string.IsNullOrWhiteSpace(entry.Identity) || !ids.Add(entry.Identity) ||
+                    !allMonths.Contains(entry.Month, StringComparer.Ordinal)) return false;
+            }
+            if (manifest.Entries.Length != expectedMonths.Sum(x => x.RowCount)) return false;
+            foreach (var month in expectedMonths)
+            {
+                if (month.RowCount < 0 || month.Sha256?.Length != 64 ||
+                    manifest.Entries.Count(e => e.Month == month.Month) != month.RowCount) return false;
+                var fetched = context.Storage.Get(RecoveryAttemptStorageNamespace, month.Month);
+                if (!fetched.Succeeded || fetched.Value?.Value is null) return false;
+                var raw = fetched.Value.Value.ToString() ?? "";
+                var actual = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw)));
+                if (!string.Equals(actual, month.Sha256, StringComparison.OrdinalIgnoreCase)) return false;
+                // A fingerprint only authenticates the canonical bytes named by the
+                // manifest.  It does NOT authenticate the manifest's own entry IDs.
+                // Check IDs against the authoritative month without retaining the
+                // recording-attempt objects after startup.
+                using var doc = JsonDocument.Parse(raw);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array) return false;
+                var canonicalIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var row in doc.RootElement.EnumerateArray())
+                {
+                    if (row.ValueKind != JsonValueKind.Object ||
+                        !row.TryGetProperty("identity", out var identityValue) ||
+                        identityValue.ValueKind != JsonValueKind.String) return false;
+                    var identity = identityValue.GetString();
+                    if (string.IsNullOrWhiteSpace(identity) || !canonicalIds.Add(identity)) return false;
+                }
+                if (canonicalIds.Count != month.RowCount ||
+                    manifest.Entries.Where(e => e.Month == month.Month)
+                        .Any(e => !canonicalIds.Contains(e.Identity))) return false;
+            }
+            _verifiedRecoveryLookup = manifest.Entries;
+            _recoveryLookupChecked = true;
+            _recoveryLazyIndexed = true;
+            _recoveryIndexedTotal = manifest.Entries.Length;
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            WriteDeveloperLog($"RECOVERY_LAZY_STARTUP result=VERIFIED_INDEX_ONLY indexedAttempts={manifest.Entries.Length} fingerprintMonths={expectedMonths.Length} canonicalObjects=0 hash=SHA256 fallback=all_months_on_index_failure");
+#endif
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    private static Dictionary<string, AIrhythmRecoveryAttempt> ReadRecoveryMonth(ITvAirPluginRuntimeContext context, string month)
+    {
+        var fetched = context.Storage.Get(RecoveryAttemptStorageNamespace, month);
+        if (!fetched.Succeeded || fetched.Value?.Value is null)
+            throw new InvalidOperationException("Recovery month read failed");
+        var rows = JsonSerializer.Deserialize<AIrhythmRecoveryAttempt[]>(fetched.Value.Value.ToString() ?? "", JsonOptions)
+            ?? throw new InvalidOperationException("Recovery month invalid");
+        var bucket = new Dictionary<string, AIrhythmRecoveryAttempt>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in rows)
+        {
+            if (string.IsNullOrWhiteSpace(row.Identity) || !bucket.TryAdd(row.Identity, row))
+                throw new InvalidOperationException("Recovery month contains invalid or duplicate identity");
+        }
+        return bucket;
+    }
+
+    private static void MergeRecoveryAttempts(ITvAirPluginRuntimeContext context,
+        IReadOnlyList<TvAirRecordingHistoryDto> hostHistory,
+        IReadOnlyList<TvAirRecordingHistoryDto> durableHistory)
+    {
+        var previouslyPersisted = 0;
+        lock (Gate)
+        {
+            if (!_recoveryAttemptsLoaded)
+            {
+                // Mark loaded only after trying the entire namespace; errors must not silently
+                // replace persisted journal records with an empty cache.
+                try
+                {
+                    if (TryLoadVerifiedRecoveryManifest(context))
+                    {
+                        _recoveryAttemptsLoaded = true;
+                        previouslyPersisted = _recoveryIndexedTotal;
+                    }
+                    else
+                    {
+                    foreach (var month in context.Storage.ListKeys(RecoveryAttemptStorageNamespace))
+                    {
+                        var result = context.Storage.Get(RecoveryAttemptStorageNamespace, month);
+                        if (!result.Succeeded || result.Value?.Value is null)
+                            throw new InvalidOperationException("Recovery journal read failed");
+                        var rows = JsonSerializer.Deserialize<AIrhythmRecoveryAttempt[]>(result.Value.Value.ToString() ?? "", JsonOptions)
+                            ?? throw new InvalidOperationException("Recovery journal invalid");
+                        foreach (var row in rows)
+                        {
+                            if (string.IsNullOrWhiteSpace(row.Identity)) continue;
+                            // Keep canonical and buckets in sync even for a duplicate ID in an older chunk.
+                            if (RecoveryAttempts.TryGetValue(row.Identity, out var oldRow))
+                            {
+                                var oldMonth = oldRow.Start.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+                                if (RecoveryAttemptsByMonth.TryGetValue(oldMonth, out var oldBucket))
+                                    oldBucket.Remove(row.Identity);
+                            }
+                            RecoveryAttempts[row.Identity] = row;
+                            var rowMonth = row.Start.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+                            if (!RecoveryAttemptsByMonth.TryGetValue(rowMonth, out var bucket))
+                                RecoveryAttemptsByMonth[rowMonth] = bucket = new Dictionary<string, AIrhythmRecoveryAttempt>(StringComparer.OrdinalIgnoreCase);
+                            bucket[row.Identity] = row;
+                        }
+                    }
+                    _recoveryAttemptsLoaded = true;
+                    previouslyPersisted = RecoveryAttempts.Count;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    RecoveryAttempts.Clear();
+                    RecoveryAttemptsByMonth.Clear();
+                    WriteDeveloperLog($"RECOVERY_JOURNAL result=LOAD_ERROR type={ex.GetType().Name} action=skip_mutation");
+                    return;
+                }
+            }
+        }
+        var updatedMonths = new HashSet<string>(StringComparer.Ordinal);
+        lock (Gate) updatedMonths.UnionWith(_recoveryDirtyMonths);
+        var added = 0;
+        // Durable success-quality facts and still-visible unsuccessful Host records.
+        // Never write failed/cancelled attempts into positive preference evidence.
+        var candidates = durableHistory.Where(x => x.ResultFinalized && x.QualityDataAvailable &&
+            ((x.DropCount ?? 0) > 0 || (x.ErrorCount ?? 0) > 0 || (x.ScrambleCount ?? 0) > 0))
+            .Concat(hostHistory.Where(x => x.ResultFinalized && IsRecordingFailureForRecovery(x)));
+        lock (Gate)
+        {
+            foreach (var item in candidates)
+            {
+                if (string.IsNullOrWhiteSpace(item.ProgramTitle)) continue;
+                var identity = UsageRecordingIdentity(item);
+                if (string.IsNullOrWhiteSpace(identity)) continue;
+                var row = new AIrhythmRecoveryAttempt(identity, item.ServiceName ?? "", item.ProgramTitle ?? "",
+                    item.NetworkId, item.TransportStreamId, item.ServiceId, item.EventId,
+                    item.ScheduledStartTime, item.Start, item.End,
+                    item.Result ?? "", item.EndReason ?? "", item.FileCreated,
+                    item.DropCount, item.ErrorCount, item.ScrambleCount,
+                    item.QualityDataAvailable, item.QualitySource ?? "");
+                if (RecoveryAttempts.ContainsKey(identity) ||
+                    (_recoveryLazyIndexed && _verifiedRecoveryLookup.Any(e => string.Equals(e.Identity, identity, StringComparison.OrdinalIgnoreCase)))) continue;
+                var rowMonth = row.Start.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+                if (_recoveryLazyIndexed && !RecoveryAttemptsByMonth.ContainsKey(rowMonth))
+                {
+                    try
+                    {
+                        var months = context.Storage.ListKeys(RecoveryAttemptStorageNamespace);
+                        var historical = months.Contains(rowMonth, StringComparer.Ordinal)
+                            ? ReadRecoveryMonth(context, rowMonth)
+                            : new Dictionary<string, AIrhythmRecoveryAttempt>(StringComparer.OrdinalIgnoreCase);
+                        var expected = _verifiedRecoveryLookup.Where(e => e.Month == rowMonth)
+                            .Select(e => e.Identity).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                        if (historical.Count != expected.Count ||
+                            historical.Keys.Any(id => !expected.Contains(id)) ||
+                            historical.Values.Any(r => r.Start.ToString("yyyy-MM", CultureInfo.InvariantCulture) != rowMonth))
+                            throw new InvalidOperationException("Recovery write-month content differs from verified index");
+                        RecoveryAttemptsByMonth[rowMonth] = historical;
+                    }
+                    catch (Exception ex)
+                    {
+                        // A failed read is NOT a dirty writable month. Retrying by writing
+                        // an absent bucket would replace historical records with [].
+                        WriteDeveloperLog($"RECOVERY_JOURNAL result=LOAD_ERROR month={rowMonth} type={ex.GetType().Name} action=skip_month_preserve_pending");
+                        // Continue processing other months and pending dirty writes. A read
+                        // failure for one month must not discard unrelated recording facts.
+                        continue;
+                    }
+                }
+                RecoveryAttempts.Add(identity, row);
+                if (!RecoveryAttemptsByMonth.TryGetValue(rowMonth, out var bucket))
+                    RecoveryAttemptsByMonth[rowMonth] = bucket = new Dictionary<string, AIrhythmRecoveryAttempt>(StringComparer.OrdinalIgnoreCase);
+                bucket.Add(identity, row);
+                updatedMonths.Add(rowMonth);
+                added++;
+            }
+        }
+        var verified = 0;
+        foreach (var month in updatedMonths)
+        {
+            AIrhythmRecoveryAttempt[] rows;
+            lock (Gate)
+            {
+                // A retry must never synthesize an empty replacement for an
+                // unreadable month; only an explicitly loaded bucket is writable.
+                if (!RecoveryAttemptsByMonth.TryGetValue(month, out var bucket))
+                {
+                    WriteDeveloperLog($"RECOVERY_JOURNAL result=WRITE_DEFERRED month={month} reason=canonical_bucket_not_loaded action=preserve_original");
+                    continue;
+                }
+                rows = bucket.Values.OrderBy(x => x.Start).ThenBy(x => x.Identity, StringComparer.Ordinal).ToArray();
+            }
+            try
+            {
+                var payload = JsonSerializer.Serialize(rows, JsonOptions);
+                var alreadyCommitted = false;
+                long? expectedCanonicalRevision = null;
+                if (_recoveryLazyIndexed)
+                {
+                    var old = context.Storage.Get(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey);
+                    var baseManifest = old.Succeeded && old.Value?.Value is not null
+                        ? JsonSerializer.Deserialize<AIrhythmRecoveryLookupManifest>(old.Value.Value.ToString() ?? "", JsonOptions)
+                        : null;
+                    if (baseManifest?.SchemaVersion != 2 || baseManifest.Months is null)
+                        throw new InvalidOperationException("Recovery prewrite manifest unreadable");
+                    var oldFingerprint = baseManifest.Months.FirstOrDefault(x => x.Month == month);
+                    var canonical = context.Storage.Get(RecoveryAttemptStorageNamespace, month);
+                    if (oldFingerprint is null)
+                    {
+                        if (context.Storage.Exists(RecoveryAttemptStorageNamespace, month))
+                        {
+                            // A previous partial commit may have written this previously absent month.
+                            // Accept only an exact byte-for-byte copy of our pending payload.
+                            if (!canonical.Succeeded || canonical.Value?.Value is null ||
+                                !string.Equals(canonical.Value.Value.ToString(), payload, StringComparison.Ordinal))
+                                throw new InvalidOperationException("Recovery prewrite unexpected existing month");
+                            alreadyCommitted = true;
+                        }
+                    }
+                    else
+                    {
+                        if (!canonical.Succeeded || canonical.Value?.Value is null)
+                            throw new InvalidOperationException("Recovery prewrite canonical unreadable");
+                        // Bind a read/modify/write to the storage revision. A checksum
+                        // validated BEFORE Set alone cannot prevent a concurrent update.
+                        expectedCanonicalRevision = canonical.Value.Revision;
+                        var canonicalText = canonical.Value.Value.ToString() ?? "";
+                        var canonicalHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalText)));
+                        if (!string.Equals(canonicalHash, oldFingerprint.Sha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            // The previous pass may have committed this month before another
+                            // month failed, leaving only the expendable manifest out of date.
+                            // Never treat arbitrary external mutations as successful writes.
+                            if (!string.Equals(canonicalText, payload, StringComparison.Ordinal))
+                                throw new InvalidOperationException("Recovery prewrite canonical fingerprint changed");
+                            alreadyCommitted = true;
+                        }
+                    }
+                }
+                if (!alreadyCommitted)
+                {
+                var written = context.Storage.Set(RecoveryAttemptStorageNamespace, month, payload, expectedRevision: expectedCanonicalRevision);
+                if (!written.Succeeded) throw new InvalidOperationException("Recovery journal write failed");
+// Persistence safety is a production invariant, not a Developer-only diagnostic.
+                // A successful Set without verified readback must never retire a dirty
+                // month or allow the lookup to claim that the write was committed.
+                var checkedValue = context.Storage.Get(RecoveryAttemptStorageNamespace, month);
+                if (!checkedValue.Succeeded || !string.Equals(checkedValue.Value?.Value?.ToString(), payload, StringComparison.Ordinal))
+                    throw new InvalidOperationException("Recovery journal readback mismatch");
+                }
+                verified++;
+                lock (Gate) _recoveryDirtyMonths.Remove(month);
+            }
+            catch (Exception ex)
+            {
+                WriteDeveloperLog($"RECOVERY_JOURNAL result=WRITE_ERROR month={month} type={ex.GetType().Name} action=keep_memory_retry_on_next_snapshot");
+                // Retain candidates in memory. Next snapshot retries this month.
+                lock (Gate) _recoveryDirtyMonths.Add(month);
+            }
+        }
+        // Sidecar is diagnostic-only and expendable. Never delete or rewrite an original journal
+        // based on a missing, damaged or obsolete lookup. Rebuild from authoritative month buckets.
+        // The sidecar must never claim facts that failed to commit to the authoritative months.
+        bool recoveryJournalClean;
+        lock (Gate) recoveryJournalClean = _recoveryDirtyMonths.Count == 0;
+        if (recoveryJournalClean && (!_recoveryLookupChecked || updatedMonths.Count != 0))
+            VerifyRecoveryLookupSidecar(context, updatedMonths.Count != 0);
+        if (_recoveryLazyIndexed && recoveryJournalClean && _recoveryLookupChecked)
+        {
+            lock (Gate)
+            {
+                // The verified sidecar now contains every committed identity.
+                // Retire materialized month objects; keep canonical bytes on disk.
+                RecoveryAttemptsByMonth.Clear();
+                RecoveryAttempts.Clear();
+            }
+        }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        int total;
+        lock (Gate) total = _recoveryLazyIndexed ? _recoveryIndexedTotal + RecoveryAttempts.Values.Count(x => !_verifiedRecoveryLookup.Any(e => string.Equals(e.Identity, x.Identity, StringComparison.OrdinalIgnoreCase))) : RecoveryAttempts.Count;
+        if (previouslyPersisted > 0 || added > 0)
+        {
+        var identified = 0;
+        var unidentified = 0;
+        var distinctEpisodeKeys = new HashSet<string>(StringComparer.Ordinal);
+        AIrhythmRecoveryAttempt[] recentSamples;
+        lock (Gate)
+        {
+            // Sample only a bounded number; do not log or scan an ever-growing full journal
+            // for each rendered page. This first-load audit is deliberately Developer-only.
+            recentSamples = RecoveryAttempts.Values.OrderByDescending(x => x.Start).Take(6).ToArray();
+        }
+        foreach (var sample in recentSamples)
+        {
+            var safe = TryRecoveryEpisodeKey(sample.ProgramTitle, out var episodeKey);
+            if (safe && distinctEpisodeKeys.Add(episodeKey)) identified++; else unidentified++;
+            WriteDeveloperLog($"RECOVERY_JOURNAL_SAMPLE station={sample.ServiceName} programme={sample.ProgramTitle} scheduled={sample.ScheduledStartTime:yyyy-MM-dd HH:mm} episodeIdentity={(safe ? episodeKey : "unresolved")} drop={sample.DropCount?.ToString(CultureInfo.InvariantCulture) ?? "unknown"} cc={sample.ErrorCount?.ToString(CultureInfo.InvariantCulture) ?? "unknown"} action=observe_only");
+        }
+        WriteDeveloperLog($"RECOVERY_JOURNAL_MONTH_INDEX result=OBSERVED months={(_recoveryLazyIndexed ? _verifiedRecoveryLookup.Select(x => x.Month).Distinct(StringComparer.Ordinal).Count() : RecoveryAttemptsByMonth.Count)} attempts={total} writeSelection=changed_month_bucket_only initialLoad={(_recoveryLazyIndexed ? "verified_index_only" : "all_months_fallback")} memoryOptimization={(_recoveryLazyIndexed ? "canonical_objects_on_demand" : "partial")} diskSchema=unchanged");
+        WriteDeveloperLog($"RECOVERY_JOURNAL result=OBSERVED total={total} loadedOnThisCapture={previouslyPersisted} added={added} changedMonths={updatedMonths.Count} verifiedMonths={verified} sampleEpisodeIdentified={identified} sampleUnresolvedOrDuplicate={unidentified} retention=indefinite match=diagnostic_only automaticReservation=False preferenceMutation=False");
+        }
+#endif
+    }
+
+    private static void VerifyRecoveryLookupSidecar(ITvAirPluginRuntimeContext context, bool journalMonthChanged)
+    {
+        AIrhythmRecoveryLookupEntry[] entries;
+        lock (Gate)
+        {
+            if (!_recoveryAttemptsLoaded) return;
+            var savedEntries = _recoveryLazyIndexed ? _verifiedRecoveryLookup : Array.Empty<AIrhythmRecoveryLookupEntry>();
+            var changedKeys = RecoveryAttemptsByMonth.Keys.ToHashSet(StringComparer.Ordinal);
+            entries = savedEntries.Where(e => !changedKeys.Contains(e.Month))
+                .Concat(RecoveryAttemptsByMonth
+                    .SelectMany(pair => pair.Value.Values.Select(row =>
+                        new AIrhythmRecoveryLookupEntry(row.Identity, pair.Key,
+                            TryRecoveryEpisodeKey(row.ProgramTitle, out var key) ? key : string.Empty,
+                            row.ScheduledStartTime))))
+                .OrderBy(row => row.Month, StringComparer.Ordinal)
+                .ThenBy(row => row.Identity, StringComparer.Ordinal).ToArray();
+        }
+        // Schema 2 binds every monthly canonical payload to the expendable lookup.
+        // Checksum verification is observational only: never repair or overwrite a source month.
+        // A future lazy loader must verify these fingerprints before trusting index-only reads.
+        AIrhythmRecoveryMonthFingerprint[] fingerprints;
+        try
+        {
+            var monthGroups = entries.GroupBy(e => e.Month, StringComparer.Ordinal)
+                .OrderBy(g => g.Key, StringComparer.Ordinal).ToArray();
+            var priorManifestResult = _recoveryLazyIndexed
+                ? context.Storage.Get(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey)
+                : null;
+            var priorFingerprints = _recoveryLazyIndexed && priorManifestResult?.Succeeded == true
+                ? JsonSerializer.Deserialize<AIrhythmRecoveryLookupManifest>(priorManifestResult.Value?.Value?.ToString() ?? "", JsonOptions)?.Months ?? Array.Empty<AIrhythmRecoveryMonthFingerprint>()
+                : Array.Empty<AIrhythmRecoveryMonthFingerprint>();
+            var checkedMonths = new List<AIrhythmRecoveryMonthFingerprint>(monthGroups.Length);
+            foreach (var group in monthGroups)
+            {
+                var fetched = context.Storage.Get(RecoveryAttemptStorageNamespace, group.Key);
+                if (!fetched.Succeeded || fetched.Value?.Value is null)
+                    throw new InvalidOperationException("Recovery original month unreadable for fingerprint");
+                var raw = fetched.Value.Value.ToString() ?? string.Empty;
+                // Match the canonical on-disk IDs, not merely the index's count.
+                var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw)));
+                if (_recoveryLazyIndexed && !RecoveryAttemptsByMonth.ContainsKey(group.Key))
+                {
+                    var prior = priorFingerprints.FirstOrDefault(x => x.Month == group.Key);
+                    if (prior is null || prior.RowCount != group.Count() ||
+                        !string.Equals(prior.Sha256, digest, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("Untouched recovery month fingerprint mismatch");
+                    checkedMonths.Add(new AIrhythmRecoveryMonthFingerprint(group.Key, group.Count(), digest));
+                    continue;
+                }
+                var persisted = JsonSerializer.Deserialize<AIrhythmRecoveryAttempt[]>(raw, JsonOptions)
+                    ?? throw new InvalidOperationException("Recovery original month invalid for fingerprint");
+                var persistedIds = persisted.Select(r => r.Identity)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                if (persisted.Length != group.Count() || persistedIds.Count != group.Count() ||
+                    group.Any(e => !persistedIds.Contains(e.Identity)))
+                    throw new InvalidOperationException("Recovery month differs from sidecar identity set");
+                checkedMonths.Add(new AIrhythmRecoveryMonthFingerprint(group.Key, persisted.Length, digest));
+            }
+            fingerprints = checkedMonths.ToArray();
+        }
+        catch (Exception ex)
+        {
+            lock (Gate) { _recoveryLookupChecked = false; }
+            WriteDeveloperLog($"RECOVERY_LOOKUP_FINGERPRINT result=DEFERRED type={ex.GetType().Name} action=preserve_canonical");
+            return;
+        }
+        var expected = JsonSerializer.Serialize(new AIrhythmRecoveryLookupManifest(2, entries, fingerprints), JsonOptions);
+        var status = "matched";
+        try
+        {
+            var existing = context.Storage.Get(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey);
+            if (existing.Succeeded && string.Equals(existing.Value?.Value?.ToString(), expected, StringComparison.Ordinal))
+            {
+                lock (Gate) { _verifiedRecoveryLookup = entries; _recoveryLookupChecked = true; _recoveryIndexedTotal = entries.Length; }
+            }
+            else
+            {
+                // A read error is not a missing key: do not overwrite a possibly intact sidecar.
+                if (!existing.Succeeded && context.Storage.Exists(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey))
+                    throw new InvalidOperationException("Lookup sidecar read failed");
+                // The sidecar is expendable but a stale rebuild must not overwrite
+                // a concurrent newer index. Reuse the revision read immediately above.
+                // An absent key has no SDK-guaranteed create-if-absent operation.
+                var expectedLookupRevision = existing.Succeeded && existing.Value is not null
+                    ? existing.Value.Revision : (long?)null;
+                var written = context.Storage.Set(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey,
+                    expected, expectedRevision: expectedLookupRevision);
+                if (!written.Succeeded) throw new InvalidOperationException("Lookup sidecar revision conflict or write failed");
+                var readback = context.Storage.Get(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey);
+                if (!readback.Succeeded || !string.Equals(readback.Value?.Value?.ToString(), expected, StringComparison.Ordinal))
+                    throw new InvalidOperationException("Lookup sidecar readback failed");
+                status = "rebuilt_verified";
+                lock (Gate) { _verifiedRecoveryLookup = entries; _recoveryLookupChecked = true; _recoveryIndexedTotal = entries.Length; }
+            }
+        }
+        catch (Exception ex)
+        {
+            status = "deferred_" + ex.GetType().Name;
+            lock (Gate) { _recoveryLookupChecked = false; }
+        }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        WriteDeveloperLog($"RECOVERY_LOOKUP_FINGERPRINT result={(status == "matched" || status == "rebuilt_verified" ? "VERIFIED" : "DEFERRED")} months={fingerprints.Length} rows={fingerprints.Sum(x => x.RowCount)} hash=SHA256 canonicalMutation=False lazyLoad={_recoveryLazyIndexed}");
+        WriteDeveloperLog($"RECOVERY_LOOKUP_SIDECAR result={status} schema=2 indexedAttempts={entries.Length} identified={entries.Count(x => x.EpisodeKey.Length != 0)} unresolved={entries.Count(x => x.EpisodeKey.Length == 0)} months={entries.Select(x => x.Month).Distinct(StringComparer.Ordinal).Count()} source=authoritative_recovery_months changedJournalMonth={journalMonthChanged} journalMutation=False reservationMutation=False lazyLoad={(_recoveryLazyIndexed ? "verified_index_only" : "fallback_all_months")} epgSelection=verified_sidecar_identity_or_full_fallback");
+#endif
     }
 
     private static int MergeUsefulRecordingFacts(ITvAirPluginRuntimeContext context, IEnumerable<TvAirRecordingHistoryDto> source)
@@ -10071,7 +11420,19 @@ internal static partial class AIrhythmDataState
                 var fact = ToRecordingFact(item);
                 if (fact.Identity.Length == 0)
                     continue;
-                if (RecordingFacts.TryGetValue(fact.Identity, out var existing) && existing == fact)
+                RecordingFacts.TryGetValue(fact.Identity, out var existing);
+                // Older Host history projections can omit finalized quality metadata.
+                // Never let such a projection erase stronger evidence already persisted.
+                if (existing is not null && existing.QualityDataAvailable && !fact.QualityDataAvailable)
+                    fact = fact with
+                    {
+                        DropCount = existing.DropCount, ErrorCount = existing.ErrorCount,
+                        ScrambleCount = existing.ScrambleCount,
+                        QualityDataAvailable = true,
+                        QualityCompleteness = existing.QualityCompleteness,
+                        QualitySource = existing.QualitySource
+                    };
+                if (existing == fact)
                     continue;
                 if (existing is not null)
                     changedMonths.Add(RecordingFactMonthKey(existing));
@@ -10134,27 +11495,6 @@ internal static partial class AIrhythmDataState
         WriteDeveloperLog($"EVIDENCE_CALIBRATION_MEMORY result=OK samples={n} meanSelectedStrength=[identity:{Mean(state.IdentitySelectedStrengthTotal,n):0.000},content:{Mean(state.ContentSelectedStrengthTotal,n):0.000},context:{Mean(state.ContextSelectedStrengthTotal,n):0.000},explicit:{Mean(state.ExplicitSelectedStrengthTotal,n):0.000}] meanBackgroundStrength=[identity:{Mean(state.IdentityBackgroundStrengthTotal,n):0.000},content:{Mean(state.ContentBackgroundStrengthTotal,n):0.000},context:{Mean(state.ContextBackgroundStrengthTotal,n):0.000},explicit:{Mean(state.ExplicitBackgroundStrengthTotal,n):0.000}] meanDiscriminativeLift=[identity:{Mean(state.IdentitySelectedStrengthTotal-state.IdentityBackgroundStrengthTotal,n):0.000},content:{Mean(state.ContentSelectedStrengthTotal-state.ContentBackgroundStrengthTotal,n):0.000},context:{Mean(state.ContextSelectedStrengthTotal-state.ContextBackgroundStrengthTotal,n):0.000},explicit:{Mean(state.ExplicitSelectedStrengthTotal-state.ExplicitBackgroundStrengthTotal,n):0.000}] meanConfidence=[identity:{Mean(state.IdentityConfidenceTotal,n):0.000},content:{Mean(state.ContentConfidenceTotal,n):0.000},context:{Mean(state.ContextConfidenceTotal,n):0.000},explicit:{Mean(state.ExplicitConfidenceTotal,n):0.000}] target=positive_reservation_prechoice_only availabilityBaseline=current_scored_population targetLeakagePrevented=True negativePreferenceInference=False persistence=plugin_storage shadowOnly=True productionMutation=False");
     }
 
-#endif
-
-    private static TvAirReservationDto? ResolveAddedReservation(ITvAirPluginRuntimeContext context, PluginEventEnvelope envelope)
-    {
-        var entityId = envelope.EntityId?.Trim() ?? string.Empty;
-        var matchedReservation = envelope.Payload as TvAirReservationDto;
-        try
-        {
-            var userReservations = context.Reservations.List(new TvAirReservationQueryDto { IncludeSystemEntries = false });
-            if (matchedReservation is null || !userReservations.Any(x => string.Equals(x.ReservationId, matchedReservation.ReservationId, StringComparison.OrdinalIgnoreCase)))
-            {
-                matchedReservation = userReservations.FirstOrDefault(x =>
-                    string.Equals(x.ReservationId, entityId, StringComparison.OrdinalIgnoreCase)
-                    || (entityId.Length > 0 && entityId.EndsWith($":{x.ReservationId}", StringComparison.OrdinalIgnoreCase)));
-            }
-        }
-        catch { return null; }
-        return matchedReservation;
-    }
-
-#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
     private static void ObserveEvidenceCalibrationFromRuntimeEvent(ITvAirPluginRuntimeContext context, string eventType, PluginEventEnvelope envelope, TvAirReservationDto? resolvedAddedReservation)
     {
         if (!string.Equals(eventType, "ReservationAdded", StringComparison.OrdinalIgnoreCase))
@@ -10235,6 +11575,24 @@ internal static partial class AIrhythmDataState
         WriteDeveloperLog($"EVIDENCE_CALIBRATION_MEMORY result=OK samples={n} meanSelectedStrength=[identity:{Mean(next.IdentitySelectedStrengthTotal,n):0.000},content:{Mean(next.ContentSelectedStrengthTotal,n):0.000},context:{Mean(next.ContextSelectedStrengthTotal,n):0.000},explicit:{Mean(next.ExplicitSelectedStrengthTotal,n):0.000}] meanBackgroundStrength=[identity:{Mean(next.IdentityBackgroundStrengthTotal,n):0.000},content:{Mean(next.ContentBackgroundStrengthTotal,n):0.000},context:{Mean(next.ContextBackgroundStrengthTotal,n):0.000},explicit:{Mean(next.ExplicitBackgroundStrengthTotal,n):0.000}] meanDiscriminativeLift=[identity:{Mean(next.IdentitySelectedStrengthTotal-next.IdentityBackgroundStrengthTotal,n):0.000},content:{Mean(next.ContentSelectedStrengthTotal-next.ContentBackgroundStrengthTotal,n):0.000},context:{Mean(next.ContextSelectedStrengthTotal-next.ContextBackgroundStrengthTotal,n):0.000},explicit:{Mean(next.ExplicitSelectedStrengthTotal-next.ExplicitBackgroundStrengthTotal,n):0.000}] meanConfidence=[identity:{Mean(next.IdentityConfidenceTotal,n):0.000},content:{Mean(next.ContentConfidenceTotal,n):0.000},context:{Mean(next.ContextConfidenceTotal,n):0.000},explicit:{Mean(next.ExplicitConfidenceTotal,n):0.000}] interpretation=availability_adjusted_positive_selection_shadow negativePreferenceInference=False productionMutation=False");
     }
 #endif
+
+    private static TvAirReservationDto? ResolveAddedReservation(ITvAirPluginRuntimeContext context, PluginEventEnvelope envelope)
+    {
+        var entityId = envelope.EntityId?.Trim() ?? string.Empty;
+        var matchedReservation = envelope.Payload as TvAirReservationDto;
+        try
+        {
+            var userReservations = context.Reservations.List(new TvAirReservationQueryDto { IncludeSystemEntries = false });
+            if (matchedReservation is null || !userReservations.Any(x => string.Equals(x.ReservationId, matchedReservation.ReservationId, StringComparison.OrdinalIgnoreCase)))
+            {
+                matchedReservation = userReservations.FirstOrDefault(x =>
+                    string.Equals(x.ReservationId, entityId, StringComparison.OrdinalIgnoreCase)
+                    || (entityId.Length > 0 && entityId.EndsWith($":{x.ReservationId}", StringComparison.OrdinalIgnoreCase)));
+            }
+        }
+        catch { return null; }
+        return matchedReservation;
+    }
 
     private static void UpdateUsageTotalsFromRuntimeEvent(ITvAirPluginRuntimeContext context, string eventType, PluginEventEnvelope envelope, TvAirReservationDto? resolvedAddedReservation)
     {
@@ -10554,12 +11912,27 @@ internal static partial class AIrhythmDataState
                 reservations = reservationRecords
                     .Where(IsUsefulReservation)
                     .ToArray();
-                recoveryHistory = hostRecordingHistory
+                // Completed recording quality must survive Host history retention.
+                // Keep unsuccessful Host entries visible without injecting them into preference facts.
+                // This is an intermediate compatibility path; it is not the final indexed
+                // unbounded recovery journal and does not guarantee episode-accurate re-recording.
+                var recoveryFacts = recordingFactHistory
+                    .Where(x => x.ResultFinalized && x.QualityDataAvailable
+                        && ((x.DropCount ?? 0) > 0 || (x.ErrorCount ?? 0) > 0 || (x.ScrambleCount ?? 0) > 0));
+                recoveryHistory = recoveryFacts
+                    .Concat(hostRecordingHistory.Where(x => x.ResultFinalized && IsRecordingFailureForRecovery(x)))
                     .Where(x => (x.ActualStart ?? x.Start) <= now)
-                    .Where(x => !string.IsNullOrWhiteSpace(x.ProgramTitle) && x.ResultFinalized)
+                    .Where(x => !string.IsNullOrWhiteSpace(x.ProgramTitle))
+                    .GroupBy(UsageRecordingIdentity, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.OrderByDescending(x => x.QualityDataAvailable).First())
                     .OrderByDescending(x => x.ActualStart ?? x.Start)
                     .ToArray();
+                MergeRecoveryAttempts(context, hostRecordingHistory, recordingFactHistory);
+                AuditRecoveryEpgCandidates(context, events);
                 history = recordingFactHistory;
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                ReportRecordingQualityPersistence(recordingFactHistory, hostRecordingHistory, recoveryHistory);
+#endif
                 WriteDeveloperLog($"canonical recording facts source=AIrhythm.PersistentRecordingFacts facts={history.Count} seeded={seededRecordingFacts} hostRaw={hostRecordingHistory.Count} hostSource={recordingHistorySource} snapshotRaw={data.RecordingHistory.Count} retention=append_success_terminal_no_host_deletion consumers=score,localEvidence,dashboard,selection,discovery,search,interest");
                 active = data.ActiveRecordings;
                 channels = data.Channels
@@ -10602,16 +11975,27 @@ internal static partial class AIrhythmDataState
                 return fallback;
             }
 
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             var diagnostics = new AIrhythmRuntimeDiagnostics(
                 programRaw, events.Count, reservationRaw, reservations.Count, historyRaw, history.Count, channelRaw, channels.Count, errors.ToArray());
+            #endif
 
             var coreFailureCount = errors.Count(x => x is "番組情報" or "予約" or "録画実績");
             var snapshot = coreFailureCount == 3
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 ? Empty("番組情報を読み込めませんでした", settings, revision, diagnostics)
+#else
+                ? Empty("番組情報を読み込めませんでした", settings, revision)
+#endif
                 : new AIrhythmRuntimeSnapshot(
                     true,
                     errors.Count == 0 ? string.Empty : $"{string.Join("・", errors.Distinct())}を読み込めませんでした",
-                    events, reservations, reservationRecords, keywordRules, history, recoveryHistory, channels, tuners, advanced, settings, revision, diagnostics);
+                    events, reservations, reservationRecords, keywordRules, history, recoveryHistory, channels, tuners, advanced, settings
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                    , revision, diagnostics);
+#else
+                    , revision);
+#endif
 
             ReportSnapshot(context, snapshot);
             lock (Gate)
@@ -11014,6 +12398,11 @@ internal static partial class AIrhythmDataState
             new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase),
             new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase));
         var loadedObservations = 0L;
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        var loadedContributorMappings = 0;
+        var loadedContributorFactIds = 0;
+        var storedContributorSaveStatus = "not_required";
+#endif
 
         if (context is not null)
         {
@@ -11057,37 +12446,63 @@ internal static partial class AIrhythmDataState
                                 ? loaded.SeenContributorObservationIds ?? Array.Empty<string>()
                                 : Array.Empty<string>(),
                             ContributorLogicVersion = ContributorLogicVersion,
-                            BasePreferenceLogicVersion = BasePreferenceLogicVersion
+                            ContributorFactWorkKeys = loaded.ContributorLogicVersion == ContributorLogicVersion
+                                ? new Dictionary<string, string>(loaded.ContributorFactWorkKeys ?? new Dictionary<string, string>(), StringComparer.Ordinal)
+                                : new Dictionary<string, string>(StringComparer.Ordinal),
+                            BasePreferenceLogicVersion = BasePreferenceLogicVersion,
+                            // Preserve only recorded per-observation weights; never reconstruct
+                            // historical intent from current keyword rule definitions.
+                            BaseEvidenceLedger = new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(
+                                loaded.BaseEvidenceLedger ?? new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(),
+                                StringComparer.Ordinal)
                         };
                         loadedObservations = state.ObservationCount;
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                        loadedContributorMappings = state.ContributorFactWorkKeys?.Count ?? 0;
+                        loadedContributorFactIds = state.SeenContributorObservationIds?.Length ?? 0;
+#endif
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                         if (!basePreferenceCompatible)
-                            WriteDeveloperLog($"USER_MODEL_BASE_MIGRATION result=REBUILD previousLogic={loaded.BasePreferenceLogicVersion} nextLogic={BasePreferenceLogicVersion} previousObservations={loaded.ObservationCount} preservedContributorLogic={loaded.ContributorLogicVersion == ContributorLogicVersion} reason=additive_natural_behavior_facts");
+                            WriteDeveloperLog($"USER_MODEL_BASE_MIGRATION result=REBUILD previousLogic={loaded.BasePreferenceLogicVersion} nextLogic={BasePreferenceLogicVersion} previousObservations={loaded.ObservationCount} preservedContributorLogic={loaded.ContributorLogicVersion == ContributorLogicVersion} reason=causal_reservation_provenance");
 #endif
                     }
                 }
             }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+#else
+            catch (Exception)
+#endif
             {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"USER_MODEL_MEMORY result=LOAD_ERROR type={ex.GetType().Name} action=start_fresh");
-#else
-                _ = ex;
 #endif
             }
         }
 
         var seen = new HashSet<string>(state.SeenObservationIds ?? Array.Empty<string>(), StringComparer.Ordinal);
         var contributorSeen = new HashSet<string>(state.SeenContributorObservationIds ?? Array.Empty<string>(), StringComparer.Ordinal);
+        // New provenance is attached only to observed identity pairs. Existing historical facts
+        // with no accessible WorkKey stay unknown, never inferred from a current title.
+        var contributorFactWorkKeys = new Dictionary<string, string>(state.ContributorFactWorkKeys ?? new Dictionary<string, string>(), StringComparer.Ordinal);
+        var contributorProvenanceAdded = 0;
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        var contributorProvenanceReused = 0;
+#endif
         // The load path above already normalizes all persisted maps into OrdinalIgnoreCase dictionaries.
         // They are local to this Observe call, so mutate that single canonical working set directly
         // instead of cloning all six maps a second time before applying observations.
+        var baseEvidenceLedger = new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(
+            state.BaseEvidenceLedger ?? new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(),
+            StringComparer.Ordinal);
+        var ledgerNewEntries = 0;
         var work = state.WorkWeights;
         var genre = state.GenreWeights;
         var terms = state.TermWeights;
         var service = state.ServiceWeights;
         var hour = state.HourWeights;
-        var contributors = state.ContributorWeights ?? new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        var contributors = state.ContributorWeights
+            ?? new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         var observationRows = source as IReadOnlyList<AIrhythmUserModelObservation> ?? source.ToArray();
 
         // Contributor facts are additive from the first occurrence. Metadata presence is one +1;
@@ -11147,6 +12562,18 @@ internal static partial class AIrhythmDataState
             foreach (var contributor in uniqueContributors)
             {
                 var contributorSeenId = $"observation:{observation.ObservationId}|{contributor.Key}";
+                if (contributorSeen.Contains(contributorSeenId)
+                    && !contributorFactWorkKeys.ContainsKey(contributorSeenId)
+                    && !string.IsNullOrWhiteSpace(observation.WorkKey))
+                {
+                    contributorFactWorkKeys[contributorSeenId] = observation.WorkKey;
+                    contributorProvenanceAdded++;
+                }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                if (contributorSeen.Contains(contributorSeenId) && contributorFactWorkKeys.TryGetValue(contributorSeenId, out var reusedWork)
+                    && string.Equals(reusedWork, observation.WorkKey, StringComparison.OrdinalIgnoreCase))
+                    contributorProvenanceReused++;
+#endif
                 if (contributorSeen.Add(contributorSeenId))
                     newContributorRows.Add(contributor);
             }
@@ -11157,25 +12584,40 @@ internal static partial class AIrhythmDataState
 
             if (isNewBaseObservation)
             {
-                if (observation.LearnWork) Add(work, observation.WorkKey);
-                if (observation.LearnGenre) Add(genre, observation.GenreKey);
-                if (observation.LearnService) Add(service, observation.ServiceKey);
-                if (observation.LearnHour && observation.Hour is int observedHour && observedHour is >= 0 and <= 23)
-                    Add(hour, observedHour.ToString(CultureInfo.InvariantCulture));
-
+                // Keep exact, deduplicated term identities and the credited hour in the
+                // immutable fact ledger. A coefficient alone cannot reconstruct a score.
+                var creditedTerms = new List<string>(16);
                 if (observation.LearnTerms)
                 {
-                    var distinctTerms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    var addedTerms = 0;
-                    for (var i = 0; i < observation.Terms.Count && addedTerms < 16; i++)
+                    var termKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var rawTerm in observation.Terms)
                     {
-                        var token = observation.Terms[i];
-                        if (string.IsNullOrWhiteSpace(token) || !distinctTerms.Add(token))
-                            continue;
-                        Add(terms, token);
-                        addedTerms++;
+                        var term = (rawTerm ?? string.Empty).Trim();
+                        if (term.Length == 0 || !termKeys.Add(term)) continue;
+                        creditedTerms.Add(term);
+                        if (creditedTerms.Count == 16) break;
                     }
                 }
+                var creditedHour = observation.LearnHour && observation.Hour is int h && h is >= 0 and <= 23
+                    ? h.ToString(CultureInfo.InvariantCulture) : string.Empty;
+                baseEvidenceLedger[observation.ObservationId] = new AIrhythmBaseEvidenceLedgerEntry(
+                    observation.LearnWork ? observation.WorkEvidenceWeight : 0,
+                    observation.LearnGenre ? observation.GenreEvidenceWeight : 0,
+                    observation.LearnTerms ? observation.TermsEvidenceWeight : 0,
+                    observation.LearnService ? observation.ServiceEvidenceWeight : 0,
+                    observation.LearnHour ? observation.HourEvidenceWeight : 0,
+                    observation.WorkKey ?? string.Empty,
+                    observation.GenreKey ?? string.Empty,
+                    observation.ServiceKey ?? string.Empty,
+                    creditedTerms.ToArray(), creditedHour);
+                ledgerNewEntries++;
+                if (observation.LearnWork) Add(work, observation.WorkKey, observation.WorkEvidenceWeight);
+                if (observation.LearnGenre) Add(genre, observation.GenreKey, observation.GenreEvidenceWeight);
+                if (observation.LearnService) Add(service, observation.ServiceKey, observation.ServiceEvidenceWeight);
+                if (creditedHour.Length > 0)
+                    Add(hour, creditedHour, observation.HourEvidenceWeight);
+                foreach (var token in creditedTerms)
+                    Add(terms, token, observation.TermsEvidenceWeight);
                 observationCount++;
                 newObservations++;
             }
@@ -11183,7 +12625,15 @@ internal static partial class AIrhythmDataState
             if (isNewContributorObservation)
             {
                 foreach (var contributor in newContributorRows)
+                {
                     Add(contributors, contributor.Key, Math.Clamp(contributor.Weight, 0.05d, 1.0d));
+                    var factId = $"observation:{observation.ObservationId}|{contributor.Key}";
+                    if (!string.IsNullOrWhiteSpace(observation.WorkKey) && !contributorFactWorkKeys.ContainsKey(factId))
+                    {
+                        contributorFactWorkKeys[factId] = observation.WorkKey;
+                        contributorProvenanceAdded++;
+                    }
+                }
                 contributorBackfills++;
             }
         }
@@ -11191,7 +12641,7 @@ internal static partial class AIrhythmDataState
         var next = new AIrhythmLearnedUserModelState(
             LearnedUserModelSchemaVersion,
             observationCount,
-            newObservations > 0 || contributorBackfills > 0 ? DateTimeOffset.Now : state.UpdatedAt,
+            newObservations > 0 || contributorBackfills > 0 || contributorProvenanceAdded > 0 ? DateTimeOffset.Now : state.UpdatedAt,
             seen.ToArray(),
             work,
             genre,
@@ -11201,32 +12651,77 @@ internal static partial class AIrhythmDataState
             contributors,
             contributorSeen.ToArray(),
             ContributorLogicVersion,
-            BasePreferenceLogicVersion);
+            BasePreferenceLogicVersion,
+            contributorFactWorkKeys,
+            baseEvidenceLedger);
 
-        if (context is not null && (newObservations > 0 || contributorBackfills > 0))
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        var baseLedgerReadback = "not_required";
+        var baseLedgerIncomplete = baseEvidenceLedger.Values.Count(e =>
+            (e.Terms > 0 && e.TermKeys is null) || (e.Hour > 0 && string.IsNullOrWhiteSpace(e.HourKey)));
+#endif
+        if (context is not null && (newObservations > 0 || contributorBackfills > 0 || contributorProvenanceAdded > 0))
         {
             try
             {
                 var json = JsonSerializer.Serialize(next, JsonOptions);
                 var written = context.Storage.Set(LearnedUserModelStorageNamespace, LearnedUserModelStorageKey, json, expectedRevision: null);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                storedContributorSaveStatus = written.Succeeded ? "succeeded" : "failed";
+                if (written.Succeeded && ledgerNewEntries > 0)
+                {
+                    try
+                    {
+                        var readback = context.Storage.Get(LearnedUserModelStorageNamespace, LearnedUserModelStorageKey);
+                        var readbackJson = readback.Succeeded ? readback.Value?.Value?.ToString() : null;
+                        var recovered = string.IsNullOrWhiteSpace(readbackJson)
+                            ? null : JsonSerializer.Deserialize<AIrhythmLearnedUserModelState>(readbackJson, JsonOptions);
+                        baseLedgerReadback = recovered?.BaseEvidenceLedger is { } recoveredEntries
+                            && recovered.ObservationCount == next.ObservationCount
+                            && recoveredEntries.Count == next.BaseEvidenceLedger?.Count
+                            && baseEvidenceLedger.Keys.All(id => recoveredEntries.TryGetValue(id, out var entry)
+                                && entry.Work == baseEvidenceLedger[id].Work
+                                && entry.Genre == baseEvidenceLedger[id].Genre
+                                && entry.Terms == baseEvidenceLedger[id].Terms
+                                && entry.Service == baseEvidenceLedger[id].Service
+                                && entry.Hour == baseEvidenceLedger[id].Hour
+                                && entry.WorkKey == baseEvidenceLedger[id].WorkKey
+                                && entry.GenreKey == baseEvidenceLedger[id].GenreKey
+                                && entry.ServiceKey == baseEvidenceLedger[id].ServiceKey
+                                && (entry.TermKeys ?? Array.Empty<string>()).SequenceEqual(baseEvidenceLedger[id].TermKeys ?? Array.Empty<string>())
+                                && entry.HourKey == baseEvidenceLedger[id].HourKey)
+                            ? "matched" : "mismatch";
+                    }
+                    catch (Exception readbackError)
+                    {
+                        baseLedgerReadback = "exception_" + readbackError.GetType().Name;
+                    }
+                }
+                else if (!written.Succeeded && ledgerNewEntries > 0)
+                    baseLedgerReadback = "write_failed";
+#endif
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 if (!written.Succeeded)
                     WriteDeveloperLog($"USER_MODEL_MEMORY result=SAVE_ERROR newObservations={newObservations} contributorBackfills={contributorBackfills} loadedObservations={loadedObservations}");
 #endif
             }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+#else
+            catch (Exception)
+#endif
             {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                storedContributorSaveStatus = "exception";
                 WriteDeveloperLog($"USER_MODEL_MEMORY result=SAVE_ERROR type={ex.GetType().Name} newObservations={newObservations} contributorBackfills={contributorBackfills} loadedObservations={loadedObservations}");
-#else
-                _ = ex;
 #endif
             }
         }
 
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var maturity = observationCount <= 0 ? 0.0d : observationCount / (observationCount + 100.0d);
-        WriteDeveloperLog($"USER_MODEL_MEMORY result=OK loadedObservations={loadedObservations} storedObservations={observationCount} newObservations={newObservations} contributorBackfills={contributorBackfills} works={work.Count} genres={genre.Count} terms={terms.Count} services={service.Count} hours={hour.Count} contributors={contributors.Count} maturity={maturity:0.000} source=additive_natural_behavior automaticReservationLearning=all_programme_axes_plus_rule_match searchCastContributorLearning=metadata_plus_rule_double_count repeatedRuleEpisodes=independent_programme_facts programTimeSlotLearning=zero notConditionLearning=zero renderingDoesNotTeach=True titleSpecificRules=False productionScoreMutation=True discoveryMutation=True");
+        WriteDeveloperLog($"USER_MODEL_BASE_EVIDENCE_LEDGER result=OBSERVED persistedEntries={baseEvidenceLedger.Count} addedThisRun={ledgerNewEntries} legacyWithoutPerFactProvenance={Math.Max(0L, observationCount - baseEvidenceLedger.Count)} incompleteLegacyLedgerEntries={baseLedgerIncomplete} saveStatus={storedContributorSaveStatus} immediateReadback={baseLedgerReadback} termIdentity=exact_deduplicated_first16 hourIdentity=credited_hour policy=preserve_historical_aggregate_no_inferred_reweighting futureRecalibration=ledger_only storageMutation=append_on_new_base_fact");
+        WriteDeveloperLog($"USER_MODEL_MEMORY result=OK loadedObservations={loadedObservations} storedObservations={observationCount} newObservations={newObservations} contributorBackfills={contributorBackfills} works={work.Count} genres={genre.Count} terms={terms.Count} services={service.Count} hours={hour.Count} contributors={contributors.Count} maturity={maturity:0.000} source=additive_natural_behavior automaticReservationLearning=causal_matching_axes_only searchCastContributorLearning=originating_rule_only repeatedRuleEpisodes=independent_programme_facts programTimeSlotLearning=zero notConditionLearning=zero renderingDoesNotTeach=True titleSpecificRules=False productionScoreMutation=True discoveryMutation=True");
 
         static (string Source, string Role, string Entity) ContributorDiagnosticIdentity(string key)
         {
@@ -11245,10 +12740,46 @@ internal static partial class AIrhythmDataState
                 .Replace('|', '/')
                 .Trim();
 
+        AIrhythmRecommendationEngine.LogContributorExtractionDiagnostics();
         var maxContributorWeight = contributors.Values.DefaultIfEmpty(0.0d).Max();
         var trackedContributors = contributors.Keys.Count(x => x.StartsWith("tracked|", StringComparison.OrdinalIgnoreCase));
         var metadataContributors = Math.Max(0, contributors.Count - trackedContributors);
         WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SUMMARY total={contributors.Count} tracked={trackedContributors} metadata={metadataContributors} maxWeight={maxContributorWeight:0.000} diagnostics=top_weighted_role_aware provenance=searchcast_or_labeled_extendeditems metadataGate=none_additive_from_first_fact negativeFromMissing=False titleSpecificRules=False");
+
+        // The saved contributor weight aggregates historical observation facts; we cannot
+        // infer all-time distinct works from current-snapshot WorkKey alone. This diagnostic
+        // explicitly limits its concentration assessment to currently available observations.
+        var snapshotContributorPairs = contributorDiagnosticObservations.Count;
+        var snapshotRepeatedSingleWork = contributorDiagnosticObservations.Count(x =>
+            x.Value > 1 && contributorDiagnosticWorks.TryGetValue(x.Key, out var works) && works.Count == 1);
+        var snapshotNoWorkIdentity = contributorDiagnosticObservations.Count(x =>
+            !contributorDiagnosticWorks.TryGetValue(x.Key, out var works) || works.Count == 0);
+        var snapshotRepeatedObservations = contributorDiagnosticObservations
+            .Where(x => x.Value > 1 && contributorDiagnosticWorks.TryGetValue(x.Key, out var works) && works.Count == 1)
+            .Sum(x => x.Value);
+        var snapshotTotalContributorObservations = contributorDiagnosticObservations.Values.Sum();
+        var snapshotMultipleWorks = contributorDiagnosticWorks.Count(x => x.Value.Count > 1);
+        var persistedKnownFactCount = contributorSeen.Count(contributorFactWorkKeys.ContainsKey);
+        var persistedUnknownFactCount = Math.Max(0, contributorSeen.Count - persistedKnownFactCount);
+        var knownContributorWorks = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (factId, workKey) in contributorFactWorkKeys)
+        {
+            if (!contributorSeen.Contains(factId) || string.IsNullOrWhiteSpace(workKey)) continue;
+            // Observation identifiers can contain '|', and contributor keys include a role '|'.
+            // Match the complete persisted contributor-key suffix, never split at the first pipe.
+            foreach (var key in contributors.Keys)
+            {
+                if (!factId.EndsWith("|" + key, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!knownContributorWorks.TryGetValue(key, out var uniqueWorks))
+                    knownContributorWorks[key] = uniqueWorks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                uniqueWorks.Add(workKey);
+                break;
+            }
+        }
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_PROVENANCE_PERSISTENCE result=OBSERVED loadedMappings={loadedContributorMappings} loadedFactIds={loadedContributorFactIds} reusedMappings={contributorProvenanceReused} newlyMapped={contributorProvenanceAdded} workingMappings={contributorFactWorkKeys.Count} saveStatus={storedContributorSaveStatus} verifiedOnRestart={(loadedContributorMappings > 0 && contributorProvenanceReused > 0 ? "observed" : "not_yet_observed")} persistedReadback=next_plugin_start_required historicalUnknownPreserved=True scoringMutation=False");
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_WORK_PROVENANCE result=OBSERVED knownFacts={persistedKnownFactCount} unknownHistoricalFacts={persistedUnknownFactCount} knownContributors={knownContributorWorks.Count} knownDistinctContributorWorkPairs={knownContributorWorks.Sum(x => x.Value.Count)} currentRunNewMappings={contributorProvenanceAdded} coverage=partial_if_unknown scoringMutation=False inferenceFromMissing=False");
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_PROVENANCE result=OBSERVED snapshotContributorObservations={snapshotTotalContributorObservations} repeatedSingleWorkObservations={snapshotRepeatedObservations} multipleWorkContributors={snapshotMultipleWorks} scope=current_snapshot_only persistedFactsHaveWorkProvenance=partial historicalDistinctWorks=partial_known_only unit=contributor_observation_pairs storageMutation=False scoreMutation=False");
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_CONCENTRATION result=OBSERVED snapshotContributors={snapshotContributorPairs} repeatedSingleWork={snapshotRepeatedSingleWork} missingWorkIdentity={snapshotNoWorkIdentity} persistedContributorCount={contributors.Count} metric=current_snapshot_observations_per_distinct_work historicalDistinctWorks=unavailable scoringMutation=False storageMutation=False");
 
         var contributorRank = 0;
         foreach (var contributor in contributors
@@ -11263,10 +12794,70 @@ internal static partial class AIrhythmDataState
             var contributorSeenSuffix = "|" + contributor.Key;
             var persistedFacts = contributorSeen.Count(x => x.EndsWith(contributorSeenSuffix, StringComparison.OrdinalIgnoreCase));
             var strength = maxContributorWeight <= 0.0d ? 0.0d : Math.Clamp(contributor.Value / maxContributorWeight, 0.0d, 1.0d);
-            WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SAMPLE rank={contributorRank} entity={ContributorDiagnosticToken(identity.Entity)} role={identity.Role} source={identity.Source} weight={contributor.Value:0.000} strength={strength:0.000} persistedFacts={persistedFacts} currentSnapshotObservations={currentSnapshotObservations} currentSnapshotDistinctWorks={currentSnapshotDistinctWorks} persisted=True scoringAxis=contributor noNegativeFromAbsence=True diagnosticsScope=persisted_fact_count_plus_current_snapshot_work_span");
+            WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SAMPLE rank={contributorRank} entity={ContributorDiagnosticToken(identity.Entity)} role={identity.Role} source={identity.Source} weight={contributor.Value:0.000} strength={strength:0.000} persistedFacts={persistedFacts} currentSnapshotObservations={currentSnapshotObservations} currentSnapshotDistinctWorks={currentSnapshotDistinctWorks} currentSnapshotObservationsPerWork={(currentSnapshotDistinctWorks == 0 ? 0.0d : (double)currentSnapshotObservations / currentSnapshotDistinctWorks):0.000} historicalDistinctWorks=unavailable persisted=True scoringAxis=contributor noNegativeFromAbsence=True diagnosticsScope=persisted_fact_count_plus_current_snapshot_work_span");
         }
 #endif
-        return next;
+        // Persist the full, untouched model above, but never allow a demonstrably
+        // ambiguous legacy identity to bias production scoring. No person-specific list,
+        // destructive migration, or inferred decomposition is involved.
+        var quarantinedKeys = contributors.Keys.Where(IsStructurallyAmbiguousPersistedContributor).ToArray();
+        var scoringContributors = CopyMap(contributors);
+        foreach (var key in quarantinedKeys)
+            scoringContributors.Remove(key);
+
+        // Score-only calibration. Unknown historical facts and their weight are preserved:
+        // only explicitly mapped fact IDs can be grouped by Work. The first independent
+        // Work retains its full credit; later observations of that SAME Work contribute
+        // with diminishing returns. Additional distinct Works retain a full first credit.
+        // Never apply an inference about a missing Work, and never persist the projection.
+        var mappedFactsByContributor = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var factId in contributorSeen)
+        {
+            if (!contributorFactWorkKeys.TryGetValue(factId, out var workKey) || string.IsNullOrWhiteSpace(workKey))
+                continue;
+            foreach (var contributorKey in scoringContributors.Keys)
+            {
+                if (!factId.EndsWith("|" + contributorKey, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (!mappedFactsByContributor.TryGetValue(contributorKey, out var byWork))
+                    mappedFactsByContributor[contributorKey] = byWork = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                byWork[workKey] = byWork.TryGetValue(workKey, out var count) ? count + 1 : 1;
+                break;
+            }
+        }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        // Baseline is AFTER the shared legacy-identity quarantine, BEFORE work calibration.
+        // Thus the comparison isolates only previous build's per-work diminishing returns.
+        var preCalibrationContributorWeights = CopyMap(scoringContributors);
+#endif
+        var calibratedContributors = 0;
+        var knownObservationCreditReduction = 0.0d;
+        foreach (var (contributorKey, byWork) in mappedFactsByContributor)
+        {
+            // Each mapped contributor fact currently contributes at most 1 to stored weight.
+            // With partial provenance, never reduce by more than its provably mapped excess.
+            var knownCount = byWork.Values.Sum();
+            if (contributorKey.StartsWith("tracked|", StringComparison.OrdinalIgnoreCase)
+                || knownCount <= byWork.Count || !scoringContributors.TryGetValue(contributorKey, out var originalWeight))
+                continue;
+            var adjustedKnownCredit = byWork.Values.Sum(count => 1.0d + Math.Log2(count));
+            var reduction = Math.Min(Math.Max(0.0d, originalWeight - 1.0d), Math.Max(0.0d, knownCount - adjustedKnownCredit));
+            if (reduction <= 0.0d) continue;
+            scoringContributors[contributorKey] = originalWeight - reduction;
+            knownObservationCreditReduction += reduction;
+            calibratedContributors++;
+        }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_WORK_CALIBRATION result=APPLIED mappedContributors={mappedFactsByContributor.Count} multiWorkContributors={mappedFactsByContributor.Count(x => x.Value.Count > 1)} calibratedContributors={calibratedContributors} knownObservationCreditReduction={knownObservationCreditReduction:0.000} unmappedHistoricalFactsPreserved=True explicitTrackedIntentUnchanged=True storageMutation=False scoreMutation=True model=per_work_log_diminishing_known_only");
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_LEGACY_QUARANTINE result=APPLIED candidates={contributors.Count} quarantined={quarantinedKeys.Length} retained={scoringContributors.Count} storageMutation=False observationDeletion=False scope=scoring_only revalidation=structural_unseparated_mixed_script");
+#endif
+        return next with
+        {
+            ContributorWeights = scoringContributors,
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            PreCalibrationContributorWeights = preCalibrationContributorWeights
+#endif
+        };
     }
 
     public static IReadOnlyList<AIrhythmInterestSignal> GetInterestSignals()
@@ -12098,7 +13689,7 @@ internal static partial class AIrhythmDataState
                 NormalizationPromotionSchemaVersion, NormalizationPromotionLogicVersion, now, entries);
             var written = context.Storage.Set(NormalizationPromotionStorageNamespace, NormalizationPromotionStorageKey,
                 JsonSerializer.Serialize(state, JsonOptions), expectedRevision: null);
-            WriteDeveloperLog($"NORMALIZATION_PROMOTION_MEMORY result={(written.Succeeded ? "OK" : "WRITE_FAILED")} active={entries.Length} schema={NormalizationPromotionSchemaVersion} logic={NormalizationPromotionLogicVersion} writePolicy=replace_with_current_strict_consensus provenance=True");
+            WriteDeveloperLog($"NORMALIZATION_PROMOTION_MEMORY result={(written.Succeeded ? "OK" : "WRITE_FAILED")} active={entries.Length} schema={NormalizationPromotionSchemaVersion} logic={NormalizationPromotionLogicVersion} rollback=replace_with_current_strict_consensus provenance=True");
         }
         catch (Exception ex)
         {
@@ -12153,12 +13744,14 @@ internal static partial class AIrhythmDataState
         {
             return new(true, string.Empty, Changed: false);
         }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"persistent data backup result=ERROR type={ex.GetType().Name}");
-#else
-            _ = ex;
 #endif
             return new(false, "バックアップできませんでした");
         }
@@ -12218,12 +13811,14 @@ internal static partial class AIrhythmDataState
         {
             return new(true, string.Empty, Changed: false);
         }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"persistent data restore result=ERROR type={ex.GetType().Name}");
-#else
-            _ = ex;
 #endif
             return new(false, "復元できませんでした");
         }
@@ -12252,7 +13847,7 @@ internal static partial class AIrhythmDataState
             var zeroUsage = JsonSerializer.Serialize(new AIrhythmUsageCounterState(0, 0), JsonOptions);
             var marker = JsonSerializer.Serialize(new AIrhythmDataResetMarker(resetAt), JsonOptions);
 
-            foreach (var storageNamespace in new[] { RecordingFactStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace })
+            foreach (var storageNamespace in new[] { RecordingFactStorageNamespace, RecoveryAttemptStorageNamespace, RecoveryLookupStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace })
             {
                 foreach (var key in context.Storage.ListKeys(storageNamespace).ToArray())
                 {
@@ -12299,12 +13894,14 @@ internal static partial class AIrhythmDataState
 #endif
             return new(true, "今この時点から新しく蓄積を開始します", Changed: true);
         }
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+#else
+        catch (Exception)
+#endif
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"persistent accumulated data reset result=ERROR type={ex.GetType().Name}");
-#else
-            _ = ex;
 #endif
             return new(false, "蓄積データをリセットできませんでした");
         }
@@ -12319,6 +13916,8 @@ internal static partial class AIrhythmDataState
         CaptureFixedStorage(context, storage, DataLifecycleStorageNamespace, new[] { DataResetCutoffStorageKey });
         CaptureFixedStorage(context, storage, ExternalLookupRuntimeStorageNamespace, new[] { ExternalProviderOutcomeStorageKey });
         CaptureAllStorageKeys(context, storage, RecordingFactStorageNamespace);
+        CaptureAllStorageKeys(context, storage, RecoveryAttemptStorageNamespace);
+        CaptureFixedStorage(context, storage, RecoveryLookupStorageNamespace, new[] { RecoveryLookupStorageKey });
         CaptureAllStorageKeys(context, storage, NormalizationLearnerStorageNamespace);
         CaptureFixedStorage(context, storage, NormalizationPromotionStorageNamespace, new[] { NormalizationPromotionStorageKey });
         return new AIrhythmBackupPayload(storage);
@@ -12345,7 +13944,7 @@ internal static partial class AIrhythmDataState
 
     private static bool ValidateBackupPayload(AIrhythmBackupPayload payload)
     {
-        var allowedNamespaces = new HashSet<string>(new[] { "settings", "usage", "rhythmSearch", RecordingFactStorageNamespace, DataLifecycleStorageNamespace, ExternalLookupRuntimeStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace }, StringComparer.Ordinal);
+        var allowedNamespaces = new HashSet<string>(new[] { "settings", "usage", "rhythmSearch", RecordingFactStorageNamespace, RecoveryAttemptStorageNamespace, RecoveryLookupStorageNamespace, DataLifecycleStorageNamespace, ExternalLookupRuntimeStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace }, StringComparer.Ordinal);
         foreach (var pair in payload.Storage)
         {
             if (!allowedNamespaces.Contains(pair.Key) || pair.Value is null)
@@ -12366,18 +13965,19 @@ internal static partial class AIrhythmDataState
         var before = CapturePersistentStorage(context);
         try
         {
-            foreach (var storageNamespace in new[] { "settings", "usage", "rhythmSearch", RecordingFactStorageNamespace, DataLifecycleStorageNamespace, ExternalLookupRuntimeStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace })
+            foreach (var storageNamespace in new[] { "settings", "usage", "rhythmSearch", RecordingFactStorageNamespace, RecoveryAttemptStorageNamespace, RecoveryLookupStorageNamespace, DataLifecycleStorageNamespace, ExternalLookupRuntimeStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace })
             {
                 var desiredKeys = desired.Storage.TryGetValue(storageNamespace, out var desiredBucket)
                     ? new HashSet<string>(desiredBucket.Keys, StringComparer.Ordinal)
                     : new HashSet<string>(StringComparer.Ordinal);
-                IEnumerable<string> currentKeys = storageNamespace == RecordingFactStorageNamespace || storageNamespace == NormalizationLearnerStorageNamespace
+                IEnumerable<string> currentKeys = storageNamespace == RecordingFactStorageNamespace || storageNamespace == RecoveryAttemptStorageNamespace || storageNamespace == NormalizationLearnerStorageNamespace
                     ? context.Storage.ListKeys(storageNamespace)
                     : storageNamespace switch
                     {
                         "settings" => new[] { "main" }.Where(key => context.Storage.Exists(storageNamespace, key)),
                         "usage" => new[] { "totals" }.Where(key => context.Storage.Exists(storageNamespace, key)),
                         "rhythmSearch" => new[] { "recent", "interestSignals", LearnedUserModelStorageKey, EvidenceCalibrationStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
+                        RecoveryLookupStorageNamespace => new[] { RecoveryLookupStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
                         NormalizationPromotionStorageNamespace => new[] { NormalizationPromotionStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
                         ExternalLookupRuntimeStorageNamespace => new[] { ExternalProviderOutcomeStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
                         _ => new[] { DataResetCutoffStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key))
@@ -12411,16 +14011,17 @@ internal static partial class AIrhythmDataState
 
     private static void RestoreStorageSnapshot(ITvAirPluginRuntimeContext context, AIrhythmBackupPayload snapshot)
     {
-        foreach (var storageNamespace in new[] { "settings", "usage", "rhythmSearch", RecordingFactStorageNamespace, DataLifecycleStorageNamespace, ExternalLookupRuntimeStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace })
+        foreach (var storageNamespace in new[] { "settings", "usage", "rhythmSearch", RecordingFactStorageNamespace, RecoveryAttemptStorageNamespace, RecoveryLookupStorageNamespace, DataLifecycleStorageNamespace, ExternalLookupRuntimeStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace })
         {
-            IEnumerable<string> currentKeys = storageNamespace == RecordingFactStorageNamespace || storageNamespace == NormalizationLearnerStorageNamespace
+            IEnumerable<string> currentKeys = storageNamespace == RecordingFactStorageNamespace || storageNamespace == RecoveryAttemptStorageNamespace || storageNamespace == NormalizationLearnerStorageNamespace
                 ? context.Storage.ListKeys(storageNamespace)
                 : storageNamespace switch
                 {
                     "settings" => new[] { "main" }.Where(key => context.Storage.Exists(storageNamespace, key)),
                     "usage" => new[] { "totals" }.Where(key => context.Storage.Exists(storageNamespace, key)),
                     "rhythmSearch" => new[] { "recent", "interestSignals", LearnedUserModelStorageKey, EvidenceCalibrationStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
-                    NormalizationPromotionStorageNamespace => new[] { NormalizationPromotionStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
+                    RecoveryLookupStorageNamespace => new[] { RecoveryLookupStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
+                        NormalizationPromotionStorageNamespace => new[] { NormalizationPromotionStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
                     ExternalLookupRuntimeStorageNamespace => new[] { ExternalProviderOutcomeStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key)),
                     _ => new[] { DataResetCutoffStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key))
                 };
@@ -12446,6 +14047,14 @@ internal static partial class AIrhythmDataState
             UsageRecentRecordingIds.Clear();
             UsageRecentRecordingOrder.Clear();
             RecordingFacts.Clear();
+            RecoveryAttempts.Clear();
+            RecoveryAttemptsByMonth.Clear();
+            _recoveryLazyIndexed = false;
+            _recoveryIndexedTotal = 0;
+            _recoveryAttemptsLoaded = false;
+            _recoveryLookupChecked = false;
+            _verifiedRecoveryLookup = Array.Empty<AIrhythmRecoveryLookupEntry>();
+            _recoveryDirtyMonths.Clear();
             _recordingFactsLoaded = false;
             _dataResetCutoff = null;
             _dataResetCutoffLoaded = false;
@@ -14318,8 +15927,11 @@ var identityContext = AIrhythmRecommendationEngine.BuildEvidenceIdentityContext(
     private static AIrhythmRuntimeSnapshot Empty(
         string error,
         AIrhythmSettings? settings = null,
-        long? revision = null,
-        AIrhythmRuntimeDiagnostics? diagnostics = null)
+        long? revision = null
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        , AIrhythmRuntimeDiagnostics? diagnostics = null
+#endif
+        )
         => new(
             false,
             error,
@@ -14334,6 +15946,9 @@ var identityContext = AIrhythmRecommendationEngine.BuildEvidenceIdentityContext(
             new AIrhythmAdvancedSnapshot(
                 Array.Empty<TvAirRecordingSessionDto>()),
             settings ?? new(),
-            revision,
-            diagnostics ?? new AIrhythmRuntimeDiagnostics(0, 0, 0, 0, 0, 0, 0, 0, Array.Empty<string>()));
+            revision
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            , diagnostics ?? new AIrhythmRuntimeDiagnostics(0, 0, 0, 0, 0, 0, 0, 0, Array.Empty<string>())
+#endif
+            );
 }
