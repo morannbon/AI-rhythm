@@ -74,9 +74,4 @@ internal static partial class AIrhythmDataState
         catch { }
     }
 }
-#else
-internal static partial class AIrhythmDataState
-{
-    internal static void WriteDeveloperLog(string message) { }
-}
 #endif

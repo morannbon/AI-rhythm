@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -1487,7 +1487,9 @@ internal static partial class AIrhythmRecommendationEngine
 
         if (source.Length < 2)
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             AIrhythmDataState.WriteDeveloperLog($"NORMALIZATION_LEARNER_SHADOW result=NO_DATA titles={source.Length} productionMutation=False persistence=False");
+            #endif
             return new NormalizationLearnerShadowModel(currentSource.ToHashSet(StringComparer.Ordinal), Array.Empty<NormalizationLearnerShadowRow>());
         }
 
@@ -1568,8 +1570,10 @@ internal static partial class AIrhythmRecommendationEngine
         var longTermStable = rows.Count(x => string.Equals(x.LongTermStage, "stable", StringComparison.Ordinal));
         var longTermDrifting = rows.Count(x => string.Equals(x.LongTermStage, "drifting", StringComparison.Ordinal));
 
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.WriteDeveloperLog(
             $"NORMALIZATION_LEARNER_QUALITY_SUMMARY result=OBSERVED rows={rows.Length} meanQuality={meanPopulationQuality:0.000} riskRows={qualityRiskRows} validatedRiskRows={validatedQualityRiskRows} issueGroups=[{string.Join(",", qualityGroups)}] evaluator=population_structure_self_assessment feedback=roleFitness+confidence+decision hypothesisFeedback=True titleSpecificTracking=False productionMutation=False canonicalMutation=False scoreMutation=False evidenceMutation=False");
+        #endif
 
         foreach (var row in rows
             .Where(x => !string.Equals(x.QualityIssue, "none", StringComparison.Ordinal))
@@ -1577,22 +1581,30 @@ internal static partial class AIrhythmRecommendationEngine
             .ThenBy(x => x.PopulationQuality)
             .Take(24))
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             AIrhythmDataState.WriteDeveloperLog(
                 $"NORMALIZATION_LEARNER_QUALITY_SAMPLE issue={row.QualityIssue} kind={row.Kind} learnedWork={row.LearnedWork} populationQuality={row.PopulationQuality:0.000} collisionRate={row.CollisionRate:0.000} numericSuffixRate={row.NumericBoundaryResidueRate:0.000} boundaryIntrusionScore={row.BoundaryIntrusionScore:0.000} learnedBoundaryTokenScore={row.LearnedBoundaryTokenScore:0.000} boundaryLeftFamilies={row.LearnedBoundaryLeftFamilies} boundaryRoleContrast={row.BoundaryRoleContrast:0.000} shorterChallengerSupport={row.ShorterChallengerSupport:0.000} externalStructuralSupport={row.ExternalStructuralSupport:0.000} externalProviderReliability={row.ExternalProviderReliability:0.000} externalProviders={row.ExternalProviderCount} externalEvidence={row.ExternalEvidenceCount} externalStage={row.ExternalStructuralStage} longTermDays={row.LongTermObservationDays} longTermReliability={row.LongTermReliability:0.000} longTermConsistency={row.LongTermConsistency:0.000} longTermStage={row.LongTermStage} decision={row.Decision} relationToCurrent={row.RelationToCurrent} currentWorkSample={row.CurrentWorkSample} rawSample={row.RawSample} sampling=population_risk_top24_not_title_watch action=observe_only");
+            #endif
         }
 
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.WriteDeveloperLog(
             $"NORMALIZATION_LEARNER_SHADOW result=OBSERVED currentTitles={currentSource.Length} memoryTitles={observationDays.Count} historicalOnlyTitles={historicalOnlyTitles} titles={source.Length} prefixAccepted={prefixRows.Count} recurringCoreAccepted={coreRows.Count} numericStableAccepted={numericStableRows.Count} combined={rows.Length} validated={validatedRows} deferred={deferredRows} rejected={rejectedRows} reported={selected.Count} algorithm=ensemble_prefix_recurring_core_numeric_stable_population_quality_hypothesis_history temporalModel=distinct_observation_days hypothesisModel=multi_day_survival slotModel=variable_left_right_numeric boundaryModel=run_safe+corpus_learned_multiview_role_contrast longTermModel=persistent_daily_feature_statistics_plus_persisted_external_structural_support_no_decision_mutation confidence=structural_x_role_fitness_x_population_quality relationSummary=[{string.Join(",", relationGroups)}] numericSlotRows={numericSlotRows} highConfidenceConflicts={highConfidenceConflicts} maxObservationDays={maxObservationDays} hypothesisSurvivors={survivorHypotheses} hypothesisContested={contestedHypotheses} hypothesisCollecting={collectingHypotheses} hypothesisPersistentReject={persistentRejectedHypotheses} maxHypothesisDays={maxHypothesisDays} longTermTracked={longTermTracked} maxLongTermDays={maxLongTermDays} meanLongTermReliability={meanLongTermReliability:0.000} longTermStable={longTermStable} longTermDrifting={longTermDrifting} productionMutation=strict_promotion_only canonicalMutation=eligible_aliases_only scoreMutation=via_canonical_identity evidenceMutation=via_canonical_identity persistence=learner_plus_promotion_state");
+        #endif
 
         foreach (var row in selected)
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             AIrhythmDataState.WriteDeveloperLog(
                 $"NORMALIZATION_LEARNER_CANDIDATE kind={row.Kind} learnedWork={row.LearnedWork} occurrences={row.Occurrences} leftContexts={row.DistinctLeftContexts} rightContexts={row.DistinctRightContexts} numericRightSlotVariants={row.NumericRightSlotVariants} meanCoverage={row.MeanCoverage:0.000} boundaryQuality={row.BoundaryQuality:0.000} roleFitness={row.RoleFitness:0.000} populationQuality={row.PopulationQuality:0.000} collisionRate={row.CollisionRate:0.000} numericSuffixRate={row.NumericBoundaryResidueRate:0.000} boundaryIntrusionScore={row.BoundaryIntrusionScore:0.000} learnedBoundaryTokenScore={row.LearnedBoundaryTokenScore:0.000} boundaryLeftFamilies={row.LearnedBoundaryLeftFamilies} boundaryRoleContrast={row.BoundaryRoleContrast:0.000} shorterChallengerSupport={row.ShorterChallengerSupport:0.000} qualityIssue={row.QualityIssue} longTermDays={row.LongTermObservationDays} longTermReliability={row.LongTermReliability:0.000} longTermConsistency={row.LongTermConsistency:0.000} longTermMeanQuality={row.LongTermMeanPopulationQuality:0.000} longTermMeanCollision={row.LongTermMeanCollisionRate:0.000} longTermMeanBoundaryIntrusion={row.LongTermMeanBoundaryIntrusion:0.000} longTermMeanExternalSupport={row.LongTermMeanExternalSupport:0.000} longTermMeanExternalProviderReliability={row.LongTermMeanExternalProviderReliability:0.000} longTermStage={row.LongTermStage} externalStructuralSupport={row.ExternalStructuralSupport:0.000} externalProviderReliability={row.ExternalProviderReliability:0.000} externalProviders={row.ExternalProviderCount} externalEvidence={row.ExternalEvidenceCount} externalStage={row.ExternalStructuralStage} temporalDays={row.TemporalObservationDays} distinctCanonicalWorks={row.DistinctCanonicalWorks} confidence={row.Confidence:0.000} decision={row.Decision} hypothesisDays={row.HypothesisObservationDays} hypothesisValidatedDays={row.HypothesisValidatedDays} hypothesisDeferredDays={row.HypothesisDeferredDays} hypothesisRejectedDays={row.HypothesisRejectedDays} hypothesisStability={row.HypothesisStability:0.000} hypothesisStage={row.HypothesisStage} relationToCurrent={row.RelationToCurrent} currentWorkSample={row.CurrentWorkSample} rawSample={row.RawSample} action={(IsNormalizationPromotionEligible(row) ? "promotion_eligible" : "observe_only")}");
+            #endif
         }
 
         var promotionSignals = BuildNormalizationPromotionSignals(source, rows);
         AIrhythmDataState.UpdateNormalizationPromotions(promotionSignals);
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.WriteDeveloperLog($"NORMALIZATION_PROMOTION result=EVALUATED signals={promotionSignals.Count} gate=validated+survivor+longterm_stable+quality_clean+collision_safe+consensus productionMutation=True canonicalMutation=True titleSpecificRules=False");
+        #endif
 
         return new NormalizationLearnerShadowModel(currentSource.ToHashSet(StringComparer.Ordinal), rows);
     }
@@ -1712,12 +1724,16 @@ internal static partial class AIrhythmRecommendationEngine
             var hypothesisStage = hasProposal ? best!.HypothesisStage : "-";
             var kind = hasProposal ? best!.Kind.ToString() : "-";
 
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             AIrhythmDataState.WriteDeveloperLog(
                 $"NORMALIZATION_LEARNER_RECOGNITION rank={i + 1} observed={wasObserved} state={state} reason={reason} proposalKind={kind} learnedWork={learned} confidence={confidence} roleFitness={roleFitness} temporalDays={temporalDays} hypothesisDays={hypothesisDays} hypothesisStability={hypothesisStability} hypothesisStage={hypothesisStage} currentWork={item.SeriesKey} rawTitle={item.Title} action=observe_or_promote");
+            #endif
         }
 
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.WriteDeveloperLog(
             $"NORMALIZATION_LEARNER_RECOGNITION_SUMMARY displayed={limit} observed={observed} proposalGenerated={proposal} deferred={deferred} purpose=distinguish_not_observed_from_data_insufficient productionMutation=strict_promotion_only canonicalMutation=eligible_aliases_only scoreMutation=via_canonical_identity evidenceMutation=via_canonical_identity persistence=learner_plus_promotion_state");
+        #endif
     }
 
     private static List<NormalizationLearnerShadowRow> BuildNormalizationPrefixShadowRows(string[] source)
@@ -9382,8 +9398,10 @@ internal static partial class AIrhythmRecommendationEngine
             $"CANONICAL_RECORDING_EPISODE_IDENTITY_AUDIT corroboratedFacts={corroboratedHistory.Length} uniqueWorks={corroboratedHistory.Select(x => x.Key).Distinct(StringComparer.OrdinalIgnoreCase).Count()} top=[{string.Join(",", corroboratedGroups)}] historyTotal={totalRecordingCount} purpose=detect_numeric_episode_fragmentation_no_title_rules storageMutation=False");
 #endif
 
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.WriteDeveloperLog(
             $"CANONICAL_RECORDING_DASHBOARD_SUMMARY total={totalRecordingCount} totalTop10=[{string.Join(",", recordingTotals.Take(10).Select(x => $"{CompactIdentity(x.DisplayTitle)}:{x.RecordingCount}"))}] genreTop10=[{string.Join(",", recordingAggregates.Take(10).Select(x => $"{x.GenreKey}:{x.RecordingCount}"))}] expandedGenres=[{string.Join(",", topGenres.Select(x => x.GenreKey))}] titleIdentity=common_canonical_work recordingCount=persistent_success_recording_facts layout=station_donut_weekday_line,total_horizontal_genre_vertical,genre1_6x10");
+        #endif
 
         var html = new StringBuilder();
         // Row 1: two large distribution cards. Do not dilute these with a third time-of-day card.
@@ -10679,9 +10697,15 @@ internal static partial class AIrhythmDataState
                 }
             }
         }
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+        #else
+        catch (Exception)
+        #endif
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"recording fact store load failed type={ex.GetType().Name} action=continue_with_host_seed");
+            #endif
         }
 
         lock (Gate)
@@ -10728,9 +10752,15 @@ internal static partial class AIrhythmDataState
                 WriteDeveloperLog($"RECORDING_QUALITY_CHUNK_READBACK result={(confirmed ? "MATCH" : "MISMATCH")} month={pair.Key} rows={pair.Value.Length} bytes={json.Length} mutation=none");
 #endif
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"recording fact store persist failed chunk={pair.Key} type={ex.GetType().Name}");
+                #endif
             }
         }
     }
@@ -11102,11 +11132,17 @@ internal static partial class AIrhythmDataState
                     previouslyPersisted = RecoveryAttempts.Count;
                     }
                 }
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 catch (Exception ex)
+                #else
+                catch (Exception)
+                #endif
                 {
                     RecoveryAttempts.Clear();
                     RecoveryAttemptsByMonth.Clear();
+                    #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                     WriteDeveloperLog($"RECOVERY_JOURNAL result=LOAD_ERROR type={ex.GetType().Name} action=skip_mutation");
+                    #endif
                     return;
                 }
             }
@@ -11151,11 +11187,17 @@ internal static partial class AIrhythmDataState
                             throw new InvalidOperationException("Recovery write-month content differs from verified index");
                         RecoveryAttemptsByMonth[rowMonth] = historical;
                     }
+                    #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                     catch (Exception ex)
+                    #else
+                    catch (Exception)
+                    #endif
                     {
                         // A failed read is NOT a dirty writable month. Retrying by writing
                         // an absent bucket would replace historical records with [].
+                        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                         WriteDeveloperLog($"RECOVERY_JOURNAL result=LOAD_ERROR month={rowMonth} type={ex.GetType().Name} action=skip_month_preserve_pending");
+                        #endif
                         // Continue processing other months and pending dirty writes. A read
                         // failure for one month must not discard unrelated recording facts.
                         continue;
@@ -11179,7 +11221,9 @@ internal static partial class AIrhythmDataState
                 // unreadable month; only an explicitly loaded bucket is writable.
                 if (!RecoveryAttemptsByMonth.TryGetValue(month, out var bucket))
                 {
+                    #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                     WriteDeveloperLog($"RECOVERY_JOURNAL result=WRITE_DEFERRED month={month} reason=canonical_bucket_not_loaded action=preserve_original");
+                    #endif
                     continue;
                 }
                 rows = bucket.Values.OrderBy(x => x.Start).ThenBy(x => x.Identity, StringComparer.Ordinal).ToArray();
@@ -11245,9 +11289,15 @@ internal static partial class AIrhythmDataState
                 verified++;
                 lock (Gate) _recoveryDirtyMonths.Remove(month);
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"RECOVERY_JOURNAL result=WRITE_ERROR month={month} type={ex.GetType().Name} action=keep_memory_retry_on_next_snapshot");
+                #endif
                 // Retain candidates in memory. Next snapshot retries this month.
                 lock (Gate) _recoveryDirtyMonths.Add(month);
             }
@@ -11357,10 +11407,16 @@ internal static partial class AIrhythmDataState
             }
             fingerprints = checkedMonths.ToArray();
         }
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+        #else
+        catch (Exception)
+        #endif
         {
             lock (Gate) { _recoveryLookupChecked = false; }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"RECOVERY_LOOKUP_FINGERPRINT result=DEFERRED type={ex.GetType().Name} action=preserve_canonical");
+            #endif
             return;
         }
         var expected = JsonSerializer.Serialize(new AIrhythmRecoveryLookupManifest(2, entries, fingerprints), JsonOptions);
@@ -11933,7 +11989,9 @@ internal static partial class AIrhythmDataState
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 ReportRecordingQualityPersistence(recordingFactHistory, hostRecordingHistory, recoveryHistory);
 #endif
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"canonical recording facts source=AIrhythm.PersistentRecordingFacts facts={history.Count} seeded={seededRecordingFacts} hostRaw={hostRecordingHistory.Count} hostSource={recordingHistorySource} snapshotRaw={data.RecordingHistory.Count} retention=append_success_terminal_no_host_deletion consumers=score,localEvidence,dashboard,selection,discovery,search,interest");
+                #endif
                 active = data.ActiveRecordings;
                 channels = data.Channels
                     .Where(x => x.IsEnabled)
@@ -11951,11 +12009,17 @@ internal static partial class AIrhythmDataState
                     .ThenBy(x => x.RuleId)
                     .ToArray();
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
                 // Discovery can operate without rule metadata. Treat this as a degraded knownness
                 // signal rather than a core snapshot failure; reservations/history remain authoritative.
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"DISCOVERY_KEYWORD_RULE_READ result=FAILED type={ex.GetType().Name} fallback=reservation_and_history_only");
+                #endif
             }
 
             var advanced = AIrhythmAdvancedDataState.Capture(active);
@@ -12028,9 +12092,15 @@ internal static partial class AIrhythmDataState
                 return fullHistory;
             }
         }
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+        #else
+        catch (Exception)
+        #endif
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"canonical recording history primary read failed type={ex.GetType().Name} fallback=snapshot");
+            #endif
         }
 
         source = "DataSnapshot.recording-history(fallback)";
@@ -12998,9 +13068,15 @@ internal static partial class AIrhythmDataState
                     }
                 }
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"NORMALIZATION_LEARNER_MEMORY result=LOAD_ERROR type={ex.GetType().Name} action=start_fresh_without_production_effect");
+                #endif
             }
         }
 
@@ -13049,19 +13125,31 @@ internal static partial class AIrhythmDataState
                         .OrderBy(x => x.ComparableTitle, StringComparer.Ordinal)
                         .ToArray());
                 var json = JsonSerializer.Serialize(state, JsonOptions);
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 var written = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerStorageKey, json, expectedRevision: null);
                 if (!written.Succeeded)
                     WriteDeveloperLog($"NORMALIZATION_LEARNER_MEMORY result=WRITE_FAILED loaded={loaded} current={observations.Count} schemaMismatch={schemaMismatch} productionMutation=False");
+                #else
+                _ = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerStorageKey, json, expectedRevision: null);
+                #endif
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"NORMALIZATION_LEARNER_MEMORY result=WRITE_ERROR type={ex.GetType().Name} loaded={loaded} current={observations.Count} productionMutation=False");
+                #endif
             }
         }
 
         var maxDays = observations.Count == 0 ? 0 : observations.Values.Max(x => x.DistinctObservationDays);
         var multiDay = observations.Values.Count(x => x.DistinctObservationDays >= 2);
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         WriteDeveloperLog($"NORMALIZATION_LEARNER_MEMORY result=OK loaded={loaded} stored={observations.Count} multiDayTitles={multiDay} maxObservationDays={maxDays} changed={changed} schema={NormalizationLearnerMemorySchemaVersion} logic=normalization_learner_v4_role_validation_temporal_memory storage=plugin_storage shadowOnly=False promotionConsumer=True productionMutation=strict_promotion_only scoreMutation=via_canonical_identity evidenceMutation=via_canonical_identity");
+        #endif
 
         return observations.ToDictionary(x => x.Key, x => Math.Max(1, x.Value.DistinctObservationDays), StringComparer.Ordinal);
     }
@@ -13107,9 +13195,15 @@ internal static partial class AIrhythmDataState
                 }
             }
         }
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+        #else
+        catch (Exception)
+        #endif
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"NORMALIZATION_LEARNER_EXTERNAL_STRUCTURAL_MEMORY result=LOAD_ERROR type={ex.GetType().Name} action=preserve_runtime_only networkRequestsAdded=False");
+            #endif
         }
 
         foreach (var item in items)
@@ -13181,13 +13275,23 @@ internal static partial class AIrhythmDataState
                     DateTimeOffset.Now,
                     observations.Values.OrderBy(x => x.EvidenceKey, StringComparer.OrdinalIgnoreCase).ToArray());
                 var json = JsonSerializer.Serialize(state, JsonOptions);
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 var written = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerExternalStructuralStorageKey, json, expectedRevision: null);
                 if (!written.Succeeded)
                     WriteDeveloperLog($"NORMALIZATION_LEARNER_EXTERNAL_STRUCTURAL_MEMORY result=WRITE_FAILED loaded={loaded} stored={observations.Count} networkRequestsAdded=False");
+                #else
+                _ = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerExternalStructuralStorageKey, json, expectedRevision: null);
+                #endif
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"NORMALIZATION_LEARNER_EXTERNAL_STRUCTURAL_MEMORY result=WRITE_ERROR type={ex.GetType().Name} loaded={loaded} stored={observations.Count} networkRequestsAdded=False");
+                #endif
             }
         }
 
@@ -13195,7 +13299,9 @@ internal static partial class AIrhythmDataState
         var conflicting = observations.Values.Count(x => string.Equals(x.Verdict, AIrhythmExternalEvidenceVerdict.Conflicting.ToString(), StringComparison.Ordinal));
         var unresolved = observations.Count - supported - conflicting;
         var providers = observations.Values.Select(x => x.ProviderId).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         WriteDeveloperLog($"NORMALIZATION_LEARNER_EXTERNAL_STRUCTURAL_MEMORY result=OK loaded={loaded} stored={observations.Count} providers={providers} supported={supported} conflicting={conflicting} unresolved={unresolved} changed={changed} source=authorized_lookup_results persistence=plugin_storage networkRequestsAdded=False scoreMutation=False canonicalMutation=False decisionMutation=False");
+        #endif
     }
 
     internal static Dictionary<string, NormalizationLearnerExternalStructuralSnapshot> GetNormalizationLearnerExternalStructuralSupport(
@@ -13221,9 +13327,15 @@ internal static partial class AIrhythmDataState
                 .Where(x => string.Equals(x.ProviderId, AIrhythmExternalLookupAdapter.TvMazeProviderId, StringComparison.OrdinalIgnoreCase))
                 .ToArray();
         }
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+        #else
+        catch (Exception)
+        #endif
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"NORMALIZATION_LEARNER_EXTERNAL_STRUCTURAL_SUPPORT result=LOAD_ERROR type={ex.GetType().Name} networkRequestsAdded=False");
+            #endif
             return result;
         }
 
@@ -13285,7 +13397,9 @@ internal static partial class AIrhythmDataState
         }
 
         var providerSummary = string.Join(",", providerReliability.OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase).Select(x => $"{x.Key}:{x.Value:0.000}"));
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         WriteDeveloperLog($"NORMALIZATION_LEARNER_EXTERNAL_STRUCTURAL_SUPPORT result=OBSERVED persistedEvidence={observations.Length} matchedHypotheses={matchedHypotheses} providers=[{providerSummary}] matching=canonical_or_alias_exact_normalized providerReliability=learned_supported_vs_conflicting_beta_prior networkRequestsAdded=False decisionMutation=False canonicalMutation=False scoreMutation=False");
+        #endif
         return result;
     }
 
@@ -13325,9 +13439,15 @@ internal static partial class AIrhythmDataState
                     }
                 }
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"NORMALIZATION_LEARNER_LONGTERM_MEMORY result=LOAD_ERROR type={ex.GetType().Name} action=start_fresh_without_production_effect");
+                #endif
             }
         }
 
@@ -13412,13 +13532,23 @@ internal static partial class AIrhythmDataState
                     DateTimeOffset.Now,
                     observations.Values.OrderBy(x => x.HypothesisKey, StringComparer.Ordinal).ToArray());
                 var json = JsonSerializer.Serialize(state, JsonOptions);
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 var written = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerLongTermStorageKey, json, expectedRevision: null);
                 if (!written.Succeeded)
                     WriteDeveloperLog($"NORMALIZATION_LEARNER_LONGTERM_MEMORY result=WRITE_FAILED loaded={loaded} stored={observations.Count} schemaMismatch={schemaMismatch} productionMutation=False");
+                #else
+                _ = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerLongTermStorageKey, json, expectedRevision: null);
+                #endif
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"NORMALIZATION_LEARNER_LONGTERM_MEMORY result=WRITE_ERROR type={ex.GetType().Name} loaded={loaded} stored={observations.Count} productionMutation=False");
+                #endif
             }
         }
 
@@ -13459,7 +13589,9 @@ internal static partial class AIrhythmDataState
         var stable = snapshots.Values.Count(x => string.Equals(x.Stage, "stable", StringComparison.Ordinal));
         var drifting = snapshots.Values.Count(x => string.Equals(x.Stage, "drifting", StringComparison.Ordinal));
         var meanReliability = snapshots.Count == 0 ? 0.0d : snapshots.Values.Average(x => x.Reliability);
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         WriteDeveloperLog($"NORMALIZATION_LEARNER_LONGTERM_MEMORY result=OK loaded={loaded} stored={snapshots.Count} maxDays={maxDays} stable={stable} drifting={drifting} meanReliability={meanReliability:0.000} changed={changed} schema={NormalizationLearnerLongTermSchemaVersion} logic=normalization_learner_v11_persistent_daily_features_external_structural_support sameDayInflation=False decisionMutation=False shadowOnly=False promotionConsumer=True productionMutation=strict_promotion_only canonicalMutation=eligible_aliases_only scoreMutation=via_canonical_identity evidenceMutation=via_canonical_identity");
+        #endif
         return snapshots;
     }
 
@@ -13499,9 +13631,15 @@ internal static partial class AIrhythmDataState
                     }
                 }
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"NORMALIZATION_LEARNER_HYPOTHESIS_MEMORY result=LOAD_ERROR type={ex.GetType().Name} action=start_fresh_without_production_effect");
+                #endif
             }
         }
 
@@ -13586,13 +13724,23 @@ internal static partial class AIrhythmDataState
                     DateTimeOffset.Now,
                     observations.Values.OrderBy(x => x.HypothesisKey, StringComparer.Ordinal).ToArray());
                 var json = JsonSerializer.Serialize(state, JsonOptions);
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 var written = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerHypothesisStorageKey, json, expectedRevision: null);
                 if (!written.Succeeded)
                     WriteDeveloperLog($"NORMALIZATION_LEARNER_HYPOTHESIS_MEMORY result=WRITE_FAILED loaded={loaded} stored={observations.Count} schemaMismatch={schemaMismatch} productionMutation=False");
+                #else
+                _ = context.Storage.Set(NormalizationLearnerStorageNamespace, NormalizationLearnerHypothesisStorageKey, json, expectedRevision: null);
+                #endif
             }
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             catch (Exception ex)
+            #else
+            catch (Exception)
+            #endif
             {
+                #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"NORMALIZATION_LEARNER_HYPOTHESIS_MEMORY result=WRITE_ERROR type={ex.GetType().Name} loaded={loaded} stored={observations.Count} productionMutation=False");
+                #endif
             }
         }
 
@@ -13635,7 +13783,9 @@ internal static partial class AIrhythmDataState
         var survivor = snapshots.Values.Count(x => string.Equals(x.Stage, "survivor", StringComparison.Ordinal));
         var contested = snapshots.Values.Count(x => string.Equals(x.Stage, "contested", StringComparison.Ordinal));
         var persistentReject = snapshots.Values.Count(x => string.Equals(x.Stage, "persistent_reject", StringComparison.Ordinal));
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         WriteDeveloperLog($"NORMALIZATION_LEARNER_HYPOTHESIS_MEMORY result=OK loaded={loaded} stored={snapshots.Count} maxDays={maxDays} survivors={survivor} contested={contested} persistentReject={persistentReject} changed={changed} schema={NormalizationLearnerHypothesisSchemaVersion} logic=normalization_learner_v5_hypothesis_survival sameDayInflation=False shadowOnly=False promotionConsumer=True productionMutation=strict_promotion_only canonicalMutation=eligible_aliases_only scoreMutation=via_canonical_identity evidenceMutation=via_canonical_identity");
+        #endif
 
         return snapshots;
     }
@@ -13689,11 +13839,19 @@ internal static partial class AIrhythmDataState
                 NormalizationPromotionSchemaVersion, NormalizationPromotionLogicVersion, now, entries);
             var written = context.Storage.Set(NormalizationPromotionStorageNamespace, NormalizationPromotionStorageKey,
                 JsonSerializer.Serialize(state, JsonOptions), expectedRevision: null);
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"NORMALIZATION_PROMOTION_MEMORY result={(written.Succeeded ? "OK" : "WRITE_FAILED")} active={entries.Length} schema={NormalizationPromotionSchemaVersion} logic={NormalizationPromotionLogicVersion} rollback=replace_with_current_strict_consensus provenance=True");
+            #endif
         }
+        #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         catch (Exception ex)
+        #else
+        catch (Exception)
+        #endif
         {
+            #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             WriteDeveloperLog($"NORMALIZATION_PROMOTION_MEMORY result=WRITE_ERROR type={ex.GetType().Name}");
+            #endif
         }
     }
 
