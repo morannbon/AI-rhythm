@@ -1,0 +1,8 @@
+{
+  "Name": "AI-rhythm",
+  "Solution": "AIrhythm.BasicPlugin.sln",
+  "Dll": "AIrhythm.BasicPlugin.dll",
+  "Version": "1.0.7",
+  "Project": "AIrhythm.BasicPlugin",
+  "Framework": "net8.0-windows"
+}

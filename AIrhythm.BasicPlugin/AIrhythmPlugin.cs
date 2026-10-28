@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -434,7 +434,7 @@ internal sealed class AIrhythmRenderer
     }
 
     // Initial Theme presentation remains server-rendered from the Host ThemeContract.
-    // SDK 1.1.12 HotApply uses the separately declared Host-shell asset
+    // Host-contract HotApply uses the separately declared Host-shell asset
     // Assets/theme-hot-apply.js to project the same semantic variables onto the existing DOM.
     // Theme-only updates never re-enter Content Render semantics.
 
@@ -1192,6 +1192,15 @@ internal static partial class AIrhythmRecommendationEngine
     private static readonly HashSet<string> ContributorNonEntityTokens = new(
         ContributorRoleMap.Keys.Concat(new[] { "MC", "ＭＣ", "出演", "出演者", "キャスト", "主演", "声の出演", "声優", "司会", "ゲスト", "解説", "実況", "原作", "原作者", "監督", "脚本", "演出", "プロデューサー", "制作", "製作", "音楽", "アーティスト", "歌", "スケーター", "選手", "アナウンサー", "ほか", "他", "ほか多数", "その他" }),
         StringComparer.OrdinalIgnoreCase);
+    // Precompute identity-normalized role labels once, in the original longest-first order.
+    // Contributor normalization runs for every candidate; sorting and Unicode normalization
+    // on each credit allocates without adding any evidence.
+    private static readonly string[] ContributorCompactRoleLabels = ContributorRoleMap.Keys
+        .OrderByDescending(x => x.Length)
+        .Select(ContributorEntityKey)
+        .ToArray();
+    private static readonly HashSet<string> ContributorCompactNonEntityTokens = new(
+        ContributorNonEntityTokens.Select(ContributorEntityKey), StringComparer.OrdinalIgnoreCase);
     private static readonly object ScoreResultCacheGate = new();
     private static AIrhythmRuntimeSnapshot? CachedScoreSnapshot;
     private static long CachedScoreExternalEvidenceGeneration = -1;
@@ -1362,6 +1371,7 @@ internal static partial class AIrhythmRecommendationEngine
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.WriteDeveloperLog($"CANONICAL_FACT_CACHE hits={identityContext.CanonicalFactsHits} misses={identityContext.CanonicalFactsMisses} programCached={identityContext.ProgramFactsCount} reservationCached={identityContext.ReservationFactsCount} historyCached={identityContext.HistoryFactsCount} scope=single_render_snapshot semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog($"LOCAL_WORK_KEY_CACHE hits={identityContext.LocalWorkKeyCacheHits} misses={identityContext.LocalWorkKeyCacheMisses} cached={identityContext.LocalWorkKeys.Count} scope=single_render_snapshot key=title_shared_except_trailing_parenthesis_service_scope semantics=unchanged");
+        AIrhythmDataState.WriteDeveloperLog($"LOCAL_WORK_KEY_ALLOCATION_DETAIL canonicalHits={identityContext.CanonicalLocalWorkKeyHitCalls} canonicalHitBytes={identityContext.CanonicalLocalWorkKeyHitBytes} canonicalMisses={identityContext.CanonicalLocalWorkKeyMissCalls} canonicalMissBytes={identityContext.CanonicalLocalWorkKeyMissBytes} canonicalTotalBytes={identityContext.CanonicalLocalWorkKeyHitBytes + identityContext.CanonicalLocalWorkKeyMissBytes} scope=canonical_facts_across_render_snapshot allocationScope=current_thread_exact measurement=existing_outer_probe_no_extra_gc_probe cacheBranch=miss_counter_delta semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog($"LOCAL_EPISODE_IDENTITY_CACHE hits={identityContext.LocalEpisodeIdentityCacheHits} misses={identityContext.LocalEpisodeIdentityCacheMisses} cached={identityContext.LocalEpisodeIdentities.Count} scope=single_render_snapshot key=title_plus_service negativeResultsCached=True continuityTimeComparisonCached=False semantics=unchanged");
 #endif
         return new(cards, charts, discovery, search, message, status);
@@ -1641,9 +1651,32 @@ internal static partial class AIrhythmRecommendationEngine
             var aliasKey = CompactIdentity(title);
             if (aliasKey.Length == 0)
                 continue;
+            // An anchored prefix can still swallow a distinct, longer Work (for example,
+            // a franchise label followed by the individual film title). Resolve the local
+            // Work once, and require a recognized structural boundary before overriding it.
+            // Do not synthesize one from the remaining unparsed characters.
+            var parsed = ParseCanonicalTitleParts(title);
+            var localParsedWork = CompactIdentity(parsed.Work);
+            var recognizedBoundary = !string.IsNullOrWhiteSpace(parsed.Episode)
+                || !string.IsNullOrWhiteSpace(parsed.Part)
+                || !string.IsNullOrWhiteSpace(parsed.Subtitle)
+                || !string.IsNullOrWhiteSpace(parsed.Event)
+                || !string.IsNullOrWhiteSpace(parsed.Stage)
+                || !string.IsNullOrWhiteSpace(parsed.BroadcastAttribute);
             var matching = eligible
-                .Where(row => aliasKey.StartsWith(CompactIdentity(row.LearnedWork), StringComparison.Ordinal)
-                    || aliasKey.Contains(CompactIdentity(row.LearnedWork), StringComparison.Ordinal))
+                .Where(row =>
+                {
+                    var learnedKey = CompactIdentity(row.LearnedWork);
+                    if (learnedKey.Length == 0
+                        || !aliasKey.StartsWith(learnedKey, StringComparison.Ordinal))
+                        return false;
+                    // If the local parser retains additional Work characters, only an
+                    // independently parsed episode/content boundary can justify shortening.
+                    // Equality needs no such proof and retains established promotions.
+                    return localParsedWork.Length == 0
+                        || string.Equals(localParsedWork, learnedKey, StringComparison.Ordinal)
+                        || recognizedBoundary;
+                })
                 .ToList();
             if (matching.Count > 0)
                 proposals[aliasKey] = matching;
@@ -3038,7 +3071,18 @@ internal static partial class AIrhythmRecommendationEngine
             = new(ReferenceEqualityComparer.Instance);
         internal Dictionary<TvAirRecordingHistoryDto, AIrhythmCanonicalEvidenceFacts> HistoryFacts { get; }
             = new(ReferenceEqualityComparer.Instance);
+        // Title-only transforms are immutable within one snapshot. Reuse them when the same
+        // programme name occurs across services/dates; do not cache service-dependent work decisions.
+        internal Dictionary<string, string[]> TitleTokens { get; } = new(StringComparer.Ordinal);
+        internal Dictionary<string, string> PromotionLookupKeys { get; } = new(StringComparer.Ordinal);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        internal int TitleTokenCacheHits { get; set; }
+        internal int TitleTokenCacheMisses { get; set; }
+        internal int PromotionKeyCacheHits { get; set; }
+        internal int PromotionKeyCacheMisses { get; set; }
+#endif
         internal Dictionary<AIrhythmLocalWorkCacheKey, string> LocalWorkKeys { get; } = new();
+        internal Dictionary<AIrhythmLocalWorkCacheKey, string> CanonicalWorkResolutions { get; } = new();
         internal int LocalWorkKeyCacheHits { get; set; }
         internal int LocalWorkKeyCacheMisses { get; set; }
         internal Dictionary<AIrhythmLocalEpisodeCacheKey, AIrhythmLocalEpisodeCacheValue> LocalEpisodeIdentities { get; } = new();
@@ -3052,6 +3096,13 @@ internal static partial class AIrhythmRecommendationEngine
         internal int CanonicalFactsMisses { get; set; }
         internal long CanonicalPreEvaluationTitleBytes { get; set; }
         internal long CanonicalLocalWorkKeyBytes { get; set; }
+        // Split the hot allocation scope by actual cache outcome. No extra GC probes:
+        // CanonicalEvidenceFacts already measures the enclosing operation; the cache hit
+        // counter supplies its branch result. These counters are diagnostic-only.
+        internal long CanonicalLocalWorkKeyHitBytes { get; set; }
+        internal long CanonicalLocalWorkKeyMissBytes { get; set; }
+        internal long CanonicalLocalWorkKeyHitCalls { get; set; }
+        internal long CanonicalLocalWorkKeyMissCalls { get; set; }
         internal long CanonicalAliasResolutionBytes { get; set; }
         internal long CanonicalGenreBytes { get; set; }
         internal long CanonicalTokensBytes { get; set; }
@@ -3061,6 +3112,10 @@ internal static partial class AIrhythmRecommendationEngine
         {
             CanonicalPreEvaluationTitleBytes = 0;
             CanonicalLocalWorkKeyBytes = 0;
+            CanonicalLocalWorkKeyHitBytes = 0;
+            CanonicalLocalWorkKeyMissBytes = 0;
+            CanonicalLocalWorkKeyHitCalls = 0;
+            CanonicalLocalWorkKeyMissCalls = 0;
             CanonicalAliasResolutionBytes = 0;
             CanonicalGenreBytes = 0;
             CanonicalTokensBytes = 0;
@@ -3153,6 +3208,40 @@ internal static partial class AIrhythmRecommendationEngine
         return false;
     }
 
+    private static string[] TitleTokensCached(string analysisTitle, AIrhythmEvidenceIdentityContext context)
+    {
+        if (context.TitleTokens.TryGetValue(analysisTitle, out var tokens))
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            context.TitleTokenCacheHits++;
+#endif
+            return tokens;
+        }
+        tokens = Tokens(analysisTitle).ToArray();
+        context.TitleTokens.Add(analysisTitle, tokens);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        context.TitleTokenCacheMisses++;
+#endif
+        return tokens;
+    }
+
+    private static string PromotionLookupKeyCached(string analysisTitle, AIrhythmEvidenceIdentityContext context)
+    {
+        if (context.PromotionLookupKeys.TryGetValue(analysisTitle, out var key))
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            context.PromotionKeyCacheHits++;
+#endif
+            return key;
+        }
+        key = CompactIdentity(NormalizationLearnerComparableTitle(analysisTitle));
+        context.PromotionLookupKeys.Add(analysisTitle, key);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        context.PromotionKeyCacheMisses++;
+#endif
+        return key;
+    }
+
     private static string LocalWorkKeyCached(
         string? title,
         AIrhythmServiceIdentity service,
@@ -3187,25 +3276,69 @@ internal static partial class AIrhythmRecommendationEngine
         AIrhythmServiceIdentity service,
         AIrhythmEvidenceIdentityContext context)
     {
-        var canonical = CanonicalizeLocalWorkKey(LocalWorkKeyCached(analysisTitle, service, context), service, context.WorkAliases);
-        var promotionKey = CompactIdentity(NormalizationLearnerComparableTitle(analysisTitle));
+        return CanonicalWorkIdentity(analysisTitle, service, context, LocalWorkKeyCached(analysisTitle, service, context));
+    }
+
+    // When canonical facts already computed the service-scoped local key, pass it through.
+    // The output cache is limited to this immutable evidence snapshot: it never retains
+    // past EPG titles or persists any promoted/alias decision across a refresh.
+    private static string CanonicalWorkIdentity(
+        string analysisTitle,
+        AIrhythmServiceIdentity service,
+        AIrhythmEvidenceIdentityContext context,
+        string localWorkKey)
+    {
+        var resolutionKey = new AIrhythmLocalWorkCacheKey(analysisTitle, service);
+        if (context.CanonicalWorkResolutions.TryGetValue(resolutionKey, out var resolved))
+            return resolved;
+
+        var canonical = CanonicalizeLocalWorkKey(localWorkKey, service, context.WorkAliases);
+        // Both evidence-backed aliases and learner promotions must respect the
+        // identical complete-Work boundary. A learner must not reinstate a shorter
+        // prefix that a locally parsed, structurally inseparable work rejected.
+        // Parse only when a shortening candidate actually exists.
+        CanonicalTitleParts parsed = default;
+        var parsedReady = false;
+        bool WouldDiscardCompleteWork(string candidate)
+        {
+            if (candidate.Length < 3 || candidate.Length >= localWorkKey.Length
+                || localWorkKey.Length - candidate.Length < 3
+                || !localWorkKey.StartsWith(candidate, StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (!parsedReady)
+            {
+                parsed = ParseCanonicalTitleParts(analysisTitle);
+                parsedReady = true;
+            }
+            return string.Equals(CompactIdentity(parsed.Work), localWorkKey, StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(parsed.Episode)
+                && string.IsNullOrWhiteSpace(parsed.Part)
+                && string.IsNullOrWhiteSpace(parsed.Subtitle)
+                && string.IsNullOrWhiteSpace(parsed.Event)
+                && string.IsNullOrWhiteSpace(parsed.Stage)
+                && string.IsNullOrWhiteSpace(parsed.BroadcastAttribute);
+        }
+        if (WouldDiscardCompleteWork(canonical))
+            canonical = localWorkKey;
+
+        var promotionKey = context.NormalizationPromotions.Count == 0
+            ? string.Empty
+            : PromotionLookupKeyCached(analysisTitle, context);
         if (promotionKey.Length > 0
             && context.NormalizationPromotions.TryGetValue(promotionKey, out var promoted)
             && !string.IsNullOrWhiteSpace(promoted))
         {
-            // A cross-day learner promotion must not undo a locally corroborated episode
-            // boundary. The same-service sequence consists of distinct recording facts,
-            // while the parenthesized number is presentation/episode identity, not Work.
-            // This is a general precedence contract, not a per-programme alias.
-            // Preserve canonical even when the learner proposes a longer title containing
-            // the episode suffix; no persisted promotion or recording fact is mutated.
-            if (canonical.Length > 0
+            // A same-service parenthesized episode sequence takes precedence.
+            // Otherwise a structurally complete Work must not be reduced merely
+            // because the learned prefix has survived across observation days.
+            if (!(canonical.Length > 0
                 && !string.Equals(canonical, promoted, StringComparison.OrdinalIgnoreCase)
                 && IsCorroboratedParenthesizedWorkSequence(
                     analysisTitle, service, context.NumericLocalValuesByService))
-                return canonical;
-            return promoted;
+                && !WouldDiscardCompleteWork(promoted))
+                canonical = promoted;
         }
+        context.CanonicalWorkResolutions[resolutionKey] = canonical;
         return canonical;
     }
 
@@ -3273,12 +3406,26 @@ internal static partial class AIrhythmRecommendationEngine
         var canonicalAfterPreEvaluation = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalPreEvaluationTitleBytes += canonicalAfterPreEvaluation - canonicalDetailStart;
 #endif
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        var workKeyMissesBefore = context.LocalWorkKeyCacheMisses;
+#endif
         var localWorkKey = LocalWorkKeyCached(analysisTitle, service, context);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var canonicalAfterLocalWorkKey = GC.GetAllocatedBytesForCurrentThread();
-        context.CanonicalLocalWorkKeyBytes += canonicalAfterLocalWorkKey - canonicalAfterPreEvaluation;
+        var localWorkAllocation = canonicalAfterLocalWorkKey - canonicalAfterPreEvaluation;
+        context.CanonicalLocalWorkKeyBytes += localWorkAllocation;
+        if (context.LocalWorkKeyCacheMisses != workKeyMissesBefore)
+        {
+            context.CanonicalLocalWorkKeyMissCalls++;
+            context.CanonicalLocalWorkKeyMissBytes += localWorkAllocation;
+        }
+        else
+        {
+            context.CanonicalLocalWorkKeyHitCalls++;
+            context.CanonicalLocalWorkKeyHitBytes += localWorkAllocation;
+        }
 #endif
-        var canonicalWorkKey = CanonicalWorkIdentity(analysisTitle, service, context);
+        var canonicalWorkKey = CanonicalWorkIdentity(analysisTitle, service, context, localWorkKey);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var canonicalAfterAliasResolution = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalAliasResolutionBytes += canonicalAfterAliasResolution - canonicalAfterLocalWorkKey;
@@ -3288,7 +3435,7 @@ internal static partial class AIrhythmRecommendationEngine
         var canonicalAfterGenre = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalGenreBytes += canonicalAfterGenre - canonicalAfterAliasResolution;
 #endif
-        var terms = Tokens(analysisTitle).ToArray();
+        var terms = TitleTokensCached(analysisTitle, context);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var canonicalAfterTokens = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalTokensBytes += canonicalAfterTokens - canonicalAfterGenre;
@@ -3367,8 +3514,8 @@ internal static partial class AIrhythmRecommendationEngine
     {
         var service = ServiceIdentityOf(item);
         var analysisTitle = PreEvaluationTitle(item.ProgramTitle, context);
-        var localWorkKey = LocalWorkKey(analysisTitle, service, context.NumericLocalValuesByService);
-        var canonicalWorkKey = CanonicalWorkIdentity(analysisTitle, service, context);
+        var localWorkKey = LocalWorkKeyCached(analysisTitle, service, context);
+        var canonicalWorkKey = CanonicalWorkIdentity(analysisTitle, service, context, localWorkKey);
 
         var displayTitle = SeriesDisplayTitle(item.ProgramTitle);
         if (IsCorroboratedParenthesizedWorkSequence(item.ProgramTitle, service, context.NumericLocalValuesByService)
@@ -4383,7 +4530,7 @@ internal static partial class AIrhythmRecommendationEngine
                 : !canonicalFacts.UsesExternalCanonicalTitle
                     ? canonicalFacts.WorkKey
                     : CanonicalizeLocalWorkKey(
-                        LocalWorkKey(title, service, identityContext.NumericLocalValuesByService),
+                        LocalWorkKeyCached(title, service, identityContext),
                         service,
                         identityContext.WorkAliases);
 
@@ -4873,7 +5020,22 @@ internal static partial class AIrhythmRecommendationEngine
     {
         if (string.IsNullOrWhiteSpace(pattern) || string.IsNullOrWhiteSpace(text)) return false;
         if (!useRegex)
-            return ContributorRuleAlternatives(pattern).Any(token => text.Contains(token, StringComparison.OrdinalIgnoreCase));
+        {
+            // Existence matching needs neither the alternative array nor Distinct():
+            // duplicate alternatives never affect a Boolean match. Keep the same
+            // RemoveEmptyEntries/TrimEntries semantics and case-insensitive comparison.
+            ReadOnlySpan<char> remaining = pattern.AsSpan();
+            while (true)
+            {
+                var separator = remaining.IndexOf('|');
+                var token = (separator < 0 ? remaining : remaining[..separator]).Trim();
+                if (!token.IsEmpty && text.AsSpan().Contains(token, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (separator < 0) break;
+                remaining = remaining[(separator + 1)..];
+            }
+            return false;
+        }
         try
         {
             return Regex.IsMatch(text, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(50));
@@ -4949,9 +5111,8 @@ internal static partial class AIrhythmRecommendationEngine
 
         var compact = ContributorEntityKey(value);
         if (compact.Length < 2 || compact.Length > 80) return string.Empty;
-        foreach (var roleLabel in ContributorRoleMap.Keys.OrderByDescending(x => x.Length))
+        foreach (var compactRole in ContributorCompactRoleLabels)
         {
-            var compactRole = ContributorEntityKey(roleLabel);
             if (compact.Length > compactRole.Length + 1 && compact.StartsWith(compactRole, StringComparison.OrdinalIgnoreCase))
             {
                 compact = compact[compactRole.Length..].Trim();
@@ -4959,7 +5120,7 @@ internal static partial class AIrhythmRecommendationEngine
             }
         }
         if (compact.Length < 2 || compact.Length > 80) return string.Empty;
-        if (ContributorNonEntityTokens.Any(x => string.Equals(ContributorEntityKey(x), compact, StringComparison.OrdinalIgnoreCase)))
+        if (ContributorCompactNonEntityTokens.Contains(compact))
             return string.Empty;
         return compact;
     }
@@ -5028,6 +5189,32 @@ internal static partial class AIrhythmRecommendationEngine
         var value = (raw ?? string.Empty).Trim();
         if (role != "music" && role != "cast" && role != "voice" && role != "artist")
             return new[] { value };
+        // A repeated 【character】performer structure is an explicit boundary supplied
+        // by EPG, not an inferred Japanese-name split. Consume it only when the entire
+        // value consists of complete bracket/performer pairs. Otherwise defer to the
+        // existing conservative parser; never create a guessed merged identity.
+        if (role is "cast" or "voice")
+        {
+            var credits = Regex.Matches(value, @"【[^【】\r\n]{1,40}】\s*(?<performer>[^【】\r\n]+)", RegexOptions.CultureInvariant);
+            if (credits.Count >= 2 && credits.Count <= 16)
+            {
+                var cursor = 0;
+                var people = new List<string>(credits.Count);
+                var complete = true;
+                foreach (Match credit in credits)
+                {
+                    if (!string.IsNullOrWhiteSpace(value[cursor..credit.Index])) { complete = false; break; }
+                    var performer = credit.Groups["performer"].Value.Trim();
+                    if (performer.Length < 2 || performer.Length > 80
+                        || Regex.IsMatch(performer, @"\S+[\s　]+\S+", RegexOptions.CultureInvariant))
+                    { complete = false; break; }
+                    people.Add(performer);
+                    cursor = credit.Index + credit.Length;
+                }
+                if (complete && string.IsNullOrWhiteSpace(value[cursor..]))
+                    return people;
+            }
+        }
         var label = Regex.Match(value, @"^【\s*(?<label>[^】]+)\s*】\s*(?<body>.+)$", RegexOptions.CultureInvariant);
         if (!label.Success || !ContributorRoleMap.TryGetValue(label.Groups["label"].Value.Trim(), out var labelledRole)
             || !string.Equals(labelledRole, role, StringComparison.Ordinal))
@@ -5067,6 +5254,23 @@ internal static partial class AIrhythmRecommendationEngine
                 value = voiceCredit.Groups["person"].Value.Trim();
             }
         }
+        // A broadcaster may nest an explicit commentator/credit label in a cast field,
+        // followed by a biographical parenthesis. This is structural metadata, not
+        // a second person's name. Only accept a single, bracket-labelled name; any
+        // unmarked multi-person remainder continues through the conservative gate.
+        if (role is "cast" or "voice" or "host" or "guest" or "commentator")
+        {
+            var nestedRole = Regex.Match(value,
+                @"^【\s*(?:センター解説|解説|実況|司会|MC|ＭＣ|キャスター|気象キャスター|出演|出演者|声の出演)\s*】\s*(?<person>[^【】\r\n]+)$",
+                RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+            if (nestedRole.Success)
+                value = nestedRole.Groups["person"].Value.Trim();
+        }
+        // Biographical explanations are metadata only when they form ONE balanced
+        // trailing parenthesis after a nonempty credit. A multi-person line such as
+        // "A（経歴）・B（経歴）" remains ambiguous and is never guessed here.
+        if (Regex.IsMatch(value, @"^[^（）()\r\n]{2,80}[（(][^（）()\r\n]{1,80}[）)]$", RegexOptions.CultureInvariant))
+            value = Regex.Replace(value, @"[（(][^（）()\r\n]{1,80}[）)]$", string.Empty, RegexOptions.CultureInvariant).Trim();
         value = ContributorTrailingNoteRegex.Replace(value, string.Empty).Trim();
         // Broadcasters sometimes repeat a role label inside the value, e.g.
         // "出演者：出演：山田太郎" or "音楽：音楽：山田太郎". Strip only known role labels.
@@ -5132,9 +5336,8 @@ internal static partial class AIrhythmRecommendationEngine
 #endif
             return string.Empty;
         }
-        foreach (var roleLabel in ContributorRoleMap.Keys.OrderByDescending(x => x.Length))
+        foreach (var compactRole in ContributorCompactRoleLabels)
         {
-            var compactRole = ContributorEntityKey(roleLabel);
             if (compact.Length > compactRole.Length + 1 && compact.StartsWith(compactRole, StringComparison.OrdinalIgnoreCase))
             {
                 compact = compact[compactRole.Length..].Trim();
@@ -5149,7 +5352,7 @@ internal static partial class AIrhythmRecommendationEngine
 #endif
             return string.Empty;
         }
-        if (ContributorNonEntityTokens.Any(x => string.Equals(ContributorEntityKey(x), compact, StringComparison.OrdinalIgnoreCase)))
+        if (ContributorCompactNonEntityTokens.Contains(compact))
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             System.Threading.Interlocked.Increment(ref _contributorDeferredNonEntity);
@@ -5680,6 +5883,39 @@ internal static partial class AIrhythmRecommendationEngine
             hourAffinity);
     }
 
+    // Identical to reasons.Distinct().Take(4).ToArray(): preserve insertion order and
+    // EqualityComparer<string>.Default semantics without per-candidate LINQ iterators/HashSet.
+    // The reason list is short, so at most four previously accepted entries are compared.
+    private static string[] TakeFirstFourDistinctReasons(List<string> reasons)
+    {
+        if (reasons.Count == 0)
+            return Array.Empty<string>();
+
+        string? first = null, second = null, third = null, fourth = null;
+        var count = 0;
+        foreach (var reason in reasons)
+        {
+            if (count > 0 && EqualityComparer<string>.Default.Equals(first, reason)) continue;
+            if (count > 1 && EqualityComparer<string>.Default.Equals(second, reason)) continue;
+            if (count > 2 && EqualityComparer<string>.Default.Equals(third, reason)) continue;
+            if (count > 3 && EqualityComparer<string>.Default.Equals(fourth, reason)) continue;
+            switch (count)
+            {
+                case 0: first = reason; break;
+                case 1: second = reason; break;
+                case 2: third = reason; break;
+                case 3: fourth = reason; break;
+            }
+            if (++count == 4) break;
+        }
+        var result = new string[count];
+        if (count > 0) result[0] = first!;
+        if (count > 1) result[1] = second!;
+        if (count > 2) result[2] = third!;
+        if (count > 3) result[3] = fourth!;
+        return result;
+    }
+
     private static IReadOnlyList<AIrhythmRecommendation> Score(AIrhythmRuntimeSnapshot snapshot, AIrhythmEvidenceIdentityContext identityContext)
     {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -5949,6 +6185,18 @@ internal static partial class AIrhythmRecommendationEngine
             var candidatePhaseStart = GC.GetAllocatedBytesForCurrentThread();
             candidateLoopVisited++;
 #endif
+            // An EPG placeholder has no broadcast Work to recommend. Gate it before
+            // canonical evidence evaluation so it cannot acquire a fictitious new-Work
+            // identity, and avoid per-candidate normalization/regex allocations.
+            // The title must consist entirely of a placeholder status: do not reject
+            // real programmes merely because their title contains similar words.
+            if (IsUnspecifiedEpgTitle(item.Title))
+            {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+                candidateLoopExcluded++;
+#endif
+                continue;
+            }
             var facts = CanonicalEvidenceFacts(item, identityContext);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             var candidatePhaseAfterCanonicalFacts = GC.GetAllocatedBytesForCurrentThread();
@@ -6465,7 +6713,7 @@ internal static partial class AIrhythmRecommendationEngine
             candidateLocalAggregateAdjustmentBytes += candidatePhaseAfterLocalExternal - candidatePhaseAfterExternalProjection;
             candidateLocalExternalBytes += candidatePhaseAfterLocalExternal - candidatePhaseAfterContextInterest;
 #endif
-            scored.Add(new(item.Title, item.ServiceName, broadcast, item.Genre ?? string.Empty, item.Start, rawScore, reasons.Distinct().Take(4).ToArray(), seriesKey, identity, isConvincing, isPlausibleDiscovery, rawScore, adjustedDeviationRawScore, externalEvidenceSummary, externalEvidenceEvaluationFlags, externalEvidenceConfidenceGate, externalEvidenceAdjustmentCandidate, externalEvidenceAdjustmentKind, externalEvidenceAdjustmentStrength, externalEvidenceSupportingVerdictReason, externalEvidenceShadowAdjustmentValue, externalEvidenceAdjustmentValue, learnedUserAffinity, 0.0d, learnedUserModelMaturity));
+            scored.Add(new(item.Title, item.ServiceName, broadcast, item.Genre ?? string.Empty, item.Start, rawScore, TakeFirstFourDistinctReasons(reasons), seriesKey, identity, isConvincing, isPlausibleDiscovery, rawScore, adjustedDeviationRawScore, externalEvidenceSummary, externalEvidenceEvaluationFlags, externalEvidenceConfidenceGate, externalEvidenceAdjustmentCandidate, externalEvidenceAdjustmentKind, externalEvidenceAdjustmentStrength, externalEvidenceSupportingVerdictReason, externalEvidenceShadowAdjustmentValue, externalEvidenceAdjustmentValue, learnedUserAffinity, 0.0d, learnedUserModelMaturity));
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             candidateRecommendationBytes += GC.GetAllocatedBytesForCurrentThread() - candidatePhaseAfterLocalExternal;
 #endif
@@ -7658,9 +7906,29 @@ internal static partial class AIrhythmRecommendationEngine
         return true;
     }
 
-    private static bool TryStructurallyInertEvidenceSeriesKeyFastPath(string value, out string key)
+    // The structural probe operates on FormKC + canonical whitespace, so terminal
+    // derivative markers can be checked without constructing a regex match for each
+    // scored EPG title. The canonical parser remains the only owner of derivative
+    // classification and the separate PR/preview Work identity.
+    private static readonly string[] TerminalDerivativeMarkers = { "PR", "予告", "みどころ", "総集編" };
+
+    private static bool HasTerminalDerivativeMarker(string normalized)
+    {
+        ReadOnlySpan<char> value = normalized.AsSpan();
+        foreach (var marker in TerminalDerivativeMarkers)
+        {
+            if (value.Length > marker.Length
+                && value[^(marker.Length + 1)] == ' '
+                && value.EndsWith(marker.AsSpan(), StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool TryStructurallyInertEvidenceSeriesKeyFastPath(string value, out string key, out string normalizedForFallback)
     {
         key = string.Empty;
+        normalizedForFallback = string.Empty;
         if (value.Length == 0)
             return true;
 
@@ -7669,13 +7937,21 @@ internal static partial class AIrhythmRecommendationEngine
         // Unlike TrySimpleEvidenceSeriesKeyFastPath, ordinary spaces and punctuation are allowed
         // here when none of the existing parser branches can change Work.
         var normalized = NormalizeCanonicalWhitespace(value.Normalize(NormalizationForm.FormKC));
+        // Pass this immutable NFKC/whitespace-normalized value through to the fallback
+        // parser, avoiding a second NFKC + whitespace normalization for every rejected title.
+        normalizedForFallback = normalized;
 
         // A numbered event round is structurally significant even if the title contains
         // no episode/session/stage tokens. The canonical parser separates "第N戦" into
         // Event, but the inert fast path previously treated such titles as plain text,
         // leaving the round and venue inside Work and fragmenting historical rankings.
         // This is a generic parser-contract guard, never a sport/title-specific alias.
+        // The numbered-round regex cannot match without both delimiters and an ASCII or
+        // full-width digit. Avoid invoking its engine on non-numeric titles in a cold snapshot.
+        // This gate does not interpret or strip Work text; matching titles still use the
+        // identical canonical parser and regular expression.
         if (normalized.IndexOf('第') >= 0 && normalized.IndexOf('戦') >= 0
+            && normalized.Any(ch => ch is >= '0' and <= '9' or >= '０' and <= '９')
             && Regex.IsMatch(normalized, @"第\s*[0-9０-９]{1,3}\s*戦"))
             return false;
 
@@ -7720,6 +7996,11 @@ internal static partial class AIrhythmRecommendationEngine
             || normalized.Contains("後編", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("部", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("ep", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // Terminal programme-derivative markers are meaningful even without quotes.
+        // Do not bypass the common parser and inadvertently conflate a PR with Work.
+        if (HasTerminalDerivativeMarker(normalized))
             return false;
 
         // Space-separated broadcast containers are the one parser branch that can change Work
@@ -7780,12 +8061,25 @@ internal static partial class AIrhythmRecommendationEngine
         string computed;
         if (TrySimpleEvidenceSeriesKeyFastPath(value, out var simpleKey))
             computed = simpleKey;
-        else if (TryStructurallyInertEvidenceSeriesKeyFastPath(value, out var inertKey))
-            computed = inertKey;
         else
         {
-            var parts = ParseCanonicalTitleParts(value);
-            computed = CompactIdentity(parts.Work);
+            var inert = TryStructurallyInertEvidenceSeriesKeyFastPath(value, out var inertKey, out var normalizedForFallback);
+            if (inert)
+                computed = inertKey;
+            else
+            {
+                // The structural fast path has already performed FormKC and normalized
+                // whitespace. Reuse that exact text; the canonical parser still owns every
+                // annotation, attribute and work-boundary decision.
+                var parts = ParseCanonicalTitleParts(normalizedForFallback, alreadyNormalized: true);
+                // Derived broadcast items retain the same underlying Work, but must not
+                // collapse into the actual programme when facts/recommendations are keyed.
+                // This preserves the historical suffix representation without teaching a
+                // programme-specific alias or silently merging a promotion with an episode.
+                computed = CompactIdentity(parts.Work);
+                if (parts.BroadcastAttribute.StartsWith("derived:", StringComparison.Ordinal))
+                    computed += parts.BroadcastAttribute["derived:".Length..];
+            }
         }
 
         if (SharedEvidenceSeriesKeys.Count < SharedTitleTransformCacheLimit)
@@ -7798,6 +8092,19 @@ internal static partial class AIrhythmRecommendationEngine
         "アワー", "劇場", "ロードショー", "プレミアム", "シネマ", "アニメイズム",
         "ドラマ", "映画", "セレクション", "コレクション", "特集", "映画祭", "ショーケース"
     };
+
+    // Status-only EPG entries are not identifiable works. No per-programme exceptions:
+    // only full-title, common unassigned-broadcast status labels are recognized.
+    private static bool IsUnspecifiedEpgTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return true;
+        var span = title.AsSpan().Trim();
+        return span.Equals("放送番組未定".AsSpan(), StringComparison.OrdinalIgnoreCase)
+            || span.Equals("番組未定".AsSpan(), StringComparison.OrdinalIgnoreCase)
+            || span.Equals("番組情報未定".AsSpan(), StringComparison.OrdinalIgnoreCase)
+            || span.Equals("放送内容未定".AsSpan(), StringComparison.OrdinalIgnoreCase)
+            || span.Equals("番組内容未定".AsSpan(), StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool LooksLikeBroadcastContainerLabel(string? value)
     {
@@ -7971,15 +8278,56 @@ internal static partial class AIrhythmRecommendationEngine
         return true;
     }
 
-    private static CanonicalTitleParts ParseCanonicalTitleParts(string? value)
+    // Fixed canonical-title patterns are reused rather than competing for the process-wide
+    // Regex static cache. The same patterns/options are retained; only their lifetime changes.
+    private static readonly Regex CanonicalTitleRegex01 = new(@"^(?<container>[^「『]{2,28}?)[「『](?<work>[^」』]{2,120})[」』](?<tail>.*)$", RegexOptions.Compiled);
+    private static readonly Regex CanonicalTitleRegex02 = new(@"^(?<type>アニメ|ドラマ|映画|ドキュメンタリー)\s+(?<work>\S.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex03 = new(@"^(?<work>.+?)\s+(?<slot>(?:MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\s+(?:ANIME|DRAMA|MOVIE)\s+NIGHT)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex04 = new(@"^(?<type>[^「『]{1,12})[「『](?<work>[^」』]{2,120})[」』](?<tail>.*)$", RegexOptions.Compiled);
+    private static readonly Regex CanonicalTitleRegex05 = new(@"(?:[!！?？]|＆|&|\bVS\b|参戦|大暴れ|密着|特集|クイズ|ランキング|スペシャル|\bSP\b|初公開|徹底|衝撃|爆笑|今夜|今週|ゲスト|ロケ|挑戦|対決)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex06 = new(@"(?:第\s*[0-9０-９]+|[#＃]\s*[0-9０-９]+)$", RegexOptions.Compiled);
+    private static readonly Regex CanonicalTitleRegex07 = new(@"(?<attr>【\s*(?:TV|テレビ|地上波|BS|CS)?\s*(?:初放送|初登場|初公開)\s*】)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex08 = new(@"(?:旅|紀行|路線バス|鉄道|街道|散歩|ドライブ|ツアー)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex09 = new(@"^(?<location>[^ ~～〜→]{2,24}(?:~|～|〜|→)[^ ~～〜→]{2,24})\s+(?<work>.+)$", RegexOptions.Compiled);
+    private static readonly Regex CanonicalTitleRegex10 = new(@"\s*(?<attr>(?:生中継|生放送|中継)(?:\s*[（(]仮[）)])?)\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex11 = new(@"(?<prefix>.+?)(?<stage>準々決勝|準決勝|決勝|予選|決定戦|3位決定戦|３位決定戦)\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex12 = new(@"(?:選手権|大会|カップ|リーグ|オープン|グランプリ|杯|シリーズ)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex13 = new(@"^(?<work>.+?[\p{L}\p{N}])\s+第\s*(?<number>[0-9０-９]{1,3})\s*戦(?<tail>.*)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex14 = new(@"(?:^|[\s:：・/／（(【\[「『])(?<stage>フリー走行\s*[0-9０-９]+|FP\s*[0-9０-９]+|予選|決勝|スプリント(?:予選|シュートアウト)?|準々決勝|準決勝)(?=$|[\s:：・/／）)】\]」』])", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex15 = new(@"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex16 = new(@"(?:【[^【】]{2,}】|\[[^\[\]]{2,}\])\s*$", RegexOptions.Compiled);
+    private static readonly Regex CanonicalTitleRegex17 = new(@"^(?<work>.+?)\s+第[一二三四五六七八九十百千零〇]+(?:話|章)(?:\s*[:：].*)?$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex18 = new(@"\s+(?<part>第\s*[0-9０-９]+\s*部|前編|後編)(?<tail>(?:\s+.+)?)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex19 = new(@"(?:新番組|初回|最終回|再放送|アンコール|リピート|一挙放送)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // A subtitle may include reading parentheses (e.g. 輿(こし)入れ).
+    // Check nesting without allocating regex captures for each nested pair.
+    private static bool HasBalancedParentheses(string value)
+    {
+        var depth = 0;
+        foreach (var ch in value)
+        {
+            if (ch is '(' or '（') depth++;
+            else if (ch is ')' or '）')
+            {
+                if (--depth < 0) return false;
+            }
+        }
+        return depth == 0;
+    }
+
+    private static CanonicalTitleParts ParseCanonicalTitleParts(string? value, bool alreadyNormalized = false)
     {
         if (string.IsNullOrWhiteSpace(value))
             return new(string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, string.Empty,
                 string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, string.Empty);
 
-        var normalized = value.Normalize(NormalizationForm.FormKC);
+        // EvidenceSeriesKey's structural probe supplies a previously FormKC- and
+        // whitespace-normalized value. Other callers retain the original parsing path.
+        var normalized = alreadyNormalized ? value : value.Normalize(NormalizationForm.FormKC);
         normalized = StripNonIdentityBroadcastAnnotations(normalized);
-        normalized = NormalizeCanonicalWhitespace(normalized);
+        if (!alreadyNormalized || !ReferenceEquals(normalized, value))
+            normalized = NormalizeCanonicalWhitespace(normalized);
         var structureSignals = DetectCanonicalTitleStructureSignals(normalized);
 
         // TvAIr のプログラム予約が末尾へ付加する曜日は Host 管理属性として分離する。
@@ -8008,16 +8356,32 @@ internal static partial class AIrhythmRecommendationEngine
         // 1) 「枠名『作品名』」は最も強いローカル構造。引用内を Work とし、前置きを Container とする。
         // 例: 日曜劇場「VIVANT」第18話 ...
         var quotedWork = workRoot.IndexOf('「') >= 0 || workRoot.IndexOf('『') >= 0
-            ? Regex.Match(workRoot, @"^(?<container>[^「『]{2,28}?)[「『](?<work>[^」』]{2,120})[」』](?<tail>.*)$")
+            ? CanonicalTitleRegex01.Match(workRoot)
             : Match.Empty;
         if (quotedWork.Success)
         {
             var quotedPrefix = quotedWork.Groups["container"].Value.Trim(' ', '・', '-', '－', ':', '：');
             var quotedBody = quotedWork.Groups["work"].Value.Trim();
             var tail = quotedWork.Groups["tail"].Value.Trim();
-            if (LooksLikeBroadcastContainerLabel(quotedPrefix))
+            // A fully bracketed lead-in is explicit broadcast-container syntax, even
+            // when the label has no conventional container suffix (e.g. a time slot).
+            // Only accept a complete bracket pair and a nonempty quoted Work.  Do not
+            // infer a container from an unbracketed marketing or sponsor prefix.
+            var explicitBracketContainer = quotedPrefix.Length >= 4
+                && quotedPrefix[0] == '【' && quotedPrefix[^1] == '】'
+                && quotedPrefix.AsSpan(1, quotedPrefix.Length - 2).IndexOfAny('【', '】') < 0;
+            if (explicitBracketContainer || LooksLikeBroadcastContainerLabel(quotedPrefix))
             {
-                // 「映画『作品』」のように型ラベルだけが前置きされる場合は Container ではなく ContentType。
+                if (explicitBracketContainer)
+                {
+                    container = quotedPrefix[1..^1].Trim();
+                    workRoot = quotedBody;
+                    if (tail.Length > 0)
+                        workRoot = $"{workRoot} {tail}";
+                }
+                else
+                {
+                    // 「映画『作品』」のように型ラベルだけが前置きされる場合は Container ではなく ContentType。
                 if (string.Equals(quotedPrefix, "映画", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(quotedPrefix, "ドラマ", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(quotedPrefix, "アニメ", StringComparison.OrdinalIgnoreCase)
@@ -8055,15 +8419,30 @@ internal static partial class AIrhythmRecommendationEngine
                 workRoot = quotedBody;
                 if (tail.Length > 0)
                     workRoot = $"{workRoot} {tail}";
+                }
             }
             else
             {
-                // 「名探偵コナン『各話副題』」等、通常番組名の後ろに引用副題が付く形。
-                // 前置きが放送枠と判断できない時は、前置きを Work として保持する。
-                workRoot = quotedPrefix;
-                subtitle = quotedBody;
-                if (tail.Length > 0)
-                    subtitle = $"{subtitle} {tail}";
+                // An unrecognized prefix is not evidence that the quoted portion is only
+                // an episode subtitle.  In particular, a quoted name followed by an
+                // edition/broadcast announcement cannot safely be collapsed to the prefix.
+                // Keep the complete identity pending corroboration rather than inventing
+                // an alias or losing the quoted Work. Ordinary episode subtitles retain
+                // the established prefix handling.
+                var editionOnlyTail = Regex.IsMatch(tail,
+                    @"^(?:スペシャル|特別編|完全版|ディレクターズカット)(?:\s|$)",
+                    RegexOptions.IgnoreCase);
+                if (editionOnlyTail)
+                {
+                    workRoot = normalized;
+                }
+                else
+                {
+                    workRoot = quotedPrefix;
+                    subtitle = quotedBody;
+                    if (tail.Length > 0)
+                        subtitle = $"{subtitle} {tail}";
+                }
             }
         }
         else
@@ -8103,9 +8482,16 @@ internal static partial class AIrhythmRecommendationEngine
         // 始まる連続語（「アニメーション...」等）には適用しない。
         if (contentType.Length == 0 && container.Length == 0)
         {
-            var typedPrefix = Regex.Match(workRoot,
-                @"^(?<type>アニメ|ドラマ|映画|ドキュメンタリー)\s+(?<work>\S.+)$",
-                RegexOptions.IgnoreCase);
+            // The anchored expression cannot match unless the title begins with one
+            // of its four literal type labels. Reject the ordinary path before Regex
+            // creates a Match object; matched inputs retain the exact old expression.
+            var hasTypedPrefix = workRoot.StartsWith("アニメ", StringComparison.OrdinalIgnoreCase)
+                || workRoot.StartsWith("ドラマ", StringComparison.OrdinalIgnoreCase)
+                || workRoot.StartsWith("映画", StringComparison.OrdinalIgnoreCase)
+                || workRoot.StartsWith("ドキュメンタリー", StringComparison.OrdinalIgnoreCase);
+            var typedPrefix = hasTypedPrefix
+                ? CanonicalTitleRegex02.Match(workRoot)
+                : Match.Empty;
             if (typedPrefix.Success && typedPrefix.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 2)
             {
                 contentType = typedPrefix.Groups["type"].Value;
@@ -8117,9 +8503,11 @@ internal static partial class AIrhythmRecommendationEngine
         // 独立した空白境界を必須とし、作品固有の副題や英語の固有名は残す。
         if (container.Length == 0)
         {
-            var trailingSlot = Regex.Match(workRoot,
-                @"^(?<work>.+?)\s+(?<slot>(?:MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\s+(?:ANIME|DRAMA|MOVIE)\s+NIGHT)$",
-                RegexOptions.IgnoreCase);
+            // The suffix is mandatory in the established anchored expression.
+            // Avoid materializing failed Regex matches for unrelated programmes.
+            var trailingSlot = workRoot.EndsWith("NIGHT", StringComparison.OrdinalIgnoreCase)
+                ? CanonicalTitleRegex03.Match(workRoot)
+                : Match.Empty;
             if (trailingSlot.Success && trailingSlot.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 3)
             {
                 container = trailingSlot.Groups["slot"].Value;
@@ -8130,7 +8518,7 @@ internal static partial class AIrhythmRecommendationEngine
         // Container 分離後に「映画『作品』」等の型ラベルが残る場合は、型ラベルを Work へ混ぜない。
         if (container.Length > 0 && (workRoot.IndexOf('「') >= 0 || workRoot.IndexOf('『') >= 0))
         {
-            var typedQuotedWork = Regex.Match(workRoot, @"^(?<type>[^「『]{1,12})[「『](?<work>[^」』]{2,120})[」』](?<tail>.*)$");
+            var typedQuotedWork = CanonicalTitleRegex04.Match(workRoot);
             if (typedQuotedWork.Success && LooksLikeBroadcastContainerLabel(typedQuotedWork.Groups["type"].Value))
             {
                 contentType = typedQuotedWork.Groups["type"].Value.Trim();
@@ -8186,13 +8574,29 @@ internal static partial class AIrhythmRecommendationEngine
             {
                 var candidateWork = workRoot[..plainTailSpace];
                 var candidateTail = workRoot[(plainTailSpace + 1)..];
-                var promoLikeTail = Regex.IsMatch(
-                    candidateTail,
-                    @"(?:[!！?？]|＆|&|\bVS\b|参戦|大暴れ|密着|特集|クイズ|ランキング|スペシャル|\bSP\b|初公開|徹底|衝撃|爆笑|今夜|今週|ゲスト|ロケ|挑戦|対決)",
-                    RegexOptions.IgnoreCase);
+                var promoLikeTail = CanonicalTitleRegex05.IsMatch(candidateTail);
+                // A terminal bracketed broadcast announcement is not evidence that
+                // the preceding unbracketed words are promotional copy. For example,
+                // an installment subtitle followed by a series-wide announcement must
+                // retain the complete Work; step 7 will separately extract the bracket.
+                // Inspect only the unbracketed tail if the strong promo match came
+                // from the complete text. This is structural, never title-specific.
                 if (promoLikeTail
+                    && TrySplitTrailingBracketSubtitle(candidateTail, requirePrefix: true,
+                        out var unbracketedTail, out _))
+                    promoLikeTail = CanonicalTitleRegex05.IsMatch(unbracketedTail);
+                // A competition/series title in the tail is not mere promotional copy.
+                // Treat an explicit season/year + named event/series as identity-bearing,
+                // even when the same text contains promo terms.  This is a generic
+                // structural veto and never learns or hardcodes a sponsor or work name.
+                var hasNamedEditionInTail = Regex.IsMatch(candidateTail,
+                    @"(?:20[0-9]{2}|(?:第\s*[0-9]+\s*(?:回|期|部|シリーズ))|(?:season|series)\s*[0-9]+)",
+                    RegexOptions.IgnoreCase)
+                    && candidateTail.Count(char.IsLetterOrDigit) >= 10;
+                if (promoLikeTail
+                    && !hasNamedEditionInTail
                     && candidateWork.Count(char.IsLetterOrDigit) >= 3
-                    && !Regex.IsMatch(candidateWork, @"(?:第\s*[0-9０-９]+|[#＃]\s*[0-9０-９]+)$"))
+                    && !CanonicalTitleRegex06.IsMatch(candidateWork))
                 {
                     workRoot = candidateWork;
                     subtitle = candidateTail;
@@ -8200,13 +8604,30 @@ internal static partial class AIrhythmRecommendationEngine
             }
         }
 
+        // Separately identify broadcast derivatives in the canonical structure.  The
+        // relation stays separate from Work and the identity key retains a distinct
+        // derivative suffix; promotion episodes are never credited as the main work.
+        // Only an exact terminal marker after an existing work is accepted.
+        var derivedTail = Regex.Match(workRoot,
+            @"^(?<work>.+?)[\s　]+(?<kind>PR|ＰＲ|予告|みどころ|総集編)$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (derivedTail.Success
+            && derivedTail.Groups["work"].Value.Trim().Count(char.IsLetterOrDigit) >= 3)
+        {
+            var derivedWork = derivedTail.Groups["work"].Value.TrimEnd();
+            var derivedKind = derivedTail.Groups["kind"].Value.Normalize(NormalizationForm.FormKC);
+            var derivedCode = derivedKind.Equals("PR", StringComparison.OrdinalIgnoreCase)
+                ? "pr"
+                : derivedKind == "予告" ? "予告"
+                : derivedKind == "みどころ" ? "みどころ" : "総集編";
+            broadcastAttribute = "derived:" + derivedCode;
+            workRoot = derivedWork;
+        }
+
         // 6) 明示的な放送属性を囲む角括弧は Work から外して BroadcastAttribute へ。
         //    ARIB短タグとは別に、局側が人間向けに書く「TV初放送」等を扱う。
         var explicitBroadcastBracket = structureSignals.MayHaveExplicitBroadcastBracket
-            ? Regex.Match(
-                workRoot,
-                @"(?<attr>【\s*(?:TV|テレビ|地上波|BS|CS)?\s*(?:初放送|初登場|初公開)\s*】)",
-                RegexOptions.IgnoreCase)
+            ? CanonicalTitleRegex07.Match(workRoot)
             : Match.Empty;
         if (explicitBroadcastBracket.Success)
         {
@@ -8233,11 +8654,11 @@ internal static partial class AIrhythmRecommendationEngine
         //    後続本文から明確な場合だけ Location へ分離する。地名辞書や個別タイトル登録は使わない。
         if (workRoot.IndexOf(' ') > 0
             && (workRoot.IndexOf('~') > 0 || workRoot.IndexOf('～') > 0 || workRoot.IndexOf('〜') > 0 || workRoot.IndexOf('→') > 0)
-            && Regex.IsMatch(workRoot, @"(?:旅|紀行|路線バス|鉄道|街道|散歩|ドライブ|ツアー)", RegexOptions.IgnoreCase))
+            && CanonicalTitleRegex08.IsMatch(workRoot))
         {
             // FormKC は全角チルダ U+FF5E を ASCII '~' へ正規化するため、構造判定側でも
             // 正規化後の '~' を同じルート区切りとして扱う。raw title の切り出しには使わない。
-            var route = Regex.Match(workRoot, @"^(?<location>[^ ~～〜→]{2,24}(?:~|～|〜|→)[^ ~～〜→]{2,24})\s+(?<work>.+)$");
+            var route = CanonicalTitleRegex09.Match(workRoot);
             if (route.Success && route.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 4)
             {
                 location = route.Groups["location"].Value.Trim();
@@ -8248,7 +8669,7 @@ internal static partial class AIrhythmRecommendationEngine
         // 9) 生中継/中継/生放送などの明示的な放送形態は Work から外して BroadcastAttribute へ。
         //    「（仮）」は放送側の暫定表記として属性側へ含める。
         var liveBroadcast = structureSignals.MayHaveLiveBroadcast
-            ? Regex.Match(workRoot, @"\s*(?<attr>(?:生中継|生放送|中継)(?:\s*[（(]仮[）)])?)\s*$", RegexOptions.IgnoreCase)
+            ? CanonicalTitleRegex10.Match(workRoot)
             : Match.Empty;
         if (liveBroadcast.Success)
         {
@@ -8261,12 +8682,12 @@ internal static partial class AIrhythmRecommendationEngine
         //    切り離しても Work 本体を壊さないよう、前側に十分な識別文字が残る場合だけ採用する。
         if (stage.Length == 0 && structureSignals.MayHaveTerminalStage)
         {
-            var terminalStage = Regex.Match(workRoot, @"(?<prefix>.+?)(?<stage>準々決勝|準決勝|決勝|予選|決定戦|3位決定戦|３位決定戦)\s*$", RegexOptions.IgnoreCase);
+            var terminalStage = CanonicalTitleRegex11.Match(workRoot);
             if (terminalStage.Success)
             {
                 var prefix = terminalStage.Groups["prefix"].Value.TrimEnd();
                 if (prefix.Count(char.IsLetterOrDigit) >= 4
-                    && Regex.IsMatch(prefix, @"(?:選手権|大会|カップ|リーグ|オープン|グランプリ|杯|シリーズ)", RegexOptions.IgnoreCase))
+                    && CanonicalTitleRegex12.IsMatch(prefix))
                 {
                     stage = terminalStage.Groups["stage"].Value.Trim();
                     workRoot = prefix;
@@ -8283,9 +8704,7 @@ internal static partial class AIrhythmRecommendationEngine
         var mayContainRound = workRoot.IndexOf('戦') >= 0
             && workRoot.IndexOf('第') >= 0;
         var round = mayContainRound
-            ? Regex.Match(workRoot,
-                @"^(?<work>.+?[\p{L}\p{N}])\s+第\s*(?<number>[0-9０-９]{1,3})\s*戦(?<tail>.*)$",
-                RegexOptions.IgnoreCase)
+            ? CanonicalTitleRegex13.Match(workRoot)
             : Match.Empty;
         if (round.Success)
         {
@@ -8296,9 +8715,7 @@ internal static partial class AIrhythmRecommendationEngine
             {
                 workRoot = candidateWork;
                 var tail = round.Groups["tail"].Value.Trim(' ', ':', '：', '・', '/', '／');
-                var session = Regex.Match(tail,
-                    @"(?:^|[\s:：・/／（(【\[「『])(?<stage>フリー走行\s*[0-9０-９]+|FP\s*[0-9０-９]+|予選|決勝|スプリント(?:予選|シュートアウト)?|準々決勝|準決勝)(?=$|[\s:：・/／）)】\]」』])",
-                    RegexOptions.IgnoreCase);
+                var session = CanonicalTitleRegex14.Match(tail);
                 if (session.Success)
                 {
                     stage = session.Groups["stage"].Value.Trim();
@@ -8310,6 +8727,30 @@ internal static partial class AIrhythmRecommendationEngine
             }
         }
 
+        // A parenthesized number followed immediately by a substantive subtitle is
+        // distinguishable from an isolated ambiguous numeric suffix.  Keep a standalone
+        // (4), production year (2023), and embedded series number untouched.
+        if (episode.Length == 0 && (workRoot.IndexOf('(') >= 0 || workRoot.IndexOf('（') >= 0))
+        {
+            var numberedSubtitle = Regex.Match(workRoot,
+                @"^(?<work>.+?)[（(](?<number>[0-9０-９]{1,3})[）)]\s*(?<subtitle>.{3,})$",
+                RegexOptions.CultureInvariant);
+            if (numberedSubtitle.Success
+                && numberedSubtitle.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 3
+                && numberedSubtitle.Groups["work"].Value.Any(char.IsLetter)
+                && numberedSubtitle.Groups["subtitle"].Value.Any(char.IsLetter)
+                // Subtitles can contain their own reading/furigana parentheses.
+                // Do not discard a clear episode boundary solely for that reason,
+                // but reject malformed trailing bracket structures conservatively.
+                && HasBalancedParentheses(numberedSubtitle.Groups["subtitle"].Value))
+            {
+                episode = "(" + numberedSubtitle.Groups["number"].Value + ")";
+                var episodeSubtitle = numberedSubtitle.Groups["subtitle"].Value.Trim();
+                subtitle = subtitle.Length == 0 ? episodeSubtitle : $"{subtitle} {episodeSubtitle}";
+                workRoot = numberedSubtitle.Groups["work"].Value.TrimEnd();
+            }
+        }
+
         // 12) 明示的な話数だけを Episode として分離する。
         var mayContainEpisodeMarker = workRoot.IndexOf('#') >= 0
             || workRoot.IndexOf('＃') >= 0
@@ -8317,10 +8758,7 @@ internal static partial class AIrhythmRecommendationEngine
             || workRoot.IndexOf('回') >= 0
             || workRoot.Contains("ep", StringComparison.OrdinalIgnoreCase);
         var marker = mayContainEpisodeMarker
-            ? Regex.Match(
-                workRoot,
-                @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)",
-                RegexOptions.IgnoreCase)
+            ? CanonicalTitleRegex15.Match(workRoot)
             : Match.Empty;
         if (marker.Success)
         {
@@ -8328,7 +8766,7 @@ internal static partial class AIrhythmRecommendationEngine
             var prefix = workRoot[..marker.Index].TrimEnd();
             var suffix = workRoot[(marker.Index + marker.Length)..].Trim();
 
-            var bracketSubtitle = Regex.Match(prefix, @"(?:【[^【】]{2,}】|\[[^\[\]]{2,}\])\s*$");
+            var bracketSubtitle = CanonicalTitleRegex16.Match(prefix);
             if (bracketSubtitle.Success)
             {
                 subtitle = bracketSubtitle.Value.Trim();
@@ -8349,11 +8787,10 @@ internal static partial class AIrhythmRecommendationEngine
         // 第十八話・第二十章など漢数字の話数・章番号を Episode に分離する。
         // 章だけを根拠にシリーズ名を削らず、先行する作品名と明示の「第」が
         // ある終端構造に限定する。
-        if (episode.Length == 0)
+        if (episode.Length == 0 && workRoot.IndexOf('第') >= 0
+            && (workRoot.IndexOf('話') >= 0 || workRoot.IndexOf('章') >= 0))
         {
-            var kanjiEpisode = Regex.Match(workRoot,
-                @"^(?<work>.+?)\s+第[一二三四五六七八九十百千零〇]+(?:話|章)(?:\s*[:：].*)?$",
-                RegexOptions.IgnoreCase);
+            var kanjiEpisode = CanonicalTitleRegex17.Match(workRoot);
             if (kanjiEpisode.Success && kanjiEpisode.Groups["work"].Value.Count(char.IsLetterOrDigit) >= 3)
             {
                 episode = workRoot[kanjiEpisode.Groups["work"].Length..].Trim();
@@ -8366,7 +8803,7 @@ internal static partial class AIrhythmRecommendationEngine
         if (episode.Length == 0
             && (workRoot.IndexOf('部') >= 0 || workRoot.Contains("前編", StringComparison.OrdinalIgnoreCase) || workRoot.Contains("後編", StringComparison.OrdinalIgnoreCase)))
         {
-            var partMarker = Regex.Match(workRoot, @"\s+(?<part>第\s*[0-9０-９]+\s*部|前編|後編)(?<tail>(?:\s+.+)?)$", RegexOptions.IgnoreCase);
+            var partMarker = CanonicalTitleRegex18.Match(workRoot);
             if (partMarker.Success)
             {
                 var prefix = workRoot[..partMarker.Index].TrimEnd();
@@ -8384,14 +8821,14 @@ internal static partial class AIrhythmRecommendationEngine
         // 放送ライフサイクル語は Work Identity ではなく BroadcastAttribute へ退避する。
         if (structureSignals.MayHaveLifecycleAttribute)
         {
-            var lifecycleMatches = Regex.Matches(workRoot, @"(?:新番組|初回|最終回|再放送|アンコール|リピート|一挙放送)", RegexOptions.IgnoreCase);
+            var lifecycleMatches = CanonicalTitleRegex19.Matches(workRoot);
             if (lifecycleMatches.Count > 0)
             {
                 var lifecycleAttribute = string.Join("/", lifecycleMatches.Cast<Match>().Select(x => x.Value).Distinct(StringComparer.OrdinalIgnoreCase));
                 broadcastAttribute = broadcastAttribute.Length == 0
                     ? lifecycleAttribute
                     : $"{broadcastAttribute}/{lifecycleAttribute}";
-                workRoot = Regex.Replace(workRoot, @"(?:新番組|初回|最終回|再放送|アンコール|リピート|一挙放送)", " ", RegexOptions.IgnoreCase);
+                workRoot = CanonicalTitleRegex19.Replace(workRoot, " ");
             }
         }
 
@@ -8821,6 +9258,15 @@ internal static partial class AIrhythmRecommendationEngine
         stem = string.Empty;
         value = 0;
         if (string.IsNullOrWhiteSpace(title))
+            return false;
+
+        // A trailing parenthesized number cannot exist without an opening AND a closing
+        // parenthesis in the source. Fullwidth parentheses normalize to their ASCII forms,
+        // but broadcast annotations cannot invent either delimiter. Skip the expensive NFKC,
+        // annotation stripping and Regex path for ordinary EPG titles. This is a necessary-
+        // condition guard only; all titles that could match still use the original parser.
+        if ((title.IndexOf('(') < 0 && title.IndexOf('（') < 0)
+            || (title.IndexOf(')') < 0 && title.IndexOf('）') < 0))
             return false;
 
         var normalized = StripNonIdentityBroadcastAnnotations(title.Normalize(NormalizationForm.FormKC)).Trim();
@@ -9768,14 +10214,72 @@ internal static class AIrhythmExternalLookupAdapter
         => LookupProviderPacedAsync(refreshState, TvMazeState, context, capability, "SearchShow",
             new Dictionary<string, string> { ["query"] = NormalizeQuery(normalizedTitle, 160) }, cancellationToken);
 
-    public static Task<AIrhythmExternalEvidenceResult> GetTvMazeEpisodesAsync(
+    // GetEpisodes is an all-episodes response in the current Host contract. A show that
+    // exceeds the Host body-size ceiling cannot become smaller by retrying the same request.
+    // Keep only a bounded, process-local suppression set; do not alter Host limits or use HTTP.
+    // Serialize the suppression check and Host call so overlapping refreshes cannot race
+    // through the same still-unknown oversized show before its failure is remembered.
+    private static readonly SemaphoreSlim EpisodesRequestGate = new(1, 1);
+    private static readonly object OversizedEpisodesGate = new();
+    private static readonly Dictionary<string, DateTimeOffset> OversizedEpisodeShows = new(StringComparer.Ordinal);
+    private static readonly TimeSpan OversizedEpisodeSuppression = TimeSpan.FromDays(7);
+    private const int OversizedEpisodeShowLimit = 256;
+
+    private static bool IsOversizedEpisodeShow(string showId)
+    {
+        lock (OversizedEpisodesGate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            foreach (var expired in OversizedEpisodeShows.Where(item => item.Value <= now).Select(item => item.Key).ToArray())
+                OversizedEpisodeShows.Remove(expired);
+            return OversizedEpisodeShows.ContainsKey(showId);
+        }
+    }
+
+    private static void RememberOversizedEpisodeShow(string showId)
+    {
+        lock (OversizedEpisodesGate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            foreach (var expired in OversizedEpisodeShows.Where(item => item.Value <= now).Select(item => item.Key).ToArray())
+                OversizedEpisodeShows.Remove(expired);
+            if (OversizedEpisodeShows.Count >= OversizedEpisodeShowLimit && !OversizedEpisodeShows.ContainsKey(showId))
+            {
+                var oldest = OversizedEpisodeShows.OrderBy(item => item.Value).First().Key;
+                OversizedEpisodeShows.Remove(oldest);
+            }
+            OversizedEpisodeShows[showId] = now + OversizedEpisodeSuppression;
+        }
+    }
+
+    public static async Task<AIrhythmExternalEvidenceResult> GetTvMazeEpisodesAsync(
         ProviderRefreshState refreshState,
         ITvAirPluginRuntimeContext context,
         TvAirExternalLookupCapabilityDto capability,
         string showId,
         CancellationToken cancellationToken = default)
-        => LookupProviderPacedAsync(refreshState, TvMazeState, context, capability, "GetEpisodes",
-            new Dictionary<string, string> { ["showId"] = NormalizePositiveInteger(showId) }, cancellationToken);
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var normalizedShowId = NormalizePositiveInteger(showId);
+        await EpisodesRequestGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Recheck after acquiring the gate: another refresh may have just observed
+            // ResponseTooLarge for the same show while this caller was waiting.
+            if (IsOversizedEpisodeShow(normalizedShowId))
+                return new(false, TvAirExternalLookupResultCode.ResponseTooLarge, TvMazeProviderId, "GetEpisodes", string.Empty);
+
+            var result = await LookupProviderPacedAsync(refreshState, TvMazeState, context, capability, "GetEpisodes",
+                new Dictionary<string, string> { ["showId"] = normalizedShowId }, cancellationToken).ConfigureAwait(false);
+            if (result.Code == TvAirExternalLookupResultCode.ResponseTooLarge)
+                RememberOversizedEpisodeShow(normalizedShowId);
+            return result;
+        }
+        finally
+        {
+            EpisodesRequestGate.Release();
+        }
+    }
 
     public static Task<AIrhythmExternalEvidenceResult> GetTvMazeAliasesAsync(
         ProviderRefreshState refreshState,
@@ -10138,6 +10642,14 @@ internal static partial class AIrhythmDataState
         var separator = key.IndexOf('|');
         if (separator <= 0 || separator >= key.Length - 1) return false;
         var entity = key[(separator + 1)..];
+        // A role label fused to a person's name is not a person identity. Preserve
+        // the original historical evidence but exclude that ambiguous key from the
+        // scoring projection. The role label is structural EPG metadata, not a
+        // person-specific exception; do not guess or split the trailing person.
+        // Explicitly tracked search intent is protected by the early return above.
+        if (Regex.IsMatch(entity, @"^(?:(?:気象|ニュース|スポーツ)?キャスター)[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]{2,}$",
+            RegexOptions.CultureInvariant))
+            return true;
         // Mixed Japanese -> Latin -> Japanese without delimiters cannot safely denote
         // a single contributor. Do not split it into guessed identities.
         return Regex.IsMatch(entity,
@@ -16063,7 +16575,7 @@ var identityContext = AIrhythmRecommendationEngine.BuildEvidenceIdentityContext(
     }
 
     // Runtime data changes invalidate the snapshot cache. Theme synchronization is presentation-only:
-    // SDK 1.1.12 HotApply dispatches Host-owned Theme generation/revision/contract through the declared Host-shell handler.
+    // Host-contract HotApply dispatches Host-owned Theme generation/revision/contract through the declared Host-shell handler.
     // Theme changes are intentionally excluded from Content Render invalidation semantics.
     private static readonly string[] RefreshEventTypes =
     {

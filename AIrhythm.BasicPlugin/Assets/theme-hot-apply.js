@@ -196,7 +196,7 @@ function onRuntimeTheme(event) {
 
 window.addEventListener(RUNTIME_THEME_EVENT, onRuntimeTheme, false);
 
-// SDK 1.1.12 declared-handler transport.
+// Host-contract declared-handler transport.
 // Host tvair-theme.js and window.TvAIrTheme already exist before this declared asset is loaded.
 if (!window.TvAIrTheme || typeof window.TvAIrTheme.registerHotApplyClientReady !== 'function') {
   return;

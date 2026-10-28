@@ -1,52 +1,38 @@
-param(
-    [Parameter(Mandatory=$true)][ValidateSet('x64','x86')][string]$Platform,
-    [Parameter(Mandatory=$true)][string]$RefName,
-    [string]$SourceRoot='.'
-)
+param([Parameter(Mandatory=$true)][ValidateSet('x64','x86')][string]$Platform,[Parameter(Mandatory=$true)][string]$RefName)
 $ErrorActionPreference='Stop'
-$spec=ConvertFrom-Json '{"Docs":["README.md","README.txt","LICENSE","THIRD_PARTY_NOTICES.txt"],"Version":"1.0.6","Host":"1.2.12","Dll":"AIrhythm.BasicPlugin.dll","Project":"AIrhythm.BasicPlugin","Framework":"net8.0-windows","Solution":"AIrhythm.BasicPlugin.sln","Name":"AI-rhythm"}'
-$root=(Resolve-Path -LiteralPath $SourceRoot).Path
-[xml]$project=Get-Content -LiteralPath (Join-Path $root "$($spec.Project)/$($spec.Project).csproj")
-if($spec.Name -eq 'AI-rhythm') {
-    [xml]$versionProps=Get-Content -LiteralPath (Join-Path $root 'AIrhythm.Version.props')
-    $version=[string]$versionProps.Project.PropertyGroup.AIrhythmVersion
-} else { $version=[string]$project.Project.PropertyGroup[0].Version }
-if(!$version -or $RefName -cne "v$version"){throw 'Tag and product version must match'}
-$bin=Join-Path $root "$($spec.Project)/bin/$Platform/Release/$($spec.Framework)"
+$spec=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'package-spec.json') -Raw|ConvertFrom-Json
+if($RefName.StartsWith('v') -and $RefName -cne "v$($spec.Version)"){throw 'Tag/version mismatch'}
+if((Get-FileHash README.md).Hash -ne (Get-FileHash README.txt).Hash){throw 'README mismatch'}
+$bin=Join-Path "$($spec.Project)/bin/$Platform/Release" $spec.Framework
+$bin=(Resolve-Path -LiteralPath $bin).Path
 $dll=Join-Path $bin $spec.Dll
-if(!(Test-Path -LiteralPath $dll)){throw 'Plugin DLL missing'}
-if([Diagnostics.FileVersionInfo]::GetVersionInfo($dll).FileVersion -ne "$version.0"){throw 'DLL version differs'}
-if((Get-FileHash (Join-Path $root 'README.md')).Hash -ne (Get-FileHash (Join-Path $root 'README.txt')).Hash){throw 'README files differ'}
-$out="package/$($spec.Name)_v${version}_${Platform}"
-if(Test-Path -LiteralPath $out){throw 'Package staging already exists. Use a clean checkout.'}
-New-Item -ItemType Directory -Path $out -Force | Out-Null
-Copy-Item -LiteralPath $dll -Destination $out
-foreach($doc in $spec.Docs){Copy-Item -LiteralPath (Join-Path $root $doc) -Destination $out}
-if($spec.Name -in @('AI-rhythm','AIrCon')) {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'SDK_LICENSE.txt') -Destination $out
-}
-$deploy=$spec.Dll
-if($spec.Name -eq 'NicoJkPlugin') {
-    foreach($file in @('System.Text.Encoding.CodePages.dll','NicoJkPlugin.deps.json')) {
-        Copy-Item -LiteralPath (Join-Path $bin $file) -Destination $out
-    }
-    $nugetRoot=if($env:NUGET_PACKAGES){$env:NUGET_PACKAGES}else{Join-Path $env:USERPROFILE '.nuget/packages'}
-    $encodingPackage=Join-Path $nugetRoot 'system.text.encoding.codepages/8.0.0'
-    Copy-Item -LiteralPath (Join-Path $encodingPackage 'LICENSE.TXT') -Destination (Join-Path $out 'ENCODING_LICENSE.txt')
-    Copy-Item -LiteralPath (Join-Path $encodingPackage 'THIRD-PARTY-NOTICES.TXT') -Destination (Join-Path $out 'ENCODING_THIRD_PARTY_NOTICES.txt')
-    $manifest=Get-Content -LiteralPath (Join-Path $out 'plugin.json') -Raw | ConvertFrom-Json
-    if($manifest.version -ne $version -or $manifest.entry -ne $spec.Dll){throw 'Manifest differs from product'}
-    $deploy='NicoJkPlugin.dll、plugin.json、NicoJkPlugin.deps.json、System.Text.Encoding.CodePages.dll'
-}
+if(-not(Test-Path -LiteralPath $dll)){throw 'Required DLL missing'}
+if([Diagnostics.FileVersionInfo]::GetVersionInfo([IO.Path]::GetFullPath($dll)).FileVersion -ne "$($spec.Version).0"){throw 'Binary version mismatch'}
+$out="package/$($spec.Name)_v$($spec.Version)_$Platform"
+$out=Join-Path (Get-Location).Path $out
+if(Test-Path -LiteralPath $out){throw 'Use clean package staging'}
+New-Item -ItemType Directory -Path $out -Force|Out-Null
+if($spec.Name -eq 'TvAIr'){
+ foreach($f in @('TvAIr.exe','TvAIr.dll','TvAIrPlugin.dll','TvAIrEpgRec.exe','TvAIrEpgRec.dll','AribDecodeBridge.dll','wwwroot/index.html')){if(-not(Test-Path -LiteralPath (Join-Path $bin $f))){throw "Required output missing: $f"}}
+ $base=[IO.Path]::GetFullPath($bin)
+ Get-ChildItem -LiteralPath $base -File -Recurse|ForEach-Object{
+  $rel=[IO.Path]::GetRelativePath($base,$_.FullName)
+  $include=$_.Extension -notin @('.pdb','.lib','.exp','.log','.tmp','.bak','.xml')
+  if($rel -match '^runtimes[\\/]([^\\/]+)[\\/]'){$include=$include -and ($Matches[1] -in @("win-$Platform",'win'))}
+  if($rel -match '\.staticwebassets\.runtime\.json$'){$include=$false}
+  if($include){$to=Join-Path $out $rel;New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($to))) -Force|Out-Null;Copy-Item -LiteralPath $_.FullName -Destination $to}
+ }
+}else{Copy-Item -LiteralPath $dll -Destination $out}
+foreach($doc in @('README.md','README.txt','LICENSE')){Copy-Item -LiteralPath $doc -Destination $out}
+foreach($doc in @('THIRD_PARTY_NOTICES.txt','SDK_LICENSE.txt')){if(Test-Path -LiteralPath $doc){Copy-Item -LiteralPath $doc -Destination $out}}
+if($spec.Name -eq 'AI-rhythm'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'SDK_LICENSE.txt') -Destination $out}
+$instructions=if($spec.Name -eq 'TvAIr'){'ZIPを展開したフォルダー一式を配置してTvAIr.exeを起動してください。READMEの動作環境と初回設定に従ってください。'}else{"TvAIr v1.2.14と同じアーキテクチャを使用してください。TvAIrを終了し、$($spec.Dll)をTvAIr.exeと同じ場所のPluginsフォルダーへ配置してください。"}
 @"
-$($spec.Name) v$version ($Platform) - ビルド済み配布
+$($spec.Name) v$($spec.Version) ($Platform) - ビルド済み配布
 
-このZIPはビルド済みです。Visual Studioによるビルドは不要です。
-TvAIr $($spec.Host)以上と、TvAIrと同じアーキテクチャの配布物を使用してください。
-TvAIrを終了してから、$deploy をTvAIr.exeと同じフォルダーのPluginsへ配置してください。
-TvAIrを起動し、プラグインメニューに表示されることを確認してください。
-更新時もTvAIrを終了して、同じファイルを置き換えます。設定や履歴は削除しないでください。
-設定・使用方法はREADMEを参照してください。
-ライセンス文書は配布物の利用条件です。SDK_LICENSE.txtがある場合は同梱SDKの利用条件を示します。
-"@ | Set-Content -LiteralPath (Join-Path $out 'INSTALL.txt') -Encoding UTF8
-Compress-Archive -Path "$out/*" -DestinationPath "package/$($spec.Name)_v${version}_${Platform}.zip"
+Visual Studioによるビルドは不要です。必要なランタイムと利用条件はREADMEをご確認ください。
+$instructions
+更新時はTvAIrを終了して差し替え、既存の設定・保存データは保持してください。
+外部アプリやプラグインが必要な機能はREADMEの条件に従って設定してください。
+"@|Set-Content -LiteralPath (Join-Path $out 'INSTALL.txt') -Encoding utf8
+Compress-Archive -Path "$out/*" -DestinationPath "package/$($spec.Name)_v$($spec.Version)_$Platform.zip"
