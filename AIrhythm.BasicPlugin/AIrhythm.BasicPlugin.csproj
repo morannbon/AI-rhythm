@@ -6,8 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <Platforms>x86;x64</Platforms>
+    <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Release'">true</TreatWarningsAsErrors>
     <Prefer32Bit>false</Prefer32Bit>
-    <AIrhythmDeveloperDiagnostics Condition="'$(AIrhythmDeveloperDiagnostics)' == ''">false</AIrhythmDeveloperDiagnostics>
+    <AIrhythmDeveloperDiagnostics Condition="'$(AIrhythmDeveloperDiagnostics)' == ''">$(TvAIrDeveloperDiagnostics)</AIrhythmDeveloperDiagnostics>
     <RootNamespace>AIrhythm.BasicPlugin</RootNamespace>
     <AssemblyName>AIrhythm.BasicPlugin</AssemblyName>
     <Version>$(AIrhythmVersion)</Version>
@@ -25,6 +26,11 @@
   <PropertyGroup Condition="'$(AIrhythmDeveloperDiagnostics)'=='true'">
     <DefineConstants>$(DefineConstants);AIRHYTHM_DEVELOPER_DIAGNOSTICS</DefineConstants>
   </PropertyGroup>
+  <!-- One canonical build switch. A divergent override must never silently ship diagnostics. -->
+  <Target Name="ValidateAIrhythmDiagnosticsBoundary" BeforeTargets="CoreCompile">
+    <Error Condition="'$(AIrhythmDeveloperDiagnostics)' != '$(TvAIrDeveloperDiagnostics)'"
+           Text="AI-rhythm and SDK Developer Diagnostics flags must match. Use TvAIrDeveloperDiagnostics only." />
+  </Target>
   <ItemGroup>
     <ProjectReference Include="..\TvAIrPlugin\TvAIrPlugin.csproj" Private="false" />
   </ItemGroup>

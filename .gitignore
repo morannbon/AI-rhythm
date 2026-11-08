@@ -8,5 +8,3 @@
 # Local development artifacts
 *.log
 *.tmp
-
-/package/

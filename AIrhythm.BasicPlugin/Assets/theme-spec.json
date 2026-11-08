@@ -1,0 +1,393 @@
+{
+  "schema": 1,
+  "roles": [
+    {
+      "name": "page-bg",
+      "keys": [
+        "pageBackground",
+        "background",
+        "backgroundColor",
+        "appBackground"
+      ],
+      "light": "#f5f6f7",
+      "dark": "#121212"
+    },
+    {
+      "name": "surface-bg",
+      "keys": [
+        "surfaceBackground",
+        "surface",
+        "panelBackground",
+        "cardBackground"
+      ],
+      "light": "#ffffff",
+      "dark": "#1e1e1e"
+    },
+    {
+      "name": "subtle-bg",
+      "keys": [
+        "subtleBackground",
+        "secondaryBackground",
+        "controlBackground"
+      ],
+      "light": "#f0f1f2",
+      "dark": "#272727"
+    },
+    {
+      "name": "input-bg",
+      "keys": [
+        "inputBackground",
+        "fieldBackground",
+        "controlBackground"
+      ],
+      "light": "#ffffff",
+      "dark": "#272727"
+    },
+    {
+      "name": "text",
+      "keys": [
+        "text",
+        "foreground",
+        "textColor",
+        "foregroundColor"
+      ],
+      "light": "#111111",
+      "dark": "#f2f2f2"
+    },
+    {
+      "name": "muted",
+      "keys": [
+        "mutedText",
+        "secondaryText",
+        "mutedForeground"
+      ],
+      "light": "#5f6368",
+      "dark": "#b7b7b7"
+    },
+    {
+      "name": "chart-text",
+      "keys": [],
+      "fallback": "muted"
+    },
+    {
+      "name": "line",
+      "keys": [
+        "border",
+        "borderColor",
+        "separator",
+        "line"
+      ],
+      "light": "#d2d5d9",
+      "dark": "#4b4b4b"
+    },
+    {
+      "name": "accent",
+      "keys": [
+        "accent",
+        "accentColor",
+        "buttonBackground"
+      ],
+      "light": "#2f3337",
+      "dark": "#303030"
+    },
+    {
+      "name": "accent-text",
+      "keys": [
+        "accentText",
+        "accentForeground",
+        "buttonForeground"
+      ],
+      "light": "#ffffff",
+      "dark": "#ffffff"
+    },
+    {
+      "name": "focus",
+      "keys": [
+        "focus",
+        "focusColor",
+        "focusRing"
+      ],
+      "light": "#5b9dd9",
+      "dark": "#7ab8f5"
+    },
+    {
+      "name": "control-bg",
+      "keys": [
+        "controlBackground"
+      ],
+      "fallback": "input-bg"
+    },
+    {
+      "name": "control-text",
+      "keys": [
+        "controlText"
+      ],
+      "fallback": "text"
+    },
+    {
+      "name": "control-border",
+      "keys": [
+        "controlBorder"
+      ],
+      "fallback": "line"
+    },
+    {
+      "name": "control-hover-bg",
+      "keys": [
+        "controlHoverBackground"
+      ],
+      "fallback": "control-bg"
+    },
+    {
+      "name": "control-hover-text",
+      "keys": [
+        "controlHoverText"
+      ],
+      "fallback": "control-text"
+    },
+    {
+      "name": "control-hover-border",
+      "keys": [
+        "controlHoverBorder"
+      ],
+      "fallback": "control-border"
+    },
+    {
+      "name": "selected-bg",
+      "keys": [
+        "selectedBackground"
+      ],
+      "fallback": "accent"
+    },
+    {
+      "name": "selected-text",
+      "keys": [
+        "selectedText"
+      ],
+      "fallback": "accent-text"
+    },
+    {
+      "name": "selected-border",
+      "keys": [
+        "selectedBorder"
+      ],
+      "fallback": "selected-bg"
+    },
+    {
+      "name": "selected-hover-bg",
+      "keys": [
+        "selectedHoverBackground"
+      ],
+      "fallback": "selected-bg"
+    },
+    {
+      "name": "selected-hover-text",
+      "keys": [
+        "selectedHoverText"
+      ],
+      "fallback": "selected-text"
+    },
+    {
+      "name": "selected-hover-border",
+      "keys": [
+        "selectedHoverBorder"
+      ],
+      "fallback": "selected-border"
+    },
+    {
+      "name": "disabled-bg",
+      "keys": [
+        "disabledBackground"
+      ],
+      "fallback": "subtle-bg"
+    },
+    {
+      "name": "disabled-text",
+      "keys": [
+        "disabledText"
+      ],
+      "fallback": "muted"
+    },
+    {
+      "name": "disabled-border",
+      "keys": [
+        "disabledBorder"
+      ],
+      "fallback": "line"
+    },
+    {
+      "name": "primary-bg",
+      "keys": [
+        "primaryActionBackground"
+      ],
+      "fallback": "accent"
+    },
+    {
+      "name": "primary-text",
+      "keys": [
+        "primaryActionText"
+      ],
+      "fallback": "accent-text"
+    },
+    {
+      "name": "primary-border",
+      "keys": [
+        "primaryActionBorder"
+      ],
+      "fallback": "primary-bg"
+    },
+    {
+      "name": "primary-hover-bg",
+      "keys": [
+        "primaryActionHoverBackground"
+      ],
+      "fallback": "primary-bg"
+    },
+    {
+      "name": "primary-hover-text",
+      "keys": [
+        "primaryActionHoverText"
+      ],
+      "fallback": "primary-text"
+    },
+    {
+      "name": "primary-hover-border",
+      "keys": [
+        "primaryActionHoverBorder"
+      ],
+      "fallback": "primary-border"
+    },
+    {
+      "name": "secondary-bg",
+      "keys": [
+        "secondaryActionBackground"
+      ],
+      "fallback": "subtle-bg"
+    },
+    {
+      "name": "secondary-text",
+      "keys": [
+        "secondaryActionText"
+      ],
+      "fallback": "text"
+    },
+    {
+      "name": "secondary-border",
+      "keys": [
+        "secondaryActionBorder"
+      ],
+      "fallback": "line"
+    },
+    {
+      "name": "secondary-hover-bg",
+      "keys": [
+        "secondaryActionHoverBackground"
+      ],
+      "fallback": "secondary-bg"
+    },
+    {
+      "name": "secondary-hover-text",
+      "keys": [
+        "secondaryActionHoverText"
+      ],
+      "fallback": "secondary-text"
+    },
+    {
+      "name": "secondary-hover-border",
+      "keys": [
+        "secondaryActionHoverBorder"
+      ],
+      "fallback": "secondary-border"
+    },
+    {
+      "name": "danger-bg",
+      "keys": [
+        "dangerActionBackground"
+      ],
+      "fallback": "primary-bg"
+    },
+    {
+      "name": "danger-text",
+      "keys": [
+        "dangerActionText"
+      ],
+      "fallback": "primary-text"
+    },
+    {
+      "name": "danger-border",
+      "keys": [
+        "dangerActionBorder"
+      ],
+      "fallback": "primary-border"
+    },
+    {
+      "name": "danger-hover-bg",
+      "keys": [
+        "dangerActionHoverBackground"
+      ],
+      "fallback": "danger-bg"
+    },
+    {
+      "name": "danger-hover-text",
+      "keys": [
+        "dangerActionHoverText"
+      ],
+      "fallback": "danger-text"
+    },
+    {
+      "name": "danger-hover-border",
+      "keys": [
+        "dangerActionHoverBorder"
+      ],
+      "fallback": "danger-border"
+    }
+  ],
+  "modes": {
+    "light": {
+      "shadow": "0 10px 30px rgba(15,23,42,.08)",
+      "card-shadow": "0 5px 16px rgba(15,23,42,.06)",
+      "chart-grid": "rgba(100,116,139,.18)"
+    },
+    "dark": {
+      "shadow": "0 10px 30px rgba(0,0,0,.28)",
+      "card-shadow": "0 5px 16px rgba(0,0,0,.22)",
+      "chart-grid": "rgba(255,255,255,.10)"
+    }
+  },
+  "layout": {
+    "radius": "10px",
+    "space": "16px"
+  },
+  "palette": {
+    "hero-a": "#2563eb",
+    "hero-b": "#7c3aed",
+    "on-hero": "#ffffff",
+    "on-hero-soft": "rgba(255,255,255,.18)",
+    "on-hero-line": "rgba(255,255,255,.45)",
+    "viz-blue": "#5b8ff9",
+    "viz-blue-line": "#5b8ff966",
+    "viz-blue-soft": "#5b8ff914",
+    "viz-green": "#34d399",
+    "viz-green-line": "#34d39966",
+    "viz-green-soft": "#34d39914",
+    "viz-yellow": "#f6bd16",
+    "viz-orange": "#f59e0b",
+    "viz-orange-line": "#f59e0b88",
+    "viz-orange-soft": "#f59e0b18",
+    "viz-amber": "#f97316",
+    "viz-purple": "#8b5cf6",
+    "viz-cyan": "#06b6d4",
+    "viz-red": "#ef4444",
+    "viz-red-line": "#ef444466",
+    "viz-pink": "#ec4899",
+    "viz-blue2": "#3b82f6",
+    "viz-green2": "#22c55e",
+    "viz-teal": "#5ad8a6",
+    "summary-blue": "#60a5fa55",
+    "summary-purple": "#a78bfa22",
+    "summary-green": "#34d39955",
+    "summary-cyan": "#22d3ee22",
+    "summary-orange": "#f59e0b55",
+    "summary-red": "#fb718522"
+  }
+}
