@@ -58,8 +58,6 @@ internal readonly record struct AIrhythmExternalUserIntentSignal(
     int ManualReservationCount,
     int RecordingCount)
 {
-    internal bool HasEvidence => AutomaticReservationCount > 0 || ManualReservationCount > 0 || RecordingCount > 0;
-
     // 外部情報 — External lookup priority reflects accumulated user actions, with per-source bounds.
     internal int Priority =>
         Math.Min(AutomaticReservationCount, 16) * 320
@@ -222,7 +220,7 @@ internal sealed record AIrhythmRuntimeSnapshot(
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
     , AIrhythmRuntimeDiagnostics Diagnostics
 #endif
-    );
+    , IReadOnlyList<TvAirRecordingHistoryDto>? RecoveryCleanHistory = null);
 internal sealed record AIrhythmSaveResult(bool Success, string Message, bool Changed = true);
 internal sealed record AIrhythmBackupEnvelope(
     int FormatVersion,
@@ -241,7 +239,8 @@ internal sealed record AIrhythmUsageCounterState(
     long ReservationTotal,
     int Version = 1,
     DateTimeOffset? RecordingAccountingStart = null,
-    string[]? CountedRecordingKeys = null);
+    string[]? CountedRecordingKeys = null,
+    string[]? CountedReservationKeys = null);
 internal readonly record struct AIrhythmServiceIdentity(int NetworkId, int TransportStreamId, int ServiceId)
 {
     public bool IsValid => NetworkId > 0 && TransportStreamId > 0 && ServiceId > 0;
@@ -259,9 +258,9 @@ internal sealed record AIrhythmInterestSignal(
     string[]? ContributorKeys = null);
 
 // 保存・読込 — Persisted, behavior-derived user model. The model never stores a hand-authored title rule. It
-// accumulates one observation per explicit user choice and learns affinity distributions across Work /
-// Genre / Terms / Service / Hour plus role-aware Contributor evidence. More observations increase model
-// maturity; merely rendering a recommendation never teaches the model.
+// stores individually auditable facts across Work / Genre / Terms / Service / Hour and Contributor
+// evidence. The model's effective maturity counts independent manual/recording decisions and groups
+// rule-generated reservations by origin. Merely rendering recommendations never trains the model.
 internal sealed record AIrhythmContributorObservation(string Key, double Weight);
 
 internal sealed record AIrhythmUserModelObservation(
@@ -281,7 +280,9 @@ internal sealed record AIrhythmUserModelObservation(
     double GenreEvidenceWeight = 1.0d,
     double TermsEvidenceWeight = 1.0d,
     double ServiceEvidenceWeight = 1.0d,
-    double HourEvidenceWeight = 1.0d)
+    double HourEvidenceWeight = 1.0d,
+    bool ReconcileGenreEvidence = false,
+    string EvidenceCohortKey = "")
 {
     internal bool HasBaseLearningAxis => LearnWork || LearnGenre || LearnTerms || LearnService || LearnHour;
 }
@@ -304,7 +305,10 @@ internal readonly record struct AIrhythmBehaviorEvidenceAxes(
 internal sealed record AIrhythmBaseEvidenceLedgerEntry(
     double Work, double Genre, double Terms, double Service, double Hour,
     string WorkKey, string GenreKey, string ServiceKey,
-    string[]? TermKeys = null, string HourKey = "");
+    string[]? TermKeys = null, string HourKey = "",
+    string EvidenceCohortKey = "", double CohortScale = 1.0d);
+
+internal sealed record AIrhythmContributorEvidenceReceipt(double Weight, double CohortScale);
 
 internal sealed record AIrhythmLearnedUserModelState(
     int SchemaVersion,
@@ -321,8 +325,14 @@ internal sealed record AIrhythmLearnedUserModelState(
     int ContributorLogicVersion = 0,
     int BasePreferenceLogicVersion = 0,
     Dictionary<string, string>? ContributorFactWorkKeys = null,
-    Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>? BaseEvidenceLedger = null)
+    Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>? BaseEvidenceLedger = null,
+    Dictionary<string, AIrhythmContributorEvidenceReceipt>? ContributorEvidenceLedger = null)
 {
+    // Effective strength is not the number of generated reservations. Reconstructed from
+    // durable per-fact provenance on every model load and intentionally not serialized.
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double EffectiveEvidenceCount { get; init; }
+
     // Host連携 — Runtime-only baseline for same-candidate Developer comparison. Never serialized.
     [System.Text.Json.Serialization.JsonIgnore]
     public Dictionary<string, double>? PreCalibrationContributorWeights { get; init; }
@@ -350,6 +360,8 @@ internal readonly record struct AIrhythmEvidenceVector(
     internal double InternalStrength => IdentityStrength + ContentStrength + ContextStrength + ExplicitBehaviorStrength;
 }
 
+internal readonly record struct AIrhythmEvidenceAssessment(double Relevance, double Confidence);
+
 [Flags]
 internal enum AIrhythmEvidenceProvenance
 {
@@ -366,10 +378,8 @@ internal enum AIrhythmEvidenceProvenance
     PreferredSetting = 1 << 9
 }
 
-// 作品識別 — Shadow-only normalized coordinates for future self-calibration. Strength and confidence are
-// deliberately separate: strength says how strongly the candidate aligns, while confidence says how much
-// behavioral support backs that coordinate. Provenance records which evidence families contributed. None
-// of these values mutate production scoring.
+// 作品識別 — Developer calibration uses the same semantic axes as production evidence assessment.
+// The observation-time calibration remains diagnostic; it never learns from cards being rendered.
 internal readonly record struct AIrhythmNormalizedEvidenceGroups(
     double IdentityStrength,
     double IdentityConfidence,
@@ -458,8 +468,8 @@ internal sealed record AIrhythmRecommendation(
     IReadOnlyList<string> Reasons,
     string SeriesKey,
     AIrhythmEventIdentity? EventIdentity,
-    bool IsConvincing = false,
-    bool IsPlausibleDiscovery = false,
+    double EvidenceRelevance = 0.0d,
+    double EvidenceConfidence = 0.0d,
     int RawScore = 0,
     double DeviationRawScore = 0.0,
     AIrhythmExternalEvidenceSummaryStatus ExternalEvidenceSummary = AIrhythmExternalEvidenceSummaryStatus.NoEvidence,

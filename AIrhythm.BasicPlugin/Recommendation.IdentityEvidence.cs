@@ -13,7 +13,350 @@ internal static partial class AIrhythmRecommendationEngine
         var aliases = BuildLocalWorkAliases(snapshot, numeric);
         var externalCanonicalTitles = AIrhythmDataState.GetExternalPreEvaluationCanonicalTitles();
         var normalizationPromotions = AIrhythmDataState.GetNormalizationPromotions();
-        return new AIrhythmEvidenceIdentityContext(numeric, numericEvidence, aliases, externalCanonicalTitles, normalizationPromotions);
+        var context = new AIrhythmEvidenceIdentityContext(numeric, numericEvidence, aliases, externalCanonicalTitles, normalizationPromotions);
+        context.CorroboratedWorkGenres = BuildCorroboratedWorkGenres(snapshot.Events, context);
+        context.HistoricalWorkGenres = BuildHistoricalWorkGenreEvidence(snapshot.History, context);
+        // Earlier evidence gathering must not retain pre-assessment Genre values.
+        context.ProgramFacts.Clear();
+        context.HistoryFacts.Clear();
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        var corrected = snapshot.History
+            .Select(item => (Item: item, Facts: CanonicalEvidenceFacts(item, context)))
+            .Where(x => x.Facts.GenreKey.Length > 0
+                && !string.Equals(x.Facts.GenreKey, NormalizeGenre(x.Item.Genre), StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var examples = corrected.Take(6).Select(x =>
+            $"{x.Item.ServiceName} {x.Item.ProgramTitle} {x.Item.Start:yyyy-MM-dd HH:mm}"
+            + $" [{NormalizeGenre(x.Item.Genre)}=>{x.Facts.GenreKey}]");
+        var disputed = context.HistoricalWorkGenres
+            .Where(x => x.Value.Ambiguous)
+            .Select(x => x.Key.Work)
+            .Take(6);
+        var genreProvenance = snapshot.History
+            .Select(item => CanonicalEvidenceFacts(item, context).GenreEvidenceSource)
+            .GroupBy(x => x)
+            .OrderBy(x => x.Key)
+            .Select(x => $"{x.Key}:{x.Count()}");
+        AIrhythmDataState.WriteDeveloperLog(
+            $"CANONICAL_GENRE_CORROBORATION supportedProgrammeForms={context.CorroboratedWorkGenres.Count}"
+            + $" correctedRecordings={corrected.Length} samples=[{string.Join(";", examples)}]"
+            + $" historyGenreSeries={context.HistoricalWorkGenres.Count} disputedWorks=[{string.Join(";", disputed)}]"
+            + $" genreEvidence=[{string.Join(";", genreProvenance)}]"
+            + " storageMutation=False fallback=unknown_when_conflicting_unproven");
+#endif
+        return context;
+    }
+
+    // A genre can be revised only by independent evidence of programme form, never by a
+    // majority of EPG genre labels. Repeated broadcasts of the same wrong category are
+    // correlated reports, not independent confirmation. Do not cross film/drama/promo forms.
+    internal readonly record struct BroadcastGenreEvidenceKey(string Work, string Form, AIrhythmServiceIdentity Service);
+    // Evidence is scoped to the particular broadcast form and service. The raw
+    // EPG category is provenance, not independent proof of a genre correction.
+    internal readonly record struct HistoricalWorkGenreKey(string Work, AIrhythmServiceIdentity Service);
+    internal readonly record struct HistoricalWorkGenreAssessment(string Genre, bool Ambiguous);
+    internal enum GenreEvidenceSource
+    {
+        Unknown,
+        BroadcastMetadata,
+        ExplicitTitle,
+        CorroboratedProgramme,
+        CorroboratedHistory,
+        Conflicting
+    }
+    internal readonly record struct CanonicalGenreDecision(string GenreKey, GenreEvidenceSource Source);
+
+    // The broadcast form and explicit genre depend on the immutable on-air title alone.
+    // Evidence or preference state must never be part of this per-snapshot cache.
+    internal readonly record struct BroadcastTitleEvidence(
+        AIrhythmDerivedProgramRelation Relation, string ExplicitGenre, string Form);
+
+    private static BroadcastTitleEvidence TitleEvidence(string? title, AIrhythmEvidenceIdentityContext context)
+    {
+        var key = title ?? string.Empty;
+        if (context.BroadcastTitles.TryGetValue(key, out var existing))
+        {
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            context.BroadcastTitleHits++;
+#endif
+            return existing;
+        }
+        // Keep the existing canonical parser and precedence intact. Only the repeated
+        // result is shared; genre reconciliation still uses the recording/EPG context.
+        var relation = ClassifyDerivedProgramRelation(title);
+        var explicitGenre = relation == AIrhythmDerivedProgramRelation.Promo
+            ? string.Empty : ExplicitProgrammeGenre(title);
+        var form = BroadcastFormFromEvidence(relation, explicitGenre);
+        var evidence = new BroadcastTitleEvidence(relation, explicitGenre, form);
+        context.BroadcastTitles.Add(key, evidence);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        context.BroadcastTitleMisses++;
+#endif
+        return evidence;
+    }
+
+    // All learning routes consume the one genre-proof policy. Broadcast metadata
+    // alone is not reliable enough to rewrite an existing preference receipt.
+    private static bool CanReconcileGenreLearning(GenreEvidenceSource source)
+        => source is GenreEvidenceSource.ExplicitTitle
+            or GenreEvidenceSource.CorroboratedProgramme
+            or GenreEvidenceSource.CorroboratedHistory
+            or GenreEvidenceSource.Conflicting;
+
+    private static string HistoricalGenreFormCached(string? title, string? sourceGenre,
+        AIrhythmEvidenceIdentityContext context)
+        => HistoricalGenreFormFromForm(TitleEvidence(title, context).Form, sourceGenre);
+
+    private static string HistoricalGenreFormFromForm(string form, string? sourceGenre)
+    {
+        if (form == "promotion") return "promotion";
+        if (form == "drama") return "ordinary";
+        if (form == "film" || NormalizeGenre(sourceGenre) == "映画") return "film";
+        if (form != "drama" && NormalizeGenre(sourceGenre) is ("ニュース/報道" or "ドキュメンタリー/教養"))
+            return "factual";
+        return "ordinary"; // Ordinary and explicitly marked drama are the same narrative form.
+    }
+
+    private static string BroadcastForm(string? title)
+    {
+        var relation = ClassifyDerivedProgramRelation(title);
+        var explicitGenre = relation == AIrhythmDerivedProgramRelation.Promo
+            ? string.Empty : ExplicitProgrammeGenre(title);
+        return BroadcastFormFromEvidence(relation, explicitGenre);
+    }
+
+    private static string BroadcastFormFromEvidence(AIrhythmDerivedProgramRelation relation, string explicitGenre)
+        => relation == AIrhythmDerivedProgramRelation.Promo ? "promotion" : explicitGenre switch
+        {
+            "映画" => "film",
+            "ドラマ" => "drama",
+            _ => "ordinary"
+        };
+
+    // A series boundary is learned only from multiple useful user recordings or
+    // reservations. Apply that same verified boundary to current EPG titles whose
+    // editorial episode subtitles or cast credits differ from the stored titles.
+    // EPG repetition alone cannot establish a series, and an explicit film/promo
+    // must never borrow the identity of the underlying broadcast series.
+    private static bool TryResolveEvidenceBackedSeriesWork(
+        string analysisTitle, AIrhythmServiceIdentity service,
+        AIrhythmEvidenceIdentityContext context, out string work)
+    {
+        work = string.Empty;
+        if (!service.IsValid || context.WorkAliases.Count == 0
+            || (!analysisTitle.Contains('～') && !analysisTitle.Contains('〜') && !analysisTitle.Contains('~')))
+            return false;
+        var normalized = analysisTitle.Normalize(NormalizationForm.FormKC);
+        var frame = Regex.Match(normalized,
+            @"^(?<series>.+?)[～~〜][^～~〜]{3,100}(?:[～~〜](?:\s+.*)?|$)");
+        if (!frame.Success) return false;
+        var series = EvidenceSeriesKey(frame.Groups["series"].Value);
+        if (series.Length < 6) return false;
+        // The complete series name must already be corroborated as a Work by
+        // multiple user facts on THIS service. A prefix alone is insufficient.
+        if (!context.WorkAliases.Any(x => x.Key.ServiceIdentity == service
+            && string.Equals(x.Value, series, StringComparison.OrdinalIgnoreCase)))
+            return false;
+        var titleEvidence = TitleEvidence(analysisTitle, context);
+        if (titleEvidence.Relation == AIrhythmDerivedProgramRelation.Promo
+            || string.Equals(titleEvidence.ExplicitGenre, "映画", StringComparison.Ordinal))
+            return false;
+        work = series;
+        return true;
+    }
+
+    // Production labels and format tags are evidence about THIS broadcast, not an
+    // assumed genre of all broadcasts sharing the canonical work name.
+    private static string ExplicitProgrammeGenre(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return string.Empty;
+        var normalized = title.Normalize(NormalizationForm.FormKC).Trim();
+        if (ClassifyDerivedProgramRelation(normalized) == AIrhythmDerivedProgramRelation.Promo)
+            return string.Empty;
+        if (Regex.IsMatch(normalized, @"^(?:\[[^\]]{1,8}\]\s*)*\[映\]", RegexOptions.IgnoreCase))
+            return "映画";
+        var parts = ParseCanonicalTitleParts(normalized, alreadyNormalized: true);
+        if (string.Equals(parts.ContentType, "映画", StringComparison.OrdinalIgnoreCase))
+            return "映画";
+        if (string.Equals(parts.ContentType, "ドラマ", StringComparison.OrdinalIgnoreCase))
+            return "ドラマ";
+        if (Regex.IsMatch(normalized, @"^(?:\[[^\]]{1,8}\]\s*)*(?:(?:【ドラマ】)|(?:連続|テレビ|TV|韓国|中国|海外|時代|夜|朝)ドラマ)(?:\s|[「『【])", RegexOptions.IgnoreCase))
+            return "ドラマ";
+        // Broadcast history may omit the cast credits appended to a current EPG
+        // title. A framed fictional case together with either cast credits or
+        // a serialized investigative-story label is evidence of programme form;
+        // neither a crime-related word nor a cast name alone is sufficient.
+        // Explicit news/documentary labels veto inference from the title frame.
+        if (Regex.IsMatch(normalized, @"[～~〜][^～~〜]{2,60}(?:殺人事件|誘拐事件|失踪事件|怪事件|事件)[～~〜]")
+            && !Regex.IsMatch(normalized, @"(?:ニュース|報道|ドキュメンタリー|ノンフィクション|実録)", RegexOptions.IgnoreCase)
+            && (Regex.IsMatch(normalized, @"出演\s*[:：]\s*\S{2,}")
+                || (Regex.IsMatch(normalized, @"(?:事件ファイル|事件簿|捜査ファイル|推理ファイル)")
+                    && Regex.IsMatch(normalized, @"[～~〜][^～~〜]{2,60}(?:殺人事件|誘拐事件|失踪事件|怪事件)[～~〜]"))))
+            return "ドラマ";
+        return string.Empty;
+    }
+
+    // Programme descriptions can supply a second, content-oriented source of
+    // evidence. The categorical EPG field is deliberately NOT inspected here.
+    private static string DescribedProgrammeGenre(TvAirProgramEventDto item, BroadcastTitleEvidence titleEvidence)
+    {
+        if (titleEvidence.ExplicitGenre.Length > 0)
+            return titleEvidence.ExplicitGenre;
+        if (titleEvidence.Form == "promotion")
+            return string.Empty;
+        var description = $"{item.Summary} {item.Detail} {item.ExtendedItems}";
+        if (Regex.IsMatch(description, @"(?:サスペンス|ミステリー|連続|テレビ|2時間|二時間)\s*ドラマ|ドラマ\s*(?:作品|シリーズ|仕立て)", RegexOptions.IgnoreCase))
+            return "ドラマ";
+        return string.Empty;
+    }
+
+    // Select a Work's historical genre once, before building any recording fact. It is
+    // legitimate to fill an omitted title marker from an independently recorded
+    // sibling on the same service only when the SAME already-confirmed Work boundary
+    // has two distinct aliases. A single programme or EPG repetition cannot invent
+    // a genre. Conflicting uncorroborated raw labels remain unknown, not a vote.
+    private static IReadOnlyDictionary<HistoricalWorkGenreKey, HistoricalWorkGenreAssessment>
+        BuildHistoricalWorkGenreEvidence(IReadOnlyList<TvAirRecordingHistoryDto> history,
+            AIrhythmEvidenceIdentityContext context)
+    {
+        var aliasCounts = context.WorkAliases
+            .GroupBy(x => new HistoricalWorkGenreKey(x.Value, x.Key.ServiceIdentity))
+            .ToDictionary(x => x.Key, x => x.Count());
+        var results = new Dictionary<HistoricalWorkGenreKey, HistoricalWorkGenreAssessment>();
+        var grouped = history
+            .Where(AIrhythmDataState.IsUsefulHistory)
+            .Select(item => new
+            {
+                Item = item,
+                Service = ServiceIdentityOf(item),
+                Work = CanonicalWorkKey(item.ProgramTitle, ServiceIdentityOf(item), context),
+                Form = HistoricalGenreFormCached(item.ProgramTitle, item.Genre, context)
+            })
+            .Where(x => x.Service.IsValid && x.Work.Length > 0 && x.Form == "ordinary")
+            .GroupBy(x => new HistoricalWorkGenreKey(x.Work, x.Service));
+        foreach (var group in grouped)
+        {
+            var entries = group.ToArray();
+            if (entries.Length < 2) continue;
+            var rawGenres = entries.Select(x => NormalizeGenre(x.Item.Genre))
+                .Where(x => x.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            var explicitGenres = entries.Select(x => TitleEvidence(x.Item.ProgramTitle, context).ExplicitGenre)
+                .Where(x => x.Length > 0)
+                .Select(NormalizeGenre)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            var distinctTitleCount = entries.Select(x => CompactIdentity(x.Item.ProgramTitle))
+                .Distinct(StringComparer.OrdinalIgnoreCase).Count();
+            var independentBroadcasts = entries.Select(x => x.Item.Start.UtcDateTime.Ticks)
+                .Distinct().Count();
+            var independentlyEstablished = distinctTitleCount >= 2 && independentBroadcasts >= 2
+                && aliasCounts.TryGetValue(group.Key, out var aliases) && aliases >= 2;
+            if (independentlyEstablished && explicitGenres.Length == 1
+                // A film version requires its own film-form proof. Never infer
+                // that an unmarked same-name broadcast is also the film.
+                && explicitGenres[0] == "ドラマ"
+                && !rawGenres.Any(x => x is "映画" or "ニュース/報道" or "ドキュメンタリー/教養")
+                && entries.All(x => TitleEvidence(x.Item.ProgramTitle, context).Relation
+                    != AIrhythmDerivedProgramRelation.Promo))
+            {
+                results[group.Key] = new HistoricalWorkGenreAssessment(explicitGenres[0], false);
+            }
+            else if (rawGenres.Length > 1 || explicitGenres.Length > 1)
+            {
+                // This is deliberately an unknown genre for the shared historical
+                // Work. It must never become a learned preference for "その他".
+                results[group.Key] = new HistoricalWorkGenreAssessment(string.Empty, true);
+            }
+        }
+        return results;
+    }
+
+    private static IReadOnlyDictionary<BroadcastGenreEvidenceKey, string> BuildCorroboratedWorkGenres(
+        IReadOnlyList<TvAirProgramEventDto> events,
+        AIrhythmEvidenceIdentityContext context)
+    {
+        var candidates = new Dictionary<BroadcastGenreEvidenceKey, Dictionary<string, HashSet<string>>>();
+        foreach (var item in events)
+        {
+            var titleEvidence = TitleEvidence(item.Title, context);
+            var genre = DescribedProgrammeGenre(item, titleEvidence);
+            if (genre.Length == 0) continue;
+            var work = CanonicalWorkKey(item, context);
+            if (work.Length == 0) continue;
+            var service = ServiceIdentityOf(item);
+            if (!service.IsValid) continue;
+            var key = new BroadcastGenreEvidenceKey(work, titleEvidence.Form, service);
+            if (!candidates.TryGetValue(key, out var byGenre))
+                candidates[key] = byGenre = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            if (!byGenre.TryGetValue(genre, out var airings))
+                byGenre[genre] = airings = new HashSet<string>(StringComparer.Ordinal);
+            // An EPG title change alone must not turn a repeated generic synopsis
+            // into multiple independent supporting descriptions. Explicit form
+            // labels are individually verifiable on the actual broadcast title.
+            var explicitForm = titleEvidence.ExplicitGenre.Length > 0;
+            var evidenceText = explicitForm ? item.Title : $"{item.Summary} {item.Detail} {item.ExtendedItems}";
+            var editorialKey = CompactIdentity(evidenceText);
+            if (editorialKey.Length > 0)
+                airings.Add($"{(explicitForm ? "title" : "description")}:{editorialKey}");
+        }
+        var resolved = new Dictionary<BroadcastGenreEvidenceKey, string>();
+        foreach (var (key, byGenre) in candidates)
+        {
+            var counts = byGenre.Select(x => (Genre: x.Key, Count: x.Value.Count))
+                .OrderByDescending(x => x.Count).ThenBy(x => x.Genre, StringComparer.OrdinalIgnoreCase).ToArray();
+            if (counts.Length == 0 || counts[0].Count < 2) continue;
+            var total = counts.Sum(x => x.Count);
+            if (counts[0].Count * 5 < total * 4) continue;
+            if (counts.Length > 1 && counts[0].Count == counts[1].Count) continue;
+            resolved[key] = counts[0].Genre;
+        }
+        return resolved;
+    }
+
+    private static CanonicalGenreDecision CanonicalBroadcastGenre(string? title, string? rawGenre,
+        string canonicalWorkKey, AIrhythmServiceIdentity service, AIrhythmEvidenceIdentityContext context,
+        bool isRecording)
+    {
+        var sourceGenre = NormalizeGenre(rawGenre);
+        var sourceDecision = new CanonicalGenreDecision(sourceGenre,
+            sourceGenre.Length > 0 ? GenreEvidenceSource.BroadcastMetadata : GenreEvidenceSource.Unknown);
+        var titleEvidence = TitleEvidence(title, context);
+        var form = titleEvidence.Form;
+        if (form == "promotion")
+            return new CanonicalGenreDecision(string.Empty, GenreEvidenceSource.Unknown);
+        var explicitGenre = titleEvidence.ExplicitGenre;
+        if (explicitGenre.Length > 0)
+            return new CanonicalGenreDecision(NormalizeGenre(explicitGenre), GenreEvidenceSource.ExplicitTitle);
+        // A recorded film/factual broadcast cannot inherit an unrelated drama.
+        // This applies before looking at other broadcasts of a shared Work.
+        if (sourceGenre is "映画" or "ニュース/報道" or "ドキュメンタリー/教養")
+            return sourceDecision;
+        var historicalKey = new HistoricalWorkGenreKey(canonicalWorkKey, service);
+        if (isRecording && canonicalWorkKey.Length > 0 && service.IsValid
+            && context.HistoricalWorkGenres.TryGetValue(historicalKey, out var disputedWork)
+            && disputedWork.Ambiguous)
+            return new CanonicalGenreDecision(string.Empty, GenreEvidenceSource.Conflicting);
+        if (canonicalWorkKey.Length > 0 && service.IsValid
+            && context.CorroboratedWorkGenres.TryGetValue(
+                new BroadcastGenreEvidenceKey(canonicalWorkKey, form, service), out var supportedGenre))
+            return new CanonicalGenreDecision(supportedGenre, GenreEvidenceSource.CorroboratedProgramme);
+        if (form == "ordinary" && canonicalWorkKey.Length > 0 && service.IsValid
+            && context.HistoricalWorkGenres.TryGetValue(historicalKey, out var historical)
+            && historical.Genre.Length > 0)
+            return new CanonicalGenreDecision(historical.Genre, GenreEvidenceSource.CorroboratedHistory);
+        // An ordinary title can borrow a proved drama classification only
+        // after separate user facts established the exact same-service series.
+        if (form == "ordinary" && canonicalWorkKey.Length > 0 && service.IsValid
+            && !Regex.IsMatch(title ?? string.Empty,
+                @"(?:ニュース|報道|ドキュメンタリー|ノンフィクション|実録)", RegexOptions.IgnoreCase)
+            && context.WorkAliases.Any(x => x.Key.ServiceIdentity == service
+                && string.Equals(x.Value, canonicalWorkKey, StringComparison.OrdinalIgnoreCase))
+            && context.CorroboratedWorkGenres.TryGetValue(
+                new BroadcastGenreEvidenceKey(canonicalWorkKey, "drama", service), out var corroboratedDrama)
+            && !context.CorroboratedWorkGenres.ContainsKey(
+                new BroadcastGenreEvidenceKey(canonicalWorkKey, "film", service)))
+            return new CanonicalGenreDecision(corroboratedDrama, GenreEvidenceSource.CorroboratedProgramme);
+        return sourceDecision;
     }
 
     private static IReadOnlyDictionary<string, int[]> MergeNumericWorkSequenceEvidence(
@@ -49,7 +392,7 @@ internal static partial class AIrhythmRecommendationEngine
             return raw;
         // 外部情報 — External catalog aliases cannot turn a promotional broadcast into the advertised programme: its
         // derived identity is a local structural fact.
-        if (ClassifyDerivedProgramRelation(raw) == AIrhythmDerivedProgramRelation.Promo)
+        if (TitleEvidence(raw, context).Relation == AIrhythmDerivedProgramRelation.Promo)
             return raw;
         // 外部情報 — A composite title containing an on-air show and a different show's announcement is not an
         // unambiguous external catalogue alias.
@@ -179,13 +522,54 @@ internal static partial class AIrhythmRecommendationEngine
         // 作品識別 — Promotion broadcasts never borrow the underlying programme's evidence, regardless of saved
         // aliases or learner proposals. Both have different canonical Work identities even when their quoted
         // advertised title matches.
-        if (ClassifyDerivedProgramRelation(analysisTitle) == AIrhythmDerivedProgramRelation.Promo)
+        if (TitleEvidence(analysisTitle, context).Relation == AIrhythmDerivedProgramRelation.Promo)
+        {
+            context.CanonicalWorkResolutions[resolutionKey] = localWorkKey;
+            return localWorkKey;
+        }
+
+        // 作品識別 — The explicit tournament day/part belongs to Event/Part rather than Work. Earlier
+        // persisted aliases or learner proposals can still contain the discarded suffix; neither may
+        // re-expand a structurally settled Work. Resolve this at the shared Work authority, not in rankings.
+        if (MayContainTournamentScheduleSuffix(analysisTitle))
+        {
+            var scheduleParts = ParseCanonicalTitleParts(analysisTitle);
+            if (HasParsedTournamentBroadcastSchedule(scheduleParts)
+                && string.Equals(CompactIdentity(scheduleParts.Work), localWorkKey, StringComparison.OrdinalIgnoreCase))
+            {
+                context.CanonicalWorkResolutions[resolutionKey] = localWorkKey;
+                return localWorkKey;
+            }
+        }
+
+        // 作品識別 — The shared Work authority rejects shortened aliases and learned
+        // promotions for a complete film or numbered standalone edition. Do this before
+        // consulting either source, rather than rewriting a damaged identity in a dashboard.
+        if (MustPreserveCompleteWorkIdentity(
+                analysisTitle, TitleEvidence(analysisTitle, context).Form == "film"))
         {
             context.CanonicalWorkResolutions[resolutionKey] = localWorkKey;
             return localWorkKey;
         }
 
         var canonical = CanonicalizeLocalWorkKey(localWorkKey, service, context.WorkAliases);
+        var evidencedSeriesBoundary = false;
+        if (string.Equals(canonical, localWorkKey, StringComparison.OrdinalIgnoreCase)
+            && TryResolveEvidenceBackedSeriesWork(analysisTitle, service, context, out var seriesWork))
+        {
+            canonical = seriesWork;
+            evidencedSeriesBoundary = true;
+        }
+        // 作品識別 — Aliases learned before a structural parser correction may shorten a full Work
+        // again. Resolve known on-air boundaries before projecting aliases to any consumer.
+        // Ordinary ambiguous work titles retain their evidence-backed aliases unchanged.
+        if (canonical.Length < localWorkKey.Length && !evidencedSeriesBoundary)
+        {
+            var settledParts = ParseCanonicalTitleParts(analysisTitle);
+            if (string.Equals(CompactIdentity(settledParts.Work), localWorkKey, StringComparison.OrdinalIgnoreCase)
+                && HasSettledAiringWorkBoundary(analysisTitle, settledParts))
+                canonical = localWorkKey;
+        }
         // 作品識別 — Both evidence-backed aliases and learner promotions must respect the identical complete-Work
         // boundary. A learner must not reinstate a shorter prefix that a locally parsed, structurally
         // inseparable work rejected. Parse only when a shortening candidate actually exists.
@@ -210,12 +594,13 @@ internal static partial class AIrhythmRecommendationEngine
                 && string.IsNullOrWhiteSpace(parsed.Stage)
                 && string.IsNullOrWhiteSpace(parsed.BroadcastAttribute);
         }
-        if (WouldDiscardCompleteWork(canonical))
-            canonical = localWorkKey;
-        // 作品識別 — A verified same-service episode/work alias is stronger than a learned population-level prefix.
-        // Never undo that evidence in the promotion path.
+        // Two distinct selected recordings with a shared strong title boundary establish a
+        // recurring programme. Do not veto that evidence with the fallback complete-work rule.
+        // Uncorroborated learner-only shortening is still rejected by the same conservative gate.
         var localEvidenceAliasConfirmed = !string.Equals(canonical, localWorkKey, StringComparison.OrdinalIgnoreCase)
             && context.WorkAliases.ContainsKey(new AIrhythmLocalWorkAliasKey(localWorkKey, service));
+        if (!localEvidenceAliasConfirmed && !evidencedSeriesBoundary && WouldDiscardCompleteWork(canonical))
+            canonical = localWorkKey;
 
         var promotionKey = context.NormalizationPromotions.Count == 0
             ? string.Empty
@@ -227,11 +612,20 @@ internal static partial class AIrhythmRecommendationEngine
             // 作品識別 — A same-service parenthesized episode sequence takes precedence. Otherwise a structurally
             // complete Work must not be reduced merely because the learned prefix has survived across observation
             // days.
+            var promotionDiscardsSettledWork = false;
+            if (promoted.Length < localWorkKey.Length)
+            {
+                var settledParts = ParseCanonicalTitleParts(analysisTitle);
+                promotionDiscardsSettledWork = string.Equals(
+                        CompactIdentity(settledParts.Work), localWorkKey, StringComparison.OrdinalIgnoreCase)
+                    && HasSettledAiringWorkBoundary(analysisTitle, settledParts);
+            }
             if (!(canonical.Length > 0
                 && !string.Equals(canonical, promoted, StringComparison.OrdinalIgnoreCase)
-                && (localEvidenceAliasConfirmed || IsCorroboratedParenthesizedWorkSequence(
+                && (localEvidenceAliasConfirmed || evidencedSeriesBoundary || IsCorroboratedParenthesizedWorkSequence(
                     analysisTitle, service, context.NumericLocalValuesByService)))
-                && !WouldDiscardCompleteWork(promoted))
+                && !WouldDiscardCompleteWork(promoted)
+                && !promotionDiscardsSettledWork)
                 canonical = promoted;
         }
         context.CanonicalWorkResolutions[resolutionKey] = canonical;
@@ -255,7 +649,8 @@ internal static partial class AIrhythmRecommendationEngine
         string TimeBand,
         IReadOnlyList<string> Terms,
         bool IsReplay,
-        bool UsesExternalCanonicalTitle);
+        bool UsesExternalCanonicalTitle,
+        GenreEvidenceSource GenreEvidenceSource);
 
     internal sealed record AIrhythmCanonicalRecordingWorkAggregate(
         string GenreKey,
@@ -290,7 +685,8 @@ internal static partial class AIrhythmRecommendationEngine
         string? genre,
         AIrhythmServiceIdentity service,
         DateTimeOffset start,
-        AIrhythmEvidenceIdentityContext context)
+        AIrhythmEvidenceIdentityContext context,
+        bool isRecording = false)
     {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var canonicalDetailStart = GC.GetAllocatedBytesForCurrentThread();
@@ -326,7 +722,7 @@ internal static partial class AIrhythmRecommendationEngine
         var canonicalAfterAliasResolution = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalAliasResolutionBytes += canonicalAfterAliasResolution - canonicalAfterLocalWorkKey;
 #endif
-        var genreKey = NormalizeGenre(genre);
+        var genreDecision = CanonicalBroadcastGenre(title, genre, canonicalWorkKey, service, context, isRecording);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var canonicalAfterGenre = GC.GetAllocatedBytesForCurrentThread();
         context.CanonicalGenreBytes += canonicalAfterGenre - canonicalAfterAliasResolution;
@@ -343,13 +739,14 @@ internal static partial class AIrhythmRecommendationEngine
 #endif
         return new AIrhythmCanonicalEvidenceFacts(
             canonicalWorkKey,
-            genreKey,
+            genreDecision.GenreKey,
             service,
             start.Hour,
             CanonicalTimeBand(start.Hour),
             terms,
             isReplay,
-            usesExternalCanonicalTitle);
+            usesExternalCanonicalTitle,
+            genreDecision.Source);
     }
 
     private static AIrhythmCanonicalEvidenceFacts CanonicalEvidenceFacts(TvAirProgramEventDto item, AIrhythmEvidenceIdentityContext context)
@@ -396,7 +793,8 @@ internal static partial class AIrhythmRecommendationEngine
             return cached;
         }
         var start = item.ActualStart ?? item.Start;
-        var facts = CanonicalEvidenceFacts(item.ProgramTitle, item.Genre, ServiceIdentityOf(item), start, context);
+        var facts = CanonicalEvidenceFacts(item.ProgramTitle, item.Genre, ServiceIdentityOf(item), start, context,
+            isRecording: true);
         context.HistoryFacts[item] = facts;
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         context.CanonicalFactsMisses++;
@@ -475,7 +873,12 @@ internal static partial class AIrhythmRecommendationEngine
             if (compactIndex != canonicalWorkKey.Length)
                 continue;
 
-            var candidate = displayTitle[..(i + 1)]
+            var boundary = i + 1;
+            if (boundary + 1 < displayTitle.Length
+                && (displayTitle[boundary] is '!' or '！' or '?' or '？')
+                && char.IsWhiteSpace(displayTitle[boundary + 1]))
+                boundary++;
+            var candidate = displayTitle[..boundary]
                 .Trim()
                 .TrimEnd('～', '~', '・', '：', ':', '-', '－');
             if (candidate.Length == 0
@@ -489,53 +892,94 @@ internal static partial class AIrhythmRecommendationEngine
         return false;
     }
 
+    // A single recording-fact projection supplies both overall and genre rankings. Per-airing
+    // EPG genres may differ for the same programme, but a Work must have one category within
+    // the dashboard. Preserve the raw genre in every fact for factual provenance.
+    private sealed record CanonicalRecordingDashboardRow(
+        string WorkKey, string DisplayTitle, string GenreKey, AIrhythmServiceIdentity ServiceIdentity,
+        string BroadcastForm);
+
+    private sealed class CanonicalDashboardWorkGroupComparer : IEqualityComparer<(string WorkKey, string BroadcastForm)>
+    {
+        public bool Equals((string WorkKey, string BroadcastForm) left, (string WorkKey, string BroadcastForm) right)
+            => StringComparer.OrdinalIgnoreCase.Equals(left.WorkKey, right.WorkKey)
+                && StringComparer.Ordinal.Equals(left.BroadcastForm, right.BroadcastForm);
+
+        public int GetHashCode((string WorkKey, string BroadcastForm) key)
+            => HashCode.Combine(StringComparer.OrdinalIgnoreCase.GetHashCode(key.WorkKey),
+                StringComparer.Ordinal.GetHashCode(key.BroadcastForm));
+    }
+    private static readonly CanonicalDashboardWorkGroupComparer DashboardWorkGroupComparer = new();
+
+    private static CanonicalRecordingDashboardRow[] BuildCanonicalRecordingDashboardRows(
+        AIrhythmRuntimeSnapshot snapshot,
+        AIrhythmEvidenceIdentityContext context)
+        => snapshot.History
+            .Select(item =>
+            {
+                var facts = CanonicalEvidenceFacts(item, context);
+                return new CanonicalRecordingDashboardRow(
+                    facts.WorkKey, CanonicalWorkDisplayTitle(item, context), facts.GenreKey, facts.ServiceIdentity,
+                    HistoricalGenreFormCached(item.ProgramTitle, item.Genre, context));
+            })
+            .Where(x => x.WorkKey.Length > 0 && x.DisplayTitle.Length > 0)
+            .ToArray();
+
+    private static string CanonicalRecordingDashboardLabel(
+        IEnumerable<CanonicalRecordingDashboardRow> workRows)
+    {
+        var rows = workRows.ToArray();
+        var label = rows.GroupBy(x => x.DisplayTitle, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key.Length)
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .First().Key;
+        // Work title and broadcast form are independent canonical facts. The
+        // aggregate key already preserves form; do not inject a genre into the title.
+        return label;
+    }
+
     internal static IReadOnlyList<AIrhythmCanonicalRecordingGenreAggregate> BuildCanonicalRecordingAggregates(
         AIrhythmRuntimeSnapshot snapshot,
         AIrhythmEvidenceIdentityContext context)
     {
-        var rows = snapshot.History
-            .Select(item =>
+        // Film, promotion and factual broadcasts are separate from narrative
+        // airings even if a shared normalized Work name was emitted upstream.
+        // Each per-airing genre comes from CanonicalEvidenceFacts, never votes.
+        var works = BuildCanonicalRecordingDashboardRows(snapshot, context)
+            .GroupBy(x => (x.WorkKey, x.BroadcastForm), DashboardWorkGroupComparer)
+            .Select(workGroup =>
             {
-                var facts = CanonicalEvidenceFacts(item, context);
-                return new
-                {
-                    Facts = facts,
-                    DisplayTitle = CanonicalWorkDisplayTitle(item, context)
-                };
+                // Dashboard is a read-only projection of the SAME per-recording
+                // canonical genre used by learning, search and recommendations.
+                // Never perform a second majority vote or privilege lexical order.
+                var distinctGenres = workGroup.Select(x => x.GenreKey)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                // Display unresolved data as 未分類 rather than misrepresenting
+                // it as the genuine EPG genre その他. No preference is learned.
+                var genreKey = distinctGenres.Length == 1 && distinctGenres[0].Length > 0
+                    ? distinctGenres[0] : "未分類";
+                var serviceCounts = workGroup
+                    .Where(x => x.ServiceIdentity.IsValid)
+                    .GroupBy(x => x.ServiceIdentity)
+                    .ToDictionary(x => x.Key, x => x.Count());
+                return new AIrhythmCanonicalRecordingWorkAggregate(
+                    genreKey, workGroup.Key.WorkKey, CanonicalRecordingDashboardLabel(workGroup),
+                    workGroup.Count(), serviceCounts.Count, serviceCounts);
             })
-            .Where(x => x.Facts.WorkKey.Length > 0 && x.Facts.GenreKey.Length > 0 && x.DisplayTitle.Length > 0)
+            .Where(x => x.GenreKey.Length > 0)
             .ToArray();
 
-        return rows
-            .GroupBy(x => x.Facts.GenreKey, StringComparer.OrdinalIgnoreCase)
+        return works
+            .GroupBy(x => x.GenreKey, StringComparer.OrdinalIgnoreCase)
             .Select(genreGroup =>
             {
-                var works = genreGroup
-                    .GroupBy(x => x.Facts.WorkKey, StringComparer.OrdinalIgnoreCase)
-                    .Select(workGroup =>
-                    {
-                        var label = workGroup
-                            .GroupBy(x => x.DisplayTitle, StringComparer.OrdinalIgnoreCase)
-                            .OrderByDescending(x => x.Count())
-                            .ThenBy(x => x.Key.Length)
-                            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
-                            .First().Key;
-                        var serviceCounts = workGroup
-                            .Where(x => x.Facts.ServiceIdentity.IsValid)
-                            .GroupBy(x => x.Facts.ServiceIdentity)
-                            .ToDictionary(x => x.Key, x => x.Count());
-                        return new AIrhythmCanonicalRecordingWorkAggregate(
-                            genreGroup.Key,
-                            workGroup.Key,
-                            label,
-                            workGroup.Count(),
-                            serviceCounts.Count,
-                            serviceCounts);
-                    })
+                var groupedWorks = genreGroup
                     .OrderByDescending(x => x.RecordingCount)
                     .ThenBy(x => x.DisplayTitle, StringComparer.OrdinalIgnoreCase)
                     .ToArray();
-                return new AIrhythmCanonicalRecordingGenreAggregate(genreGroup.Key, genreGroup.Count(), works);
+                return new AIrhythmCanonicalRecordingGenreAggregate(
+                    genreGroup.Key, groupedWorks.Sum(x => x.RecordingCount), groupedWorks);
             })
             .OrderByDescending(x => x.RecordingCount)
             .ThenBy(x => x.GenreKey, StringComparer.OrdinalIgnoreCase)
@@ -545,35 +989,13 @@ internal static partial class AIrhythmRecommendationEngine
     internal static IReadOnlyList<AIrhythmCanonicalRecordingTotalAggregate> BuildCanonicalRecordingWorkTotals(
         AIrhythmRuntimeSnapshot snapshot,
         AIrhythmEvidenceIdentityContext context)
-    {
-        // 録画実績・復旧 — Dashboard total ranking is deliberately factual: one successful history row is one
-        // recording. Station, genre and episode presentation differences never create extra ranking identities;
-        // all rows are first projected through the common canonical Work/title evidence.
-        var rows = snapshot.History
-            .Select(item => new
-            {
-                WorkKey = CanonicalWorkKey(item, context),
-                DisplayTitle = CanonicalWorkDisplayTitle(item, context)
-            })
-            .Where(x => x.WorkKey.Length > 0 && x.DisplayTitle.Length > 0)
-            .ToArray();
-
-        return rows
-            .GroupBy(x => x.WorkKey, StringComparer.OrdinalIgnoreCase)
-            .Select(workGroup =>
-            {
-                var label = workGroup
-                    .GroupBy(x => x.DisplayTitle, StringComparer.OrdinalIgnoreCase)
-                    .OrderByDescending(x => x.Count())
-                    .ThenBy(x => x.Key.Length)
-                    .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
-                    .First().Key;
-                return new AIrhythmCanonicalRecordingTotalAggregate(workGroup.Key, label, workGroup.Count());
-            })
+        => BuildCanonicalRecordingDashboardRows(snapshot, context)
+            .GroupBy(x => (x.WorkKey, x.BroadcastForm), DashboardWorkGroupComparer)
+            .Select(workGroup => new AIrhythmCanonicalRecordingTotalAggregate(
+                workGroup.Key.WorkKey, CanonicalRecordingDashboardLabel(workGroup), workGroup.Count()))
             .OrderByDescending(x => x.RecordingCount)
             .ThenBy(x => x.DisplayTitle, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-    }
 
     private static string BuildEvidenceIdentityFingerprint(AIrhythmEvidenceIdentityContext context)
     {
@@ -587,7 +1009,16 @@ internal static partial class AIrhythmRecommendationEngine
         var externalTitles = string.Join(";", context.ExternalCanonicalTitles
             .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
             .Select(x => $"{x.Key}->{x.Value}"));
-        return $"{numeric}#{aliases}#{externalTitles}";
+        var corroboratedGenres = string.Join(";", context.CorroboratedWorkGenres
+            .OrderBy(x => x.Key.Work, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Key.Form, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Key.Service.ToString(), StringComparer.OrdinalIgnoreCase)
+            .Select(x => $"{x.Key.Work}|{x.Key.Form}|{x.Key.Service}->{x.Value}"));
+        var historicalGenres = string.Join(";", context.HistoricalWorkGenres
+            .OrderBy(x => x.Key.Work, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Key.Service.ToString(), StringComparer.OrdinalIgnoreCase)
+            .Select(x => $"{x.Key.Work}|{x.Key.Service}->{x.Value.Genre}|{x.Value.Ambiguous}"));
+        return $"{numeric}#{aliases}#{externalTitles}#{corroboratedGenres}#{historicalGenres}";
     }
 
     internal readonly record struct AIrhythmLocalEpisodeIdentity(
@@ -649,10 +1080,10 @@ internal static partial class AIrhythmRecommendationEngine
     private static bool HasExplicitEpisodeMarkerSignal(string title)
     {
         // 作品識別 — Retain this prefilter exactly aligned with AnalyzeExplicitEpisode's accepted syntax. A generic
-        // 'e'/'E' is not sufficient: the canonical regex only accepts episode/ep, while '#'/＃ and 話 cover the
+        // 'e'/'E' is not sufficient: the canonical regex only accepts episode/ep, while '#'/＃/♯ and 話 cover the
         // other deterministic episode forms. Avoiding false positives here prevents ordinary Latin-script titles
         // from paying FormKC + regex costs.
-        if (title.IndexOf('#') >= 0 || title.IndexOf('＃') >= 0 || title.IndexOf('話') >= 0)
+        if (title.IndexOf('#') >= 0 || title.IndexOf('＃') >= 0 || title.IndexOf('♯') >= 0 || title.IndexOf('話') >= 0)
             return true;
 
         for (var i = 0; i + 1 < title.Length; i++)
@@ -716,7 +1147,7 @@ internal static partial class AIrhythmRecommendationEngine
             || normalized.IndexOf('—') >= 0;
         if (mayHaveRange && Regex.IsMatch(
                 normalized,
-                @"(?:[#＃]\s*[0-9]+|(?:episode|ep\.?)\s*[0-9]+|第\s*[0-9]+\s*話|[0-9]+\s*話)\s*[-~〜～–—]\s*(?:(?:[#＃]|(?:episode|ep\.?)|第)\s*)?[0-9]+\s*(?:話)?",
+                @"(?:[#＃♯]\s*[0-9]+|(?:episode|ep\.?)\s*[0-9]+|第\s*[0-9]+\s*話|[0-9]+\s*話)\s*[-~〜～–—]\s*(?:(?:[#＃♯]|(?:episode|ep\.?)|第)\s*)?[0-9]+\s*(?:話)?",
                 RegexOptions.IgnoreCase))
         {
             return new AIrhythmExplicitEpisodeAnalysis(false, 0, hasTrailingParenthesizedNumber, parenthesizedStem, parenthesizedValue);
@@ -726,7 +1157,7 @@ internal static partial class AIrhythmRecommendationEngine
         // event/edition ordinals. Deterministic episode identity is limited here to 第N話 / #N / EP N / N話.
         var match = Regex.Match(
             normalized,
-            @"(?:第\s*([0-9]+)\s*話|[#＃]\s*([0-9]+)|(?:episode|ep\.?)\s*([0-9]+)|([0-9]+)\s*話)",
+            @"(?:第\s*([0-9]+)\s*話|[#＃♯]\s*([0-9]+)|(?:episode|ep\.?)\s*([0-9]+)|([0-9]+)\s*話)",
             RegexOptions.IgnoreCase);
         if (!match.Success)
             return new AIrhythmExplicitEpisodeAnalysis(false, 0, hasTrailingParenthesizedNumber, parenthesizedStem, parenthesizedValue);
@@ -745,6 +1176,84 @@ internal static partial class AIrhythmRecommendationEngine
         return new AIrhythmExplicitEpisodeAnalysis(false, 0, hasTrailingParenthesizedNumber, parenthesizedStem, parenthesizedValue);
     }
 
+
+    // 録画実績・復旧 — A replacement must identify the *same broadcast content*, not just a related Work.
+    // Series episodes use the existing single-episode evidence parser and its snapshot-scoped Work aliases.
+    // Only explicitly identified films can use an unnumbered full-title match: daily programmes and specials
+    // without an episode number cannot prove an identical re-airing from a shared title alone.
+    // 録画実績・復旧 — An episode number identifies one broadcast only within its season/edition.
+    // The canonical Work key is for learning continuity and intentionally omits such variants.
+    // Keep the proven season as a separate recovery-only identity axis; zero means unknown,
+    // not first season. A known season must never match an unspecified one.
+    internal readonly record struct AIrhythmRecoveryBroadcastIdentity(
+        string Work, string Form, int EpisodeNumber, string CompleteFilmTitle, int SeasonNumber);
+
+    private static bool TryRecoverySeasonNumber(string title, out int seasonNumber)
+    {
+        seasonNumber = 0;
+        // Accept only explicit ordinal season wording; plain year/episode/Part numbers never
+        // establish a season. Inspect the entire on-air title, including text after #N,
+        // because broadcasters often put "第2期" in their episode description.
+        var normalized = StripNonIdentityBroadcastAnnotations(title.Normalize(NormalizationForm.FormKC));
+        var matches = Regex.Matches(normalized,
+            @"(?<![A-Za-z0-9])(?:第\s*(?<ordinal>[1-9][0-9]?)\s*(?:期|シーズン|シリーズ)|(?<ordinal>[1-9][0-9]?)\s*(?:期|シーズン)|(?:シーズン|season)\s*[:：-]?\s*(?<ordinal>[1-9][0-9]?)(?![A-Za-z0-9]))",
+            RegexOptions.IgnoreCase);
+        foreach (Match match in matches)
+        {
+            var numberText = match.Groups["ordinal"].Value;
+            if (!int.TryParse(numberText, NumberStyles.None, CultureInfo.InvariantCulture, out var number)
+                || number == 0)
+                return false;
+            // Contradictory explicit season markers make a broadcast uncertain, not season 0.
+            if (seasonNumber != 0 && seasonNumber != number) return false;
+            seasonNumber = number;
+        }
+        return true;
+    }
+
+    internal static bool TryCanonicalRecoveryBroadcastIdentity(
+        string? title, string? rawGenre, AIrhythmServiceIdentity service,
+        AIrhythmEvidenceIdentityContext context, out AIrhythmRecoveryBroadcastIdentity identity)
+    {
+        identity = default;
+        if (string.IsNullOrWhiteSpace(title)) return false;
+        var form = TitleEvidence(title, context).Form;
+        if (form == "promotion") return false;
+
+        var isFilm = form == "film" || NormalizeGenre(rawGenre) == "映画";
+        if (isFilm)
+        {
+            // A numbered film or a combined-episode film listing is not a proven standalone replacement.
+            if (AIrhythmDataState.HasContractedRecoveryEpisodeGroup(title)
+                || AIrhythmDataState.HasRecoveryEpisodeSyntax(title)
+                || AIrhythmDataState.TryRecoveryEpisodeKey(title, out _)
+                || AIrhythmDataState.TryRecoveryMultiEpisodeRange(title, out _, out _, out _))
+                return false;
+            var normalized = StripNonIdentityBroadcastAnnotations(title.Normalize(NormalizationForm.FormKC)).Trim();
+            // Remove the classification *label*, never the film's title, sequel number or edition.
+            normalized = Regex.Replace(normalized, @"^映画(?=\s|[:：]|[「『])\s*[:：]?\s*", string.Empty);
+            var completeTitle = CompactIdentity(normalized);
+            if (completeTitle.Length < 5) return false;
+            identity = new AIrhythmRecoveryBroadcastIdentity(string.Empty, "film", 0, completeTitle, 0);
+            return true;
+        }
+
+        // The recovery journal owns this conservative marker gate. Multi-episode ranges, extra markers,
+        // unnumbered titles and year/edition numbers must not turn into an assumed #N replacement.
+        if (!AIrhythmDataState.TryRecoveryEpisodeKey(title, out var episodeKey)
+            || !TryBuildLocalEpisodeIdentityForContinuityCached(title, service, context, out var episodeIdentity))
+            return false;
+        var hash = episodeKey.LastIndexOf('#');
+        if (hash < 0 || !int.TryParse(episodeKey.AsSpan(hash + 1), NumberStyles.None,
+                CultureInfo.InvariantCulture, out var number)
+            || number != episodeIdentity.EpisodeNumber || episodeIdentity.WorkKey.Length < 4)
+            return false;
+        if (!TryRecoverySeasonNumber(title, out var seasonNumber))
+            return false;
+        identity = new AIrhythmRecoveryBroadcastIdentity(episodeIdentity.WorkKey, "series", number,
+            string.Empty, seasonNumber);
+        return true;
+    }
 
     private static bool TryGetAliasCorroboratedRepeatedEpisodeNumber(
         string? title,
@@ -833,7 +1342,7 @@ internal static partial class AIrhythmRecommendationEngine
         var normalized = StripNonIdentityBroadcastAnnotations(value.Normalize(NormalizationForm.FormKC));
         var marker = Regex.Match(
             normalized,
-            @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)",
+            @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃♯]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)",
             RegexOptions.IgnoreCase);
         if (!marker.Success) return false;
 
@@ -873,7 +1382,8 @@ internal static partial class AIrhythmRecommendationEngine
         // explicit episode marker, or when the caller has already corroborated a parenthesized Work sequence on
         // this exact service.
         var canSeparate = allowLeadingContainerSeparation
-            || HasWorkBeforeExplicitEpisodeMarker(containerParts.Remainder);
+            || HasWorkBeforeExplicitEpisodeMarker(containerParts.Remainder)
+            || IsExplicitLeadingBroadcastSlot(containerParts.Container, containerParts.Remainder);
         if (!canSeparate)
             return EvidenceSeriesKey(title);
 
@@ -1039,7 +1549,7 @@ internal static partial class AIrhythmRecommendationEngine
             && (source.IndexOf('(') >= 0 || source.IndexOf('（') >= 0
                 || (source.IndexOf('第') >= 0 && source.IndexOf('夜') >= 0));
         var mayNeedEpisodeAnalysis = hasQuotedStructuralEpisodeCandidate || source.IndexOf('#') >= 0
-            || source.IndexOf('＃') >= 0
+            || source.IndexOf('＃') >= 0 || source.IndexOf('♯') >= 0
             || source.IndexOf('話') >= 0
             || source.IndexOf('回') >= 0
             || source.IndexOf('(') >= 0
@@ -1111,7 +1621,10 @@ internal static partial class AIrhythmRecommendationEngine
         if (string.IsNullOrWhiteSpace(title))
             return false;
 
-        var normalized = StripNonIdentityBroadcastAnnotations(title.Normalize(NormalizationForm.FormKC)).Trim();
+        // Use the same aired Work boundary before learning a series alias.  A
+        // separately advertised work is not evidence of a shared series prefix.
+        var normalized = StripNonIdentityBroadcastAnnotations(
+            AiredTitleEvidenceText(title).Normalize(NormalizationForm.FormKC)).Trim();
         if (normalized.Length == 0)
             return false;
 
@@ -1122,26 +1635,41 @@ internal static partial class AIrhythmRecommendationEngine
         // title-shortening path for those rows.
         if (Regex.IsMatch(
                 normalized,
-                @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)",
+                @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃♯]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)",
                 RegexOptions.IgnoreCase))
             return false;
 
+        // A programme headline boundary must be outside a quoted Work. Otherwise
+        // punctuation or spaces in an official film/edition title become a false
+        // recurring-series prefix and erase sequel/part identity.
         var boundary = -1;
-        foreach (var marker in new[] { '！', '!', '？', '?', '▼', '▽' })
+        var quoteDepth = 0;
+        for (var i = 0; i < normalized.Length; i++)
         {
-            var index = normalized.IndexOf(marker);
-            if (index > 0 && (boundary < 0 || index < boundary))
+            if (normalized[i] is '「' or '『')
             {
-                boundary = index;
-                strongBoundary = true;
+                quoteDepth++;
+                continue;
             }
-        }
-
-        var whitespace = Regex.Match(normalized, @"[\s　]+", RegexOptions.None);
-        if (whitespace.Success && whitespace.Index > 0 && (boundary < 0 || whitespace.Index < boundary))
-        {
-            boundary = whitespace.Index;
-            strongBoundary = false;
+            if (normalized[i] is '」' or '』')
+            {
+                quoteDepth = Math.Max(0, quoteDepth - 1);
+                continue;
+            }
+            if (quoteDepth != 0 || i == 0)
+                continue;
+            if (normalized[i] is '！' or '!' or '？' or '?' or '▼' or '▽')
+            {
+                boundary = i;
+                strongBoundary = true;
+                break;
+            }
+            if (char.IsWhiteSpace(normalized[i]))
+            {
+                boundary = i;
+                strongBoundary = false;
+                break;
+            }
         }
 
         if (boundary <= 0)
@@ -1301,9 +1829,10 @@ internal static partial class AIrhythmRecommendationEngine
         var recurringPrefixGroups = new Dictionary<(AIrhythmServiceIdentity Service, string Prefix, bool StrongBoundary), HashSet<string>>();
         var exactEvidenceKeysByService = new Dictionary<AIrhythmServiceIdentity, HashSet<string>>();
 
-        void ObserveRecurringPrefix(string? title, AIrhythmServiceIdentity service)
+        void ObserveRecurringPrefix(string? title, AIrhythmServiceIdentity service, string? recordedGenre = null)
         {
-            if (!service.IsValid || string.IsNullOrWhiteSpace(title))
+            if (!service.IsValid || string.IsNullOrWhiteSpace(title)
+                || MustPreserveCompleteWorkIdentity(title, BroadcastForm(title) == "film", recordedGenre))
                 return;
 
             var fullKey = EvidenceSeriesKey(title);
@@ -1333,7 +1862,7 @@ internal static partial class AIrhythmRecommendationEngine
         foreach (var item in snapshot.History)
         {
             if (AIrhythmDataState.IsUsefulHistory(item))
-                ObserveRecurringPrefix(item.ProgramTitle, ServiceIdentityOf(item));
+                ObserveRecurringPrefix(item.ProgramTitle, ServiceIdentityOf(item), item.Genre);
         }
         foreach (var item in snapshot.Reservations)
         {
@@ -1378,15 +1907,18 @@ internal static partial class AIrhythmRecommendationEngine
         // sufficient.
         var numberedWorkEpisodes = new Dictionary<AIrhythmLocalWorkAliasKey, HashSet<int>>();
         var numberedWorkText = new Dictionary<AIrhythmLocalWorkAliasKey, string>();
+        // EPG is an application target; only completed recordings and useful reservations prove a series.
+        var selectedNumberedWorkEpisodes = new Dictionary<AIrhythmLocalWorkAliasKey, HashSet<int>>();
+        var selectedNumberedWorkText = new Dictionary<AIrhythmLocalWorkAliasKey, string>();
 
-        void ObserveNumberedEpisode(string? title, AIrhythmServiceIdentity service)
+        void ObserveNumberedEpisode(string? title, AIrhythmServiceIdentity service, bool selectedEvidence)
         {
             if (!service.IsValid || string.IsNullOrWhiteSpace(title)
-                || (title.IndexOf('#') < 0 && title.IndexOf('＃') < 0)
-                || ClassifyDerivedProgramRelation(title) == AIrhythmDerivedProgramRelation.Promo)
+                || (title.IndexOf('#') < 0 && title.IndexOf('＃') < 0 && title.IndexOf('♯') < 0)
+                || BroadcastForm(title) is "promotion" or "film")
                 return;
             var parts = ParseCanonicalTitleParts(title);
-            var marker = Regex.Match(parts.Episode, @"^#\s*(?<number>[0-9]{1,3})$",
+            var marker = Regex.Match(parts.Episode, @"^[#＃♯]\s*(?<number>[0-9]{1,3})$",
                 RegexOptions.CultureInvariant);
             if (!marker.Success || !int.TryParse(marker.Groups["number"].Value,
                     NumberStyles.None, CultureInfo.InvariantCulture, out var episodeNumber)
@@ -1401,16 +1933,23 @@ internal static partial class AIrhythmRecommendationEngine
                 numberedWorkEpisodes[key] = episodes = new HashSet<int>();
             episodes.Add(episodeNumber);
             numberedWorkText.TryAdd(key, rawWork);
+            if (selectedEvidence)
+            {
+                if (!selectedNumberedWorkEpisodes.TryGetValue(key, out var selectedEpisodes))
+                    selectedNumberedWorkEpisodes[key] = selectedEpisodes = new HashSet<int>();
+                selectedEpisodes.Add(episodeNumber);
+                selectedNumberedWorkText.TryAdd(key, rawWork);
+            }
         }
 
         foreach (var item in snapshot.Events)
-            ObserveNumberedEpisode(item.Title, ServiceIdentityOf(item));
+            ObserveNumberedEpisode(item.Title, ServiceIdentityOf(item), selectedEvidence: false);
         foreach (var item in snapshot.History)
             if (AIrhythmDataState.IsUsefulHistory(item))
-                ObserveNumberedEpisode(item.ProgramTitle, ServiceIdentityOf(item));
+                ObserveNumberedEpisode(item.ProgramTitle, ServiceIdentityOf(item), selectedEvidence: true);
         foreach (var item in snapshot.Reservations)
             if (AIrhythmDataState.IsUsefulReservation(item) && ReservationEvidenceWeight(item) > 0)
-                ObserveNumberedEpisode(item.ProgramTitle, ServiceIdentityOf(item));
+                ObserveNumberedEpisode(item.ProgramTitle, ServiceIdentityOf(item), selectedEvidence: true);
 
         foreach (var (longKey, longEpisodes) in numberedWorkEpisodes)
         {
@@ -1444,7 +1983,79 @@ internal static partial class AIrhythmRecommendationEngine
                 aliases[longKey] = matchedShortKey;
         }
 
+        // A pair of independently selected neighboring #N episodes on the same service may reveal a
+        // stable multi-word Work even when neither recorded title is the bare series name. EPG-only
+        // variants cannot teach this boundary. Project verified aliases to every current episode through
+        // the existing WorkAliases authority, shared by scoring, learning, dashboard and continuity.
+        foreach (var serviceEvidence in selectedNumberedWorkEpisodes.GroupBy(x => x.Key.ServiceIdentity))
+        {
+            var selected = serviceEvidence.ToArray();
+            var supportedPrefixes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < selected.Length; i++)
+            {
+                for (var j = i + 1; j < selected.Length; j++)
+                {
+                    if (!selected[i].Value.Any(first => selected[j].Value.Any(second =>
+                            first != second && Math.Abs(first - second) <= 2)))
+                        continue;
+                    var prefix = SharedNumberedProgrammePrefix(
+                        selectedNumberedWorkText[selected[i].Key],
+                        selectedNumberedWorkText[selected[j].Key]);
+                    if (prefix.Length > 0)
+                        supportedPrefixes.Add(prefix);
+                }
+            }
+            // Where several series share an opening word, use the longest complete supported title.
+            var orderedPrefixes = supportedPrefixes.OrderByDescending(x => x.Length).ToArray();
+            foreach (var entry in numberedWorkText)
+            {
+                if (entry.Key.ServiceIdentity != serviceEvidence.Key || aliases.ContainsKey(entry.Key))
+                    continue;
+                var matched = orderedPrefixes.FirstOrDefault(prefix =>
+                    MatchesEvidenceBackedNumberedSeriesPrefix(entry.Value, prefix));
+                if (matched is null) continue;
+                var canonical = CompactIdentity(matched);
+                if (canonical.Length >= 6 && canonical.Length < entry.Key.WorkKey.Length)
+                    aliases[entry.Key] = canonical;
+            }
+        }
+
         return aliases;
+    }
+
+    // Only independently observed, distinct #N episodes enter this common title boundary.
+    // Entire whitespace-delimited words are required; never infer an arbitrary character prefix.
+    private static string SharedNumberedProgrammePrefix(string firstWork, string secondWork)
+    {
+        var left = NormalizeCanonicalWhitespace(firstWork.Normalize(NormalizationForm.FormKC)).Trim();
+        var right = NormalizeCanonicalWhitespace(secondWork.Normalize(NormalizationForm.FormKC)).Trim();
+        var common = 0;
+        while (common < Math.Min(left.Length, right.Length)
+            && char.ToUpperInvariant(left[common]) == char.ToUpperInvariant(right[common]))
+            common++;
+        for (var end = common; end > 0;)
+        {
+            var boundary = left.LastIndexOf(' ', end - 1);
+            if (boundary < 0) break;
+            var prefix = left[..boundary].TrimEnd();
+            if (MatchesEvidenceBackedNumberedSeriesPrefix(left, prefix)
+                && MatchesEvidenceBackedNumberedSeriesPrefix(right, prefix))
+                return prefix;
+            end = boundary;
+        }
+        return string.Empty;
+    }
+
+    private static bool MatchesEvidenceBackedNumberedSeriesPrefix(string title, string prefix)
+    {
+        if (prefix.Length < 6 || prefix.Count(char.IsLetterOrDigit) < 6
+            || !prefix.Any(char.IsLetter)
+            || LooksLikeBroadcastContainerLabel(prefix)
+            || title.Length <= prefix.Length + 1
+            || !title.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            || title[prefix.Length] != ' ')
+            return false;
+        return title[(prefix.Length + 1)..].Count(char.IsLetterOrDigit) >= 8;
     }
 
     // 録画実績・復旧 — One scoring snapshot uses one observation of keyword-rule provenance and reservation
@@ -1566,9 +2177,8 @@ internal static partial class AIrhythmRecommendationEngine
                 aggregate.AddActivity(when);
             }
 
-            // 作品識別 — Continuity is an episode relation, not another preference vote. Retain all episode positions
-            // for an axis that legitimately owns Work evidence, while counting the originating rule/chain only once
-            // in the work aggregate above.
+            // Continuity keeps episode positions without creating more preference votes:
+            // one originating automatic rule contributes only one work-activity fact.
             if (hasEpisodeSource)
                 AddContinuitySource(sourceIdentity, sourceKind, when);
         }
@@ -1604,7 +2214,9 @@ internal static partial class AIrhythmRecommendationEngine
             var isAutomated = item.Intent is TvAirReservationIntent.AutomaticSearch or TvAirReservationIntent.KeywordRule;
             var facts = CanonicalEvidenceFacts(item, identityContext);
             var axes = BehaviorEvidenceAxesForReservation(item, rulesById);
-            var causalKey = AIrhythmDataState.ReservationEvidenceCausalIdentity(item);
+            var causalKey = isAutomated
+                ? $"{AIrhythmPreferenceOriginPolicy.AutomatedEvidenceCohort(item)}|work:{facts.WorkKey}"
+                : AIrhythmDataState.ReservationEvidenceCausalIdentity(item);
             AddEvidence(
                 item.ProgramTitle,
                 facts.ServiceIdentity,

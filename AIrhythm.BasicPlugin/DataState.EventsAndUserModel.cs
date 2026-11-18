@@ -2,6 +2,49 @@ namespace AIrhythm.BasicPlugin;
 
 internal static partial class AIrhythmDataState
 {
+    private static IReadOnlyList<TvAirReservationDto> ReadReservationOrigins(
+        ITvAirPluginRuntimeContext context, IReadOnlyList<TvAirReservationDto> current)
+    {
+        IReadOnlyList<TvAirReservationDto> prior;
+        bool loaded;
+        lock (Gate)
+        {
+            loaded = _verifiedReservationHistoryLoaded;
+            prior = _verifiedReservationHistory;
+        }
+        if (!loaded)
+        {
+            try
+            {
+                var fetched = context.Reservations.ListHistory(new TvAirReservationHistoryQueryDto
+                {
+                    IncludeSystemEntries = false, Limit = 10000
+                });
+                lock (Gate)
+                {
+                    if (ReferenceEquals(_runtimeContext, context))
+                    {
+                        _verifiedReservationHistory = fetched.ToArray();
+                        _verifiedReservationHistoryLoaded = true;
+                        prior = _verifiedReservationHistory;
+                    }
+                }
+            }
+            catch
+            {
+                // An unreadable origin never turns an unidentified recording into admissible evidence.
+            }
+        }
+        return current.Concat(prior).ToArray();
+    }
+
+    internal static IReadOnlyList<TvAirReservationDto> GetExcludedHistoricalReservationOrigins()
+    {
+        lock (Gate)
+            return _verifiedReservationHistory
+                .Where(AIrhythmPreferenceOriginPolicy.IsExcludedReservation).ToArray();
+    }
+
     private static TvAirReservationDto? ResolveAddedReservation(ITvAirPluginRuntimeContext context, PluginEventEnvelope envelope)
     {
         var entityId = envelope.EntityId?.Trim() ?? string.Empty;
@@ -56,6 +99,46 @@ internal static partial class AIrhythmDataState
     private static string UsageRecordingLedgerKey(string recordingIdentity)
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(recordingIdentity)));
 
+    private static string UsageReservationLedgerKey(TvAirReservationDto reservation)
+        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            $"reservation:usage:{reservation.ReservationId?.Trim()}:{reservation.CreatedAt.UtcDateTime.Ticks}")));
+
+    private static void ReconcileAdmittedReservationUsage(
+        ITvAirPluginRuntimeContext context, IEnumerable<TvAirReservationDto> reservations)
+    {
+        EnsureUsageTotalsInitialized(context);
+        var added = 0;
+        var removed = 0;
+        lock (Gate)
+        {
+            if (!_usageTotalsInitialized || !ReferenceEquals(_runtimeContext, context)) return;
+            foreach (var reservation in reservations)
+            {
+                if (!AIrhythmPreferenceOriginPolicy.AllowsReservation(reservation)
+                    && UsageCountedReservationKeys.Remove(UsageReservationLedgerKey(reservation)))
+                {
+                    _usageTotals = _usageTotals with
+                    {
+                        ReservationTotal = Math.Max(0L, _usageTotals.ReservationTotal - 1)
+                    };
+                    _usageRecordingLedgerRevision++;
+                    removed++;
+                }
+                if (!AIrhythmPreferenceOriginPolicy.AllowsReservation(reservation)
+                    || (_usageRecordingAccountingStart != DateTimeOffset.MinValue
+                        && reservation.CreatedAt < _usageRecordingAccountingStart)) continue;
+                if (UsageCountedReservationKeys.Add(UsageReservationLedgerKey(reservation))) added++;
+            }
+            if (added + removed == 0) return;
+            if (added > 0)
+            {
+                _usageTotals = _usageTotals with { ReservationTotal = _usageTotals.ReservationTotal + added };
+                _usageRecordingLedgerRevision++;
+            }
+        }
+        PersistUsageCounterState(context);
+    }
+
     private static void ReconcileFinalizedRecordingUsage(
         ITvAirPluginRuntimeContext context, IEnumerable<TvAirRecordingHistoryDto> history, string trigger)
     {
@@ -67,11 +150,20 @@ internal static partial class AIrhythmDataState
             if (!_usageTotalsInitialized || !ReferenceEquals(_runtimeContext, context)) return;
             foreach (var item in history)
             {
-                if (!item.ResultFinalized || (item.ActualEnd ?? item.End) < _usageRecordingAccountingStart)
+                if (!item.ResultFinalized || !IsAdmittedRecording(item)
+                    || (item.ActualEnd ?? item.End) < _usageRecordingAccountingStart)
                     continue;
                 var recordingIdentity = UsageRecordingIdentity(item);
                 if (string.IsNullOrWhiteSpace(recordingIdentity)) continue;
-                if (!UsageCountedRecordingKeys.Add(UsageRecordingLedgerKey(recordingIdentity))) continue;
+                var receipt = UsageRecordingLedgerKey(recordingIdentity);
+                if (UsageCountedRecordingKeys.Contains(receipt)) continue;
+                // If the canonical fact store is temporarily unreadable, a historic v2 receipt
+                // still proves this attempt was counted. Never increment while provenance is
+                // unavailable: the verified recording-fact migration will attach its v3 alias.
+                if (!_recordingFactsLoaded && UsageCountedRecordingKeys.Contains(
+                        UsageRecordingLedgerKey(LegacyUsageRecordingIdentity(item))))
+                    continue;
+                UsageCountedRecordingKeys.Add(receipt);
                 newCount++;
             }
             if (newCount == 0) return;
@@ -90,32 +182,27 @@ internal static partial class AIrhythmDataState
         EnsureUsageTotalsInitialized(context);
         bool counterReady;
         lock (Gate) counterReady = _usageTotalsInitialized;
-        if (!counterReady) return;
         if (string.Equals(eventType, "ReservationAdded", StringComparison.OrdinalIgnoreCase))
         {
+            if (!counterReady) return;
             var matchedReservation = resolvedAddedReservation;
             var reservationIdentity = matchedReservation?.ReservationId?.Trim() ?? string.Empty;
-            if (reservationIdentity.Length == 0)
+            if (reservationIdentity.Length == 0 || matchedReservation is null
+                || !AIrhythmPreferenceOriginPolicy.AllowsReservation(matchedReservation))
                 return;
 
-            AIrhythmUsageTotals next;
-            lock (Gate)
-            {
-                if (!RememberUsageIdentity(UsageRecentReservationIds, UsageRecentReservationOrder, reservationIdentity))
-                    return;
-                next = _usageTotals with { ReservationTotal = _usageTotals.ReservationTotal + 1 };
-                _usageTotals = next;
-            }
-            PersistUsageCounterState(context);
-#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-            WriteDeveloperLog($"usage total increment kind=reservation entity={reservationIdentity} total={next.ReservationTotal} trigger=ReservationAdded");
-#endif
+            ReconcileAdmittedReservationUsage(context, new[] { matchedReservation });
             return;
         }
 
         if (!string.Equals(eventType, "RecordingResultFinalized", StringComparison.OrdinalIgnoreCase))
             return;
 
+        lock (Gate)
+        {
+            _verifiedReservationHistory = Array.Empty<TvAirReservationDto>();
+            _verifiedReservationHistoryLoaded = false;
+        }
         var recordingEntity = envelope.EntityId?.Trim() ?? string.Empty;
         var matched = envelope.Payload as TvAirRecordingHistoryDto;
         IReadOnlyList<TvAirRecordingHistoryDto> recent;
@@ -133,7 +220,8 @@ internal static partial class AIrhythmDataState
 
         // Hostのファイル識別子と録画履歴IDが一致しなくても、履歴内の確定録画を直接計上する。
         // 履歴投影が後着の場合は次の通常スナップショットで同一経路を再実行する。
-        ReconcileFinalizedRecordingUsage(context, recent, "RecordingResultFinalized_history");
+        // Provenance may not have been saved when the Host publishes the finalization event.
+        // First persist verified origin; never count a raw history row on its own.
         if (matched is null)
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -142,7 +230,10 @@ internal static partial class AIrhythmDataState
             return;
         }
 
-        if (IsUsefulHistory(matched))
+        // Recording finalization persists recovery evidence independently of opening the UI or
+        // preference-learning eligibility. A write failure retains the journal dirty month for retry.
+        MergeRecoveryAttempts(context, new[] { matched }, Array.Empty<TvAirRecordingHistoryDto>());
+        if (matched.ResultFinalized)
         {
             TvAirReservationDto? origin = null;
             if (!string.IsNullOrWhiteSpace(matched.ReservationId))
@@ -157,14 +248,18 @@ internal static partial class AIrhythmDataState
             }
             var verifiedOrigin = origin is null ? Array.Empty<TvAirReservationDto>() : new[] { origin };
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-            var mergedFacts = MergeUsefulRecordingFacts(context, new[] { matched }, verifiedOrigin);
+            var mergedFacts = MergeFinalizedRecordingFacts(context, new[] { matched }, verifiedOrigin);
             if (mergedFacts > 0)
                 WriteDeveloperLog($"recording fact appended trigger=RecordingResultFinalized identity={UsageRecordingIdentity(matched)} totalFacts={GetRecordingFactCount()}");
 #else
-            _ = MergeUsefulRecordingFacts(context, new[] { matched }, verifiedOrigin);
+            _ = MergeFinalizedRecordingFacts(context, new[] { matched }, verifiedOrigin);
 #endif
+            ReconcileRecordingOrigins(context, verifiedOrigin);
+            if (origin is not null && !AIrhythmPreferenceOriginPolicy.AllowsReservation(origin))
+                return;
         }
-        ReconcileFinalizedRecordingUsage(context, new[] { matched }, "RecordingResultFinalized_payload");
+        if (counterReady)
+            ReconcileFinalizedRecordingUsage(context, new[] { matched }, "RecordingResultFinalized_payload");
     }
 
     public static AIrhythmSaveResult CancelReservation(IReadOnlyDictionary<string, string> payload)
@@ -246,7 +341,10 @@ internal static partial class AIrhythmDataState
 
     public static AIrhythmSaveResult ReserveProgram(IReadOnlyDictionary<string, string> payload)
     {
-        if (!TryReadIdentity(payload, out var networkId, out var transportStreamId, out var serviceId, out var eventNumber))
+        if (!TryReadIdentity(payload, out var networkId, out var transportStreamId, out var serviceId, out var eventNumber)
+            || !payload.TryGetValue("startTime", out var startText)
+            || !DateTimeOffset.TryParse(startText, CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind, out var requestedStart))
             return new AIrhythmSaveResult(false, "番組を確認できませんでした");
 
         ITvAirPluginRuntimeContext? context;
@@ -270,9 +368,20 @@ internal static partial class AIrhythmDataState
                 x.NetworkId == networkId &&
                 x.TransportStreamId == transportStreamId &&
                 x.ServiceId == serviceId &&
-                x.EventNumber == eventNumber);
+                x.EventNumber == eventNumber &&
+                x.Start == requestedStart);
             if (program is null || program.End <= DateTimeOffset.Now)
                 return new AIrhythmSaveResult(false, "この番組は予約できません");
+
+            // Any owner may have already reserved this exact occurrence. Do not depend on
+            // the reservation's eligibility for preference learning.
+            if (snapshot.ReservationRecords.Any(x =>
+                    x.NetworkId == networkId && x.TransportStreamId == transportStreamId
+                    && x.ServiceId == serviceId && x.EventNumber == eventNumber
+                    && (x.ScheduledStart ?? x.Start) == requestedStart
+                    && !ContainsAny($"{x.Status} {x.Source} {x.Route}",
+                        "cancel", "removed", "取消", "削除")))
+                return new AIrhythmSaveResult(true, "予約済みです", Changed: false);
 
             var result = context.Reservations.Add(new TvAirReservationCreateDto
             {
@@ -354,6 +463,7 @@ internal static partial class AIrhythmDataState
             IReadOnlyList<TvAirKeywordRuleDto> keywordRules = Array.Empty<TvAirKeywordRuleDto>();
             IReadOnlyList<TvAirRecordingHistoryDto> history = Array.Empty<TvAirRecordingHistoryDto>();
             IReadOnlyList<TvAirRecordingHistoryDto> recoveryHistory = Array.Empty<TvAirRecordingHistoryDto>();
+            IReadOnlyList<TvAirRecordingHistoryDto> recoveryClean = Array.Empty<TvAirRecordingHistoryDto>();
             IReadOnlyList<TvAirRecordingSessionDto> active = Array.Empty<TvAirRecordingSessionDto>();
             IReadOnlyList<TvAirServiceDto> channels = Array.Empty<TvAirServiceDto>();
             IReadOnlyList<TvAirTunerStatusDto> tuners = Array.Empty<TvAirTunerStatusDto>();
@@ -396,11 +506,16 @@ internal static partial class AIrhythmDataState
                 channelRaw = data.Channels.Count;
 
                 var hostRecordingHistory = ReadCanonicalRecordingHistory(context, data.RecordingHistory, out var recordingHistorySource);
+                var originRecords = ReadReservationOrigins(context, data.Reservations);
+                ReconcileAdmittedReservationUsage(context, originRecords);
+                // Retain excluded origins solely for repairing older user-model evidence.
+                // Productive reservations are filtered below by IsUsefulReservation.
                 reservationRecords = data.Reservations
                     .Where(x => x.NetworkId > 0 && x.TransportStreamId > 0 && x.ServiceId > 0 && x.EventNumber > 0)
                     .OrderBy(x => x.Start)
                     .ToArray();
-                var recordingFactHistory = GetRecordingFactHistory(context, hostRecordingHistory, data.Reservations, out var seededRecordingFacts);
+                var recordingFactHistory = GetRecordingFactHistory(context, hostRecordingHistory, originRecords, out var seededRecordingFacts);
+                var admittedHostHistory = SelectAdmittedHostHistory(hostRecordingHistory, originRecords);
                 historyRaw = recordingFactHistory.Count;
 
                 events = data.ProgramEvents
@@ -413,27 +528,46 @@ internal static partial class AIrhythmDataState
                 // 録画実績・復旧 — A completed recording and its quality observations must remain available after the Host
                 // history window moves on. Failed Host rows participate in recovery facts, not positive preference
                 // learning. This projection alone does not authorize episode-exact re-recording.
-                var recoveryFacts = recordingFactHistory
-                    .Where(x => x.ResultFinalized && x.QualityDataAvailable
-                        && ((x.DropCount ?? 0) > 0 || (x.ErrorCount ?? 0) > 0 || (x.ScrambleCount ?? 0) > 0));
-                recoveryHistory = recoveryFacts
-                    .Concat(hostRecordingHistory.Where(x => x.ResultFinalized && IsRecordingFailureForRecovery(x)))
+                var allRecordingFacts = GetAllFactualRecordingHistory(context);
+                var recoveryResetCutoff = GetDataResetCutoff(context);
+                // Host history can survive a user-requested data reset; prevent resurrection
+                // through both the persisted journal and the direct on-screen fallback.
+                var eligibleHostRecovery = hostRecordingHistory
+                    .Where(x => recoveryResetCutoff is null
+                        || (x.ActualStart ?? x.Start) >= recoveryResetCutoff.Value).ToArray();
+                recoveryClean = allRecordingFacts.Concat(eligibleHostRecovery)
+                    .Where(AIrhythmRecoveryEvidencePolicy.IsVerifiedClean)
+                    .GroupBy(UsageRecordingIdentity, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.First()).ToArray();
+                MergeRecoveryAttempts(context, eligibleHostRecovery, allRecordingFacts);
+                // All three sources are factual; preference admission never filters recovery.
+                // Persistent failed attempts survive expiry of the Host's history window.
+                recoveryHistory = GetPersistedRecoveryHistory(context, events)
+                    .Concat(allRecordingFacts.Where(AIrhythmRecoveryEvidencePolicy.IsDefective))
+                    .Concat(eligibleHostRecovery.Where(AIrhythmRecoveryEvidencePolicy.IsDefective))
                     .Where(x => (x.ActualStart ?? x.Start) <= now)
                     .Where(x => !string.IsNullOrWhiteSpace(x.ProgramTitle))
                     .GroupBy(UsageRecordingIdentity, StringComparer.OrdinalIgnoreCase)
-                    .Select(g => g.OrderByDescending(x => x.QualityDataAvailable).First())
+                    .Select(g => g.OrderByDescending(x => x.QualityDataAvailable)
+                        .ThenByDescending(x => AIrhythmRecoveryEvidencePolicy.HasVerifiedCompleteQuality(x)).First())
                     .OrderByDescending(x => x.ActualStart ?? x.Start)
                     .ToArray();
-                MergeRecoveryAttempts(context, hostRecordingHistory, recordingFactHistory);
-                AuditRecoveryEpgCandidates(context, events);
+                AuditRecoveryEpgCandidates(context, events,
+                    recoveryHistory.Select(UsageRecordingIdentity).ToHashSet(StringComparer.OrdinalIgnoreCase));
                 history = recordingFactHistory;
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-                ReportRecordingQualityPersistence(recordingFactHistory, hostRecordingHistory, recoveryHistory);
+                ReportRecordingQualityPersistence(recordingFactHistory, admittedHostHistory, recoveryHistory);
 #endif
                 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                 WriteDeveloperLog($"canonical recording facts source=AIrhythm.PersistentRecordingFacts facts={history.Count} seeded={seededRecordingFacts} hostRaw={hostRecordingHistory.Count} hostSource={recordingHistorySource} snapshotRaw={data.RecordingHistory.Count} retention=append_success_terminal_no_host_deletion consumers=score,localEvidence,dashboard,selection,discovery,search,interest");
                 #endif
-                active = data.ActiveRecordings;
+                var eligibleReservationIds = data.Reservations
+                    .Where(AIrhythmPreferenceOriginPolicy.AllowsReservation)
+                    .Select(x => x.ReservationId)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                active = data.ActiveRecordings
+                    .Where(x => eligibleReservationIds.Contains(x.ReservationId))
+                    .ToArray();
                 channels = data.Channels
                     .Where(x => x.IsEnabled)
                     .OrderBy(x => x.DisplayOrder)
@@ -501,6 +635,7 @@ internal static partial class AIrhythmDataState
 #else
                     , revision);
 #endif
+            snapshot = snapshot with { RecoveryCleanHistory = recoveryClean };
 
             ReportSnapshot(context, snapshot);
             lock (Gate)
@@ -924,7 +1059,8 @@ internal static partial class AIrhythmDataState
 
     public static AIrhythmLearnedUserModelState ObserveLearnedUserModel(
         IEnumerable<AIrhythmUserModelObservation> source,
-        IReadOnlyDictionary<string, string>? excludedReservationOrigins = null)
+        IReadOnlyDictionary<string, string>? excludedReservationOrigins = null,
+        IReadOnlyDictionary<string, string>? verifiedWorkAliases = null)
     {
         ITvAirPluginRuntimeContext? context;
         lock (Gate) context = _runtimeContext;
@@ -1018,9 +1154,16 @@ internal static partial class AIrhythmDataState
                             BasePreferenceLogicVersion = BasePreferenceLogicVersion,
                             // 処理条件 — Retain only recorded per-observation weights; never reconstruct historical intent from current
                             // keyword rule definitions.
-                            BaseEvidenceLedger = new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(
-                                loaded.BaseEvidenceLedger ?? new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(),
-                                StringComparer.Ordinal)
+                            BaseEvidenceLedger = basePreferenceCompatible
+                                ? new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(
+                                    loaded.BaseEvidenceLedger ?? new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(),
+                                    StringComparer.Ordinal)
+                                : new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(StringComparer.Ordinal),
+                            ContributorEvidenceLedger = loaded.ContributorLogicVersion == ContributorLogicVersion
+                                ? new Dictionary<string, AIrhythmContributorEvidenceReceipt>(
+                                    loaded.ContributorEvidenceLedger ?? new Dictionary<string, AIrhythmContributorEvidenceReceipt>(),
+                                    StringComparer.Ordinal)
+                                : new Dictionary<string, AIrhythmContributorEvidenceReceipt>(StringComparer.Ordinal)
                         };
                         loadedObservations = state.ObservationCount;
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -1029,7 +1172,7 @@ internal static partial class AIrhythmDataState
 #endif
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
                         if (!basePreferenceCompatible)
-                            WriteDeveloperLog($"USER_MODEL_BASE_MIGRATION result=REBUILD previousLogic={loaded.BasePreferenceLogicVersion} nextLogic={BasePreferenceLogicVersion} previousObservations={loaded.ObservationCount} preservedContributorLogic={loaded.ContributorLogicVersion == ContributorLogicVersion} reason=causal_reservation_provenance");
+                            WriteDeveloperLog($"USER_MODEL_BASE_MIGRATION result=REBUILD previousLogic={loaded.BasePreferenceLogicVersion} nextLogic={BasePreferenceLogicVersion} previousObservations={loaded.ObservationCount} rebuildContributorLogic={loaded.ContributorLogicVersion != ContributorLogicVersion} reason=program_origin_absence_from_all_learning_axes");
 #endif
                         }
                         else
@@ -1068,7 +1211,11 @@ internal static partial class AIrhythmDataState
         var baseEvidenceLedger = new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(
             state.BaseEvidenceLedger ?? new Dictionary<string, AIrhythmBaseEvidenceLedgerEntry>(),
             StringComparer.Ordinal);
+        var contributorEvidenceLedger = new Dictionary<string, AIrhythmContributorEvidenceReceipt>(
+            state.ContributorEvidenceLedger ?? new Dictionary<string, AIrhythmContributorEvidenceReceipt>(),
+            StringComparer.Ordinal);
         var ledgerNewEntries = 0;
+        var cohortProvenanceBackfills = 0;
         var work = state.WorkWeights;
         var genre = state.GenreWeights;
         var terms = state.TermWeights;
@@ -1124,7 +1271,11 @@ internal static partial class AIrhythmDataState
                     continue;
                 }
                 var contributorKey = factId[prefix.Length..];
-                Subtract(contributors, contributorKey, AIrhythmPreferenceOriginPolicy.IncidentalContributorWeight);
+                Subtract(contributors, contributorKey,
+                    contributorEvidenceLedger.TryGetValue(factId, out var creditedContributor)
+                        ? creditedContributor.Weight
+                        : AIrhythmPreferenceOriginPolicy.IncidentalContributorWeight);
+                contributorEvidenceLedger.Remove(factId);
                 contributorSeen.Remove(factId);
                 contributorFactWorkKeys.Remove(factId);
                 excludedContributorRemoved++;
@@ -1162,6 +1313,13 @@ internal static partial class AIrhythmDataState
             else map[normalized] = nextWeight;
         }
 
+        // Restore historical genre contributions only when the current observation
+        // can be matched to its exact saved per-observation ledger. Other learned
+        // axes, counts, identifiers and untraceable older preferences are untouched.
+        var reconciledGenres = 0;
+        var deferredGenreReconciliations = 0;
+        var reconciledWorks = 0;
+        var deferredWorkReconciliations = 0;
         var processedObservationIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var observation in observationRows)
         {
@@ -1169,6 +1327,22 @@ internal static partial class AIrhythmDataState
                 continue;
 
             var isNewBaseObservation = observation.HasBaseLearningAxis && seen.Add(observation.ObservationId);
+            // A legacy receipt may receive rule provenance only from this exact,
+            // independently checked Work/service observation. Never infer it from
+            // the current rule's title or a reused reservation identifier.
+            if (!isNewBaseObservation && !string.IsNullOrWhiteSpace(observation.EvidenceCohortKey)
+                && baseEvidenceLedger.TryGetValue(observation.ObservationId, out var previousReceipt)
+                && string.IsNullOrWhiteSpace(previousReceipt.EvidenceCohortKey)
+                && string.Equals(previousReceipt.WorkKey, observation.WorkKey, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(previousReceipt.ServiceKey, observation.ServiceKey, StringComparison.OrdinalIgnoreCase))
+            {
+                baseEvidenceLedger[observation.ObservationId] = previousReceipt with
+                {
+                    EvidenceCohortKey = observation.EvidenceCohortKey,
+                    CohortScale = 1.0d
+                };
+                cohortProvenanceBackfills++;
+            }
             var contributorRows = observation.Contributors ?? Array.Empty<AIrhythmContributorObservation>();
             var uniqueContributors = new List<AIrhythmContributorObservation>(Math.Min(contributorRows.Count, 8));
             var contributorKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1215,9 +1389,89 @@ internal static partial class AIrhythmDataState
 #endif
                 if (contributorSeen.Add(contributorSeenId))
                     newContributorRows.Add(contributor);
+                else if (!contributorEvidenceLedger.ContainsKey(contributorSeenId)
+                    && contributorFactWorkKeys.TryGetValue(contributorSeenId, out var priorContributorWork)
+                    && string.Equals(priorContributorWork, observation.WorkKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Prior versions persisted contributor receipts without their
+                    // credited coefficients. Exact same-work observations may recover
+                    // the coefficient, but never retroactively invent a different fact.
+                    contributorEvidenceLedger[contributorSeenId] = new AIrhythmContributorEvidenceReceipt(
+                        Math.Clamp(contributor.Weight, 0.05d, 1.0d), 1.0d);
+                    cohortProvenanceBackfills++;
+                }
             }
 
             var isNewContributorObservation = newContributorRows.Count > 0;
+            // Re-key a historical Work receipt only when the same observation, service and
+            // independently corroborated canonical alias agree. A verified non-empty local key
+            // is the sole destination for both the base receipt and contributor provenance.
+            var verifiedObservationWorkKey = observation.WorkKey;
+            if (!isNewBaseObservation && seen.Contains(observation.ObservationId)
+                && observation.LearnWork
+                && !string.IsNullOrWhiteSpace(verifiedObservationWorkKey)
+                && observation.ObservationId.StartsWith("reservation:", StringComparison.Ordinal)
+                && baseEvidenceLedger.TryGetValue(observation.ObservationId, out var originalWork)
+                && originalWork.Work > 0
+                && !string.IsNullOrWhiteSpace(originalWork.WorkKey)
+                && !string.IsNullOrWhiteSpace(originalWork.ServiceKey)
+                && string.Equals(originalWork.ServiceKey, observation.ServiceKey, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(originalWork.WorkKey, verifiedObservationWorkKey, StringComparison.OrdinalIgnoreCase)
+                && verifiedWorkAliases is not null
+                && verifiedWorkAliases.TryGetValue($"{originalWork.ServiceKey}|{originalWork.WorkKey}", out var verifiedCanonical)
+                && string.Equals(verifiedCanonical, verifiedObservationWorkKey, StringComparison.OrdinalIgnoreCase))
+            {
+                if (work.TryGetValue(originalWork.WorkKey, out var credited)
+                    && credited + 0.0000001d >= originalWork.Work)
+                {
+                    Subtract(work, originalWork.WorkKey, originalWork.Work);
+                    Add(work, verifiedObservationWorkKey, originalWork.Work);
+                    baseEvidenceLedger[observation.ObservationId] = originalWork with { WorkKey = verifiedObservationWorkKey };
+                    var contributorPrefix = $"observation:{observation.ObservationId}|";
+                    foreach (var factId in contributorFactWorkKeys.Keys.Where(x =>
+                                 x.StartsWith(contributorPrefix, StringComparison.Ordinal)).ToArray())
+                    {
+                        if (string.Equals(contributorFactWorkKeys[factId], originalWork.WorkKey,
+                                StringComparison.OrdinalIgnoreCase))
+                            contributorFactWorkKeys[factId] = verifiedObservationWorkKey;
+                    }
+                    reconciledWorks++;
+                }
+                else deferredWorkReconciliations++;
+            }
+            if (!isNewBaseObservation && seen.Contains(observation.ObservationId)
+                && observation.ReconcileGenreEvidence && observation.LearnGenre
+                && observation.ObservationId.StartsWith("reservation:", StringComparison.Ordinal)
+                && baseEvidenceLedger.TryGetValue(observation.ObservationId, out var original)
+                && original.Genre > 0
+                && !string.IsNullOrWhiteSpace(original.ServiceKey)
+                && !string.IsNullOrWhiteSpace(observation.ServiceKey)
+                && string.Equals(original.WorkKey, observation.WorkKey, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(original.ServiceKey, observation.ServiceKey, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(original.GenreKey, observation.GenreKey, StringComparison.OrdinalIgnoreCase))
+            {
+                // A partial or inconsistent aggregate is not a license to
+                // subtract someone else's learning evidence.
+                if (string.IsNullOrWhiteSpace(original.GenreKey)
+                    || (genre.TryGetValue(original.GenreKey, out var credited)
+                        && credited + 0.0000001d >= original.Genre))
+                {
+                    if (!string.IsNullOrWhiteSpace(original.GenreKey))
+                        Subtract(genre, original.GenreKey, original.Genre);
+                    var replacementGenre = (observation.GenreKey ?? string.Empty).Trim();
+                    if (replacementGenre.Length > 0)
+                        Add(genre, replacementGenre, original.Genre);
+                    baseEvidenceLedger[observation.ObservationId] = original with
+                    {
+                        GenreKey = replacementGenre,
+                        // Keep the original credited weight while suspended so
+                        // later verified evidence can restore that very credit.
+                        Genre = original.Genre
+                    };
+                    reconciledGenres++;
+                }
+                else deferredGenreReconciliations++;
+            }
             if (!isNewBaseObservation && !isNewContributorObservation)
                 continue;
 
@@ -1248,7 +1502,8 @@ internal static partial class AIrhythmDataState
                     observation.WorkKey ?? string.Empty,
                     observation.GenreKey ?? string.Empty,
                     observation.ServiceKey ?? string.Empty,
-                    creditedTerms.ToArray(), creditedHour);
+                    creditedTerms.ToArray(), creditedHour,
+                    observation.EvidenceCohortKey, 1.0d);
                 ledgerNewEntries++;
                 if (observation.LearnWork) Add(work, observation.WorkKey, observation.WorkEvidenceWeight);
                 if (observation.LearnGenre) Add(genre, observation.GenreKey, observation.GenreEvidenceWeight);
@@ -1265,8 +1520,10 @@ internal static partial class AIrhythmDataState
             {
                 foreach (var contributor in newContributorRows)
                 {
-                    Add(contributors, contributor.Key, Math.Clamp(contributor.Weight, 0.05d, 1.0d));
+                    var credit = Math.Clamp(contributor.Weight, 0.05d, 1.0d);
+                    Add(contributors, contributor.Key, credit);
                     var factId = $"observation:{observation.ObservationId}|{contributor.Key}";
+                    contributorEvidenceLedger[factId] = new AIrhythmContributorEvidenceReceipt(credit, 1.0d);
                     if (!string.IsNullOrWhiteSpace(observation.WorkKey) && !contributorFactWorkKeys.ContainsKey(factId))
                     {
                         contributorFactWorkKeys[factId] = observation.WorkKey;
@@ -1277,13 +1534,112 @@ internal static partial class AIrhythmDataState
             }
         }
 
+        // Canonical cohort projection: old individual facts remain durable and
+        // auditable, but one automatic rule contributes only a weak total vote.
+        // Rebalance every affected receipt when the rule yields another airing.
+        // The original coefficient is always receipt.Weight / receipt.CohortScale.
+        var rebalancedReceipts = 0;
+        var rebalancedContributorReceipts = 0;
+        var deferredCohortReceipts = 0;
+        foreach (var cohort in baseEvidenceLedger
+            .Where(x => !string.IsNullOrWhiteSpace(x.Value.EvidenceCohortKey))
+            .GroupBy(x => x.Value.EvidenceCohortKey, StringComparer.Ordinal))
+        {
+            var targetScale = AIrhythmPreferenceOriginPolicy.AutomatedRuleIntentWeight / cohort.Count();
+            foreach (var (observationId, receipt) in cohort.ToArray())
+            {
+                var oldScale = receipt.CohortScale;
+                if (oldScale <= 0.0d || !double.IsFinite(oldScale))
+                {
+                    deferredCohortReceipts++;
+                    continue;
+                }
+                if (Math.Abs(oldScale - targetScale) > 0.0000000001d)
+                {
+                    var ratio = targetScale / oldScale;
+                    var delta = ratio - 1.0d;
+                    bool CanApply(Dictionary<string, double> map, string key, double oldWeight)
+                        => oldWeight <= 0.0d || string.IsNullOrWhiteSpace(key)
+                            || (map.TryGetValue(key, out var available)
+                                && available + 0.0000001d >= -oldWeight * delta);
+                    if ((receipt.Terms > 0 && receipt.TermKeys is null)
+                        || (receipt.Hour > 0 && string.IsNullOrWhiteSpace(receipt.HourKey))
+                        || !CanApply(work, receipt.WorkKey, receipt.Work)
+                        || !CanApply(genre, receipt.GenreKey, receipt.Genre)
+                        || !CanApply(service, receipt.ServiceKey, receipt.Service)
+                        || !CanApply(hour, receipt.HourKey, receipt.Hour)
+                        || (receipt.TermKeys is not null && receipt.TermKeys.Any(k => !CanApply(terms, k, receipt.Terms))))
+                    {
+                        deferredCohortReceipts++;
+                        continue;
+                    }
+                    void Move(Dictionary<string, double> map, string key, double oldWeight)
+                    {
+                        var shift = oldWeight * delta;
+                        if (shift < 0.0d) Subtract(map, key, -shift);
+                        else if (shift > 0.0d) Add(map, key, shift);
+                    }
+                    Move(work, receipt.WorkKey, receipt.Work);
+                    Move(genre, receipt.GenreKey, receipt.Genre);
+                    Move(service, receipt.ServiceKey, receipt.Service);
+                    Move(hour, receipt.HourKey, receipt.Hour);
+                    if (receipt.TermKeys is not null)
+                        foreach (var termKey in receipt.TermKeys) Move(terms, termKey, receipt.Terms);
+                    baseEvidenceLedger[observationId] = receipt with
+                    {
+                        Work = receipt.Work * ratio,
+                        Genre = receipt.Genre * ratio,
+                        Terms = receipt.Terms * ratio,
+                        Service = receipt.Service * ratio,
+                        Hour = receipt.Hour * ratio,
+                        CohortScale = targetScale
+                    };
+                    rebalancedReceipts++;
+                }
+                var prefix = $"observation:{observationId}|";
+                foreach (var factId in contributorEvidenceLedger.Keys.Where(x =>
+                             x.StartsWith(prefix, StringComparison.Ordinal)).ToArray())
+                {
+                    var credited = contributorEvidenceLedger[factId];
+                    if (credited.CohortScale <= 0.0d || !double.IsFinite(credited.CohortScale)) continue;
+                    var contributorKey = factId[prefix.Length..];
+                    var contributorRatio = targetScale / credited.CohortScale;
+                    if (Math.Abs(1.0d - contributorRatio) < 0.0000000001d) continue;
+                    var contributionShift = credited.Weight * (contributorRatio - 1.0d);
+                    if (contributionShift < 0.0d
+                        && (!contributors.TryGetValue(contributorKey, out var creditedTotal)
+                            || creditedTotal + 0.0000001d < -contributionShift))
+                    {
+                        deferredCohortReceipts++;
+                        continue;
+                    }
+                    if (contributionShift < 0.0d)
+                        Subtract(contributors, contributorKey, -contributionShift);
+                    else if (contributionShift > 0.0d)
+                        Add(contributors, contributorKey, contributionShift);
+                    contributorEvidenceLedger[factId] = new AIrhythmContributorEvidenceReceipt(
+                        credited.Weight * contributorRatio, targetScale);
+                    rebalancedContributorReceipts++;
+                }
+            }
+        }
+        // Unprovenanced historical facts retain their former count. All known
+        // automated contributions use their *credited* fractional cohort scales.
+        var effectiveObservationCount = Math.Max(0L, observationCount - baseEvidenceLedger.Count)
+            + baseEvidenceLedger.Values.Sum(x => string.IsNullOrWhiteSpace(x.EvidenceCohortKey)
+                ? 1.0d : x.CohortScale);
+
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var userModelAfterObserve = GC.GetAllocatedBytesForCurrentThread();
+        WriteDeveloperLog($"USER_MODEL_COHORT_BALANCE distinctAutomaticRules={baseEvidenceLedger.Values.Where(x => !string.IsNullOrWhiteSpace(x.EvidenceCohortKey)).Select(x => x.EvidenceCohortKey).Distinct(StringComparer.Ordinal).Count()} balancedReceipts={rebalancedReceipts} balancedContributorReceipts={rebalancedContributorReceipts} deferredReceipts={deferredCohortReceipts} provenanceBackfills={cohortProvenanceBackfills} rawObservations={observationCount} effectiveObservations={effectiveObservationCount:0.000} policy=one_rule_one_weak_intent durableReceipts=True");
 #endif
         var next = new AIrhythmLearnedUserModelState(
             LearnedUserModelSchemaVersion,
             observationCount,
-            newObservations > 0 || contributorBackfills > 0 || contributorProvenanceAdded > 0 || excludedEvidenceChanged ? DateTimeOffset.Now : state.UpdatedAt,
+            newObservations > 0 || contributorBackfills > 0 || contributorProvenanceAdded > 0
+                || excludedEvidenceChanged || reconciledGenres > 0 || reconciledWorks > 0
+                || rebalancedReceipts > 0 || rebalancedContributorReceipts > 0 || cohortProvenanceBackfills > 0
+                    ? DateTimeOffset.Now : state.UpdatedAt,
             seen.ToArray(),
             work,
             genre,
@@ -1295,7 +1651,11 @@ internal static partial class AIrhythmDataState
             ContributorLogicVersion,
             BasePreferenceLogicVersion,
             contributorFactWorkKeys,
-            baseEvidenceLedger);
+            baseEvidenceLedger,
+            contributorEvidenceLedger)
+        {
+            EffectiveEvidenceCount = effectiveObservationCount
+        };
 
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var baseLedgerReadback = "not_required";
@@ -1303,7 +1663,9 @@ internal static partial class AIrhythmDataState
             (e.Terms > 0 && e.TermKeys is null) || (e.Hour > 0 && string.IsNullOrWhiteSpace(e.HourKey)));
 #endif
         if (context is not null && mayPersistUserModel
-            && (newObservations > 0 || contributorBackfills > 0 || contributorProvenanceAdded > 0 || excludedEvidenceChanged))
+            && (newObservations > 0 || contributorBackfills > 0 || contributorProvenanceAdded > 0
+                || excludedEvidenceChanged || reconciledGenres > 0 || reconciledWorks > 0
+                || rebalancedReceipts > 0 || rebalancedContributorReceipts > 0 || cohortProvenanceBackfills > 0))
         {
             try
             {
@@ -1365,11 +1727,16 @@ internal static partial class AIrhythmDataState
         }
 #endif
 
+        // The same scoring exclusion is used by Developer diagnostics and the recommendation projection.
+        // Stored observations remain untouched; no second diagnostic-specific eligibility rules.
+        var quarantinedKeys = contributors.Keys.Where(IsStructurallyAmbiguousPersistedContributor).ToArray();
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var userModelAfterPersistence = GC.GetAllocatedBytesForCurrentThread();
-        var maturity = observationCount <= 0 ? 0.0d : observationCount / (observationCount + 100.0d);
+        var maturity = effectiveObservationCount <= 0 ? 0.0d : effectiveObservationCount / (effectiveObservationCount + 100.0d);
         WriteDeveloperLog($"USER_MODEL_BASE_EVIDENCE_LEDGER result=OBSERVED persistedEntries={baseEvidenceLedger.Count} addedThisRun={ledgerNewEntries} legacyWithoutPerFactProvenance={Math.Max(0L, observationCount - baseEvidenceLedger.Count)} incompleteLegacyLedgerEntries={baseLedgerIncomplete} saveStatus={storedContributorSaveStatus} immediateReadback={baseLedgerReadback} termIdentity=exact_deduplicated_first16 hourIdentity=credited_hour policy=preserve_historical_aggregate_no_inferred_reweighting futureRecalibration=ledger_only storageMutation=append_on_new_base_fact");
-        WriteDeveloperLog($"USER_MODEL_MEMORY result=OK loadedObservations={loadedObservations} storedObservations={observationCount} newObservations={newObservations} contributorBackfills={contributorBackfills} works={work.Count} genres={genre.Count} terms={terms.Count} services={service.Count} hours={hour.Count} contributors={contributors.Count} maturity={maturity:0.000} source=additive_natural_behavior automaticReservationLearning=causal_matching_axes_only searchCastContributorLearning=originating_rule_only repeatedRuleEpisodes=independent_programme_facts programTimeSlotLearning=zero notConditionLearning=zero renderingDoesNotTeach=True titleSpecificRules=False productionScoreMutation=True discoveryMutation=True");
+        WriteDeveloperLog($"USER_MODEL_GENRE_RECONCILIATION corrected={reconciledGenres} deferred={deferredGenreReconciliations} verifiedPerObservationLedgerOnly=True legacyWithoutLedgerPreserved=True storageMutation=conditional");
+        WriteDeveloperLog($"USER_MODEL_WORK_RECONCILIATION corrected={reconciledWorks} deferred={deferredWorkReconciliations} evidence=same_service_confirmed_alias verifiedPerObservationLedgerOnly=True legacyWithoutLedgerPreserved=True storageMutation=conditional");
+        WriteDeveloperLog($"USER_MODEL_MEMORY result=OK loadedObservations={loadedObservations} storedObservations={observationCount} newObservations={newObservations} contributorBackfills={contributorBackfills} works={work.Count} genres={genre.Count} terms={terms.Count} services={service.Count} hours={hour.Count} contributors={contributors.Count} maturity={maturity:0.000} effectiveObservations={effectiveObservationCount:0.000} source=cohort_balanced_behavior automaticReservationLearning=one_rule_one_weak_intent searchCastContributorLearning=originating_rule_only repeatedRuleEpisodes=durable_facts_not_independent_preferences programTimeSlotLearning=zero notConditionLearning=zero renderingDoesNotTeach=True titleSpecificRules=False productionScoreMutation=True discoveryMutation=True");
 
         static (string Source, string Role, string Entity) ContributorDiagnosticIdentity(string key)
         {
@@ -1392,7 +1759,7 @@ internal static partial class AIrhythmDataState
         var maxContributorWeight = contributors.Values.DefaultIfEmpty(0.0d).Max();
         var trackedContributors = contributors.Keys.Count(x => x.StartsWith("tracked|", StringComparison.OrdinalIgnoreCase));
         var metadataContributors = Math.Max(0, contributors.Count - trackedContributors);
-        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SUMMARY total={contributors.Count} tracked={trackedContributors} metadata={metadataContributors} maxWeight={maxContributorWeight:0.000} diagnostics=top_weighted_role_aware provenance=searchcast_or_labeled_extendeditems metadataGate=none_additive_from_first_fact negativeFromMissing=False titleSpecificRules=False");
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SUMMARY total={contributors.Count} tracked={trackedContributors} metadata={metadataContributors} maxWeight={maxContributorWeight:0.000} scoringEligible={contributors.Count - quarantinedKeys.Length} diagnostics=top_weighted_role_aware provenance=searchcast_or_labeled_extendeditems metadataGate=shared_evidence_gate negativeFromMissing=False titleSpecificRules=False");
 
         // 保存・読込 — The saved contributor weight aggregates historical observation facts; we cannot infer all-time
         // distinct works from current-snapshot WorkKey alone. This diagnostic explicitly limits its
@@ -1438,7 +1805,7 @@ internal static partial class AIrhythmDataState
             var contributorSeenSuffix = "|" + contributor.Key;
             var persistedFacts = contributorSeen.Count(x => x.EndsWith(contributorSeenSuffix, StringComparison.OrdinalIgnoreCase));
             var strength = maxContributorWeight <= 0.0d ? 0.0d : Math.Clamp(contributor.Value / maxContributorWeight, 0.0d, 1.0d);
-            WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SAMPLE rank={contributorRank} entity={ContributorDiagnosticToken(identity.Entity)} role={identity.Role} source={identity.Source} weight={contributor.Value:0.000} strength={strength:0.000} persistedFacts={persistedFacts} currentSnapshotObservations={currentSnapshotObservations} currentSnapshotDistinctWorks={currentSnapshotDistinctWorks} currentSnapshotObservationsPerWork={(currentSnapshotDistinctWorks == 0 ? 0.0d : (double)currentSnapshotObservations / currentSnapshotDistinctWorks):0.000} historicalDistinctWorks=unavailable persisted=True scoringAxis=contributor noNegativeFromAbsence=True diagnosticsScope=persisted_fact_count_plus_current_snapshot_work_span");
+            WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_SAMPLE rank={contributorRank} entity={ContributorDiagnosticToken(identity.Entity)} role={identity.Role} source={identity.Source} weight={contributor.Value:0.000} strength={strength:0.000} persistedFacts={persistedFacts} currentSnapshotObservations={currentSnapshotObservations} currentSnapshotDistinctWorks={currentSnapshotDistinctWorks} currentSnapshotObservationsPerWork={(currentSnapshotDistinctWorks == 0 ? 0.0d : (double)currentSnapshotObservations / currentSnapshotDistinctWorks):0.000} historicalDistinctWorks=unavailable persisted=True scoringAxis={(quarantinedKeys.Contains(contributor.Key, StringComparer.OrdinalIgnoreCase) ? "excluded" : "contributor")} noNegativeFromAbsence=True diagnosticsScope=persisted_fact_count_plus_current_snapshot_work_span");
         }
 #endif
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -1446,7 +1813,6 @@ internal static partial class AIrhythmDataState
 #endif
         // 推薦・学習 — Retain saved observations intact; exclude structurally ambiguous contributor keys from scoring
         // without migration or person-specific inference.
-        var quarantinedKeys = contributors.Keys.Where(IsStructurallyAmbiguousPersistedContributor).ToArray();
         var scoringContributors = CopyMap(contributors);
         foreach (var key in quarantinedKeys)
             scoringContributors.Remove(key);
@@ -1491,7 +1857,7 @@ internal static partial class AIrhythmDataState
         }
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_WORK_CALIBRATION result=APPLIED mappedContributors={mappedFactsByContributor.Count} multiWorkContributors={mappedFactsByContributor.Count(x => x.Value.Count > 1)} calibratedContributors={calibratedContributors} knownObservationCreditReduction={knownObservationCreditReduction:0.000} unmappedHistoricalFactsPreserved=True explicitTrackedIntentUnchanged=True storageMutation=False scoreMutation=True model=per_work_log_diminishing_known_only");
-        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_LEGACY_QUARANTINE result=APPLIED candidates={contributors.Count} quarantined={quarantinedKeys.Length} retained={scoringContributors.Count} storageMutation=False observationDeletion=False scope=scoring_only revalidation=structural_unseparated_mixed_script");
+        WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_LEGACY_QUARANTINE result=APPLIED candidates={contributors.Count} quarantined={quarantinedKeys.Length} retained={scoringContributors.Count} storageMutation=False observationDeletion=False scope=scoring_only revalidation=shared_contributor_identity_policy");
 #endif
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var userModelAfterProjection = GC.GetAllocatedBytesForCurrentThread();
@@ -1599,7 +1965,8 @@ internal static partial class AIrhythmDataState
 
     internal static bool IsUsefulReservation(TvAirReservationDto item)
     {
-        if (!item.IsEnabled || item.HasConflict || string.IsNullOrWhiteSpace(item.ProgramTitle))
+        if (!AIrhythmPreferenceOriginPolicy.AllowsReservation(item)
+            || !item.IsEnabled || item.HasConflict || string.IsNullOrWhiteSpace(item.ProgramTitle))
             return false;
         var state = $"{item.Status} {item.Source} {item.Route}";
         return !ContainsAny(state, "cancel", "disabled", "removed", "取消", "無効", "削除");

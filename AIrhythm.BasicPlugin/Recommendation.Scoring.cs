@@ -88,12 +88,21 @@ internal static partial class AIrhythmRecommendationEngine
         }
     }
 
+    // User-authored SearchCast tokens retain their existing compact identity across updates.
     private static string ContributorEntityKey(string? value)
         => CompactIdentity((value ?? string.Empty).Normalize(NormalizationForm.FormKC));
 
+    // Metadata has explicit credit punctuation. Preserve evidence-bearing initial separators
+    // without reinterpreting legacy compact keys or changing independently tracked user intent.
+    private static string ContributorMetadataEntityKey(string? value)
+    {
+        var normalized = (value ?? string.Empty).Normalize(NormalizationForm.FormKC);
+        return AIrhythmText.CanonicalDelimitedMiddleInitial(normalized) ?? ContributorEntityKey(normalized);
+    }
+
     private static string ContributorRoleKey(string role, string? entity)
     {
-        var normalized = ContributorEntityKey(entity);
+        var normalized = ContributorMetadataEntityKey(entity);
         return normalized.Length == 0 ? string.Empty : $"{role}|{normalized}";
     }
 
@@ -158,7 +167,7 @@ internal static partial class AIrhythmRecommendationEngine
             }
         }
         if (compact.Length < 2 || compact.Length > 80) return string.Empty;
-        if (ContributorCompactNonEntityTokens.Contains(compact))
+        if (AIrhythmText.IsKnownContributorLabel(compact))
             return string.Empty;
         return compact;
     }
@@ -283,6 +292,23 @@ internal static partial class AIrhythmRecommendationEngine
     private static string NormalizeContributorMetadataValue(string role, string raw)
     {
         var value = (raw ?? string.Empty).Trim();
+        // A single 【character】performer pair has the same unambiguous boundary as the
+        // multiple-pair grammar. Extract only the explicitly delimited performer; never compact
+        // character and performer into a fused person. A known *different* staff role is not cast.
+        if ((role is "cast" or "voice") && value.StartsWith('【'))
+        {
+            var labelledCredit = Regex.Match(value,
+                @"^【\s*(?<label>[^【】\r\n]{1,40})\s*】\s*(?<person>[^【】\r\n]{2,80})$",
+                RegexOptions.CultureInvariant);
+            if (labelledCredit.Success)
+            {
+                var label = labelledCredit.Groups["label"].Value.Trim();
+                if (ContributorRoleMap.TryGetValue(label, out var labelledRole)
+                    && labelledRole != role)
+                    return string.Empty;
+                value = labelledCredit.Groups["person"].Value.Trim();
+            }
+        }
         // 作品識別 — A parenthesized, explicitly labelled voice credit carries reliable person identity. Resolve
         // that label before removing trailing parentheses; otherwise the character name survives and is
         // incorrectly learned as the performer.
@@ -373,7 +399,7 @@ internal static partial class AIrhythmRecommendationEngine
         }
 
         value = ContributorTrailingNoteRegex.Replace(value.Trim(), string.Empty).Trim();
-        var compact = ContributorEntityKey(value);
+        var compact = ContributorMetadataEntityKey(value);
         if (compact.Length < 2 || compact.Length > 80)
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -398,7 +424,7 @@ internal static partial class AIrhythmRecommendationEngine
 #endif
             return string.Empty;
         }
-        if (ContributorCompactNonEntityTokens.Contains(compact))
+        if (AIrhythmText.IsKnownContributorLabel(compact))
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             System.Threading.Interlocked.Increment(ref _contributorDeferredNonEntity);
@@ -408,7 +434,7 @@ internal static partial class AIrhythmRecommendationEngine
         }
         // 推薦・学習 — Apply the same evidence boundary to new metadata and historical scoring. Raw programme credits
         // are retained; never invent a split or rewrite facts.
-        if (AIrhythmText.HasAmbiguousContributorBoundary(compact))
+        if (AIrhythmText.IsUnsupportedContributorIdentity(compact, role))
         {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             System.Threading.Interlocked.Increment(ref _contributorDeferredMixedScript);
@@ -750,25 +776,32 @@ internal static partial class AIrhythmRecommendationEngine
             .Select(x => new AIrhythmContributorObservation(x.Key, x.Value)).ToArray();
     }
 
-    private static Dictionary<(int NetworkId, int TransportStreamId, int ServiceId, int EventNumber), TvAirProgramEventDto> BuildReservationEventLookup(
-        AIrhythmRuntimeSnapshot snapshot,
-        IReadOnlyList<TvAirReservationDto> userModelReservations)
+    private static Dictionary<(int NetworkId, int TransportStreamId, int ServiceId, int EventNumber, long BroadcastStart), TvAirProgramEventDto>
+        BuildReservationEventLookup(AIrhythmRuntimeSnapshot snapshot,
+            IReadOnlyList<TvAirReservationDto> userModelReservations)
     {
-        var needed = new HashSet<(int NetworkId, int TransportStreamId, int ServiceId, int EventNumber)>();
-        foreach (var reservation in userModelReservations)
-            needed.Add((reservation.NetworkId, reservation.TransportStreamId, reservation.ServiceId, reservation.EventNumber));
-
-        var lookup = new Dictionary<(int NetworkId, int TransportStreamId, int ServiceId, int EventNumber), TvAirProgramEventDto>(needed.Count);
-        if (needed.Count == 0)
-            return lookup;
+        // A broadcast event number can be reused on a different day. Match
+        // the particular reservation airing, not the first EPG row with that ID.
+        var needed = userModelReservations
+            .GroupBy(x => (x.NetworkId, x.TransportStreamId, x.ServiceId, x.EventNumber))
+            .ToDictionary(g => g.Key, g => g.Select(x => x.Start).Distinct().ToArray());
+        var lookup = new Dictionary<(int NetworkId, int TransportStreamId, int ServiceId, int EventNumber, long BroadcastStart), TvAirProgramEventDto>();
+        if (needed.Count == 0) return lookup;
 
         foreach (var eventRow in snapshot.Events)
         {
-            var key = (eventRow.NetworkId, eventRow.TransportStreamId, eventRow.ServiceId, eventRow.EventNumber);
-            if (!needed.Contains(key))
-                continue;
-            if (!lookup.TryGetValue(key, out var current) || eventRow.Start < current.Start)
-                lookup[key] = eventRow;
+            var identity = (eventRow.NetworkId, eventRow.TransportStreamId, eventRow.ServiceId, eventRow.EventNumber);
+            if (!needed.TryGetValue(identity, out var reservationStarts)) continue;
+            foreach (var start in reservationStarts)
+            {
+                var delta = Math.Abs((eventRow.Start - start).TotalMinutes);
+                if (delta > 10) continue;
+                var key = (eventRow.NetworkId, eventRow.TransportStreamId, eventRow.ServiceId,
+                    eventRow.EventNumber, start.UtcDateTime.Ticks);
+                if (!lookup.TryGetValue(key, out var current)
+                    || delta < Math.Abs((current.Start - start).TotalMinutes))
+                    lookup[key] = eventRow;
+            }
         }
         return lookup;
     }
@@ -782,6 +815,7 @@ internal static partial class AIrhythmRecommendationEngine
         // Only a single confirmed work for a given observation ID may authorize correction of old learned
         // contributions. Reused reservation IDs with conflicting works are deliberately left untouched.
         var excludedReservationOrigins = snapshot.ReservationRecords
+            .Concat(AIrhythmDataState.GetExcludedHistoricalReservationOrigins())
             .Where(AIrhythmPreferenceOriginPolicy.IsExcludedReservation)
             .Where(x => !string.IsNullOrWhiteSpace(x.ReservationId))
             .Select(x => (Id: $"reservation:{x.ReservationId}", Work: CanonicalEvidenceFacts(x, identityContext).WorkKey))
@@ -803,26 +837,50 @@ internal static partial class AIrhythmRecommendationEngine
         {
             var reservationFacts = CanonicalEvidenceFacts(reservation, identityContext);
             var genreKey = reservationFacts.GenreKey;
+            var genreEvidence = reservationFacts.GenreEvidenceSource;
             IReadOnlyList<string> terms = reservationFacts.Terms;
             TvAirProgramEventDto? matchedEvent = null;
-            if (eventByIdentity.TryGetValue((reservation.NetworkId, reservation.TransportStreamId, reservation.ServiceId, reservation.EventNumber), out var eventRow))
+            if (eventByIdentity.TryGetValue((reservation.NetworkId, reservation.TransportStreamId,
+                reservation.ServiceId, reservation.EventNumber, reservation.Start.UtcDateTime.Ticks), out var eventRow))
             {
                 matchedEvent = eventRow;
                 var eventFacts = CanonicalEvidenceFacts(eventRow, identityContext);
-                if (eventFacts.GenreKey.Length > 0) genreKey = eventFacts.GenreKey;
+                // Preserve explicit reservation evidence against an unverified
+                // EPG category. Both sources share the same assessment authority.
+                if (CanReconcileGenreLearning(genreEvidence)
+                    && CanReconcileGenreLearning(eventFacts.GenreEvidenceSource)
+                    && reservationFacts.GenreKey.Length > 0 && eventFacts.GenreKey.Length > 0
+                    && !string.Equals(reservationFacts.GenreKey, eventFacts.GenreKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    genreKey = string.Empty;
+                    genreEvidence = GenreEvidenceSource.Conflicting;
+                }
+                else if (eventFacts.GenreKey.Length > 0
+                    && (!CanReconcileGenreLearning(genreEvidence)
+                        || CanReconcileGenreLearning(eventFacts.GenreEvidenceSource)))
+                {
+                    genreKey = eventFacts.GenreKey;
+                    genreEvidence = eventFacts.GenreEvidenceSource;
+                }
+                else if (eventFacts.GenreEvidenceSource == GenreEvidenceSource.Conflicting)
+                {
+                    genreKey = string.Empty;
+                    genreEvidence = GenreEvidenceSource.Conflicting;
+                }
                 terms = eventFacts.Terms;
             }
             IReadOnlyList<AIrhythmContributorObservation> contributors = ContributorObservationsForReservation(reservation, matchedEvent, activeSearchCastRulesById);
             var axes = BehaviorEvidenceAxesForReservation(reservation, rulesById);
+            var isPromotion = TitleEvidence(reservation.ProgramTitle, identityContext).Form == "promotion"
+                || (matchedEvent is not null && TitleEvidence(matchedEvent.Title, identityContext).Form == "promotion");
             var preferenceWeights = PreferenceWeightsForReservation(reservation, rulesById);
 
             if (axes.HasBaseAxis) baseEligibleReservations++;
             if (!axes.HasBaseAxis && contributors.Count > 0) contributorOnlyReservations++;
             if (!axes.HasBaseAxis && contributors.Count == 0) provenanceDeferredReservations++;
 
-            // 作品識別 — One programme occurrence is one additive observation. Repeated episodes selected by the same
-            // rule are intentionally retained as separate facts; the same ReservationId is still one observation so
-            // retries/reloads cannot multiply it.
+            // Each airing remains a durable fact. The originating rule is one preference
+            // decision, so its aggregate learning weight is cohort-balanced at ingestion.
             var observationId = $"reservation:{reservation.ReservationId}";
             observations.Add(new AIrhythmUserModelObservation(
                 observationId,
@@ -833,7 +891,7 @@ internal static partial class AIrhythmRecommendationEngine
                 terms,
                 contributors,
                 LearnWork: axes.Work,
-                LearnGenre: axes.Genre,
+                LearnGenre: axes.Genre && !isPromotion,
                 LearnTerms: axes.Terms,
                 LearnService: axes.Service,
                 LearnHour: axes.Hour,
@@ -841,7 +899,9 @@ internal static partial class AIrhythmRecommendationEngine
                 GenreEvidenceWeight: preferenceWeights.Genre,
                 TermsEvidenceWeight: preferenceWeights.Terms,
                 ServiceEvidenceWeight: preferenceWeights.Service,
-                HourEvidenceWeight: preferenceWeights.Hour));
+                HourEvidenceWeight: preferenceWeights.Hour,
+                ReconcileGenreEvidence: !isPromotion && CanReconcileGenreLearning(genreEvidence),
+                EvidenceCohortKey: AIrhythmPreferenceOriginPolicy.AutomatedEvidenceCohort(reservation)));
         }
 
         var interestSignals = AIrhythmDataState.GetInterestSignals();
@@ -872,7 +932,7 @@ internal static partial class AIrhythmRecommendationEngine
         }
 
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-        AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_SOURCE_SUMMARY baseEligibleReservations={baseEligibleReservations} contributorOnlyReservations={contributorOnlyReservations} provenanceDeferredReservations={provenanceDeferredReservations} interests={interestSignals.Count} basePreference=causal_weighted_positive_evidence automaticReservationLearning=all_observed_axes_weighted_by_provenance searchCastContributorLearning=originating_rule_strong_metadata_incidental repeatedRuleEpisodes=independent_programme_facts programTimeSlotLearning=zero notConditionLearning=zero");
+        AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_SOURCE_SUMMARY baseEligibleReservations={baseEligibleReservations} contributorOnlyReservations={contributorOnlyReservations} provenanceDeferredReservations={provenanceDeferredReservations} interests={interestSignals.Count} basePreference=causal_weighted_positive_evidence automaticReservationLearning=one_rule_one_weak_intent searchCastContributorLearning=originating_rule_strong_metadata_incidental repeatedRuleEpisodes=durable_facts_not_independent_preferences programTimeSlotLearning=zero notConditionLearning=zero");
         var activeSearchCastRules = snapshot.KeywordRules.Where(x => x.Enabled && x.SearchCast).ToArray();
         AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_RULE_SUMMARY activeSearchCastRules={activeSearchCastRules.Length} regexRules={activeSearchCastRules.Count(x => x.UseRegex)} semantics=current_explicit_intent_scored_on_matching_extendeditems persistence=reservation_provenance_only missingMatchNotNegative=True");
         foreach (var rule in activeSearchCastRules.Take(16))
@@ -883,7 +943,12 @@ internal static partial class AIrhythmRecommendationEngine
             AIrhythmDataState.WriteDeveloperLog($"USER_MODEL_CONTRIBUTOR_RULE_SAMPLE ruleId={rule.RuleId} entity={diagnosticPattern} source=SearchCast enabled=True useRegex={rule.UseRegex} allChannels={rule.UseAllChannels} scoring=current_candidate_match provenance=persist_after_matching_reservation");
         }
 #endif
-        return AIrhythmDataState.ObserveLearnedUserModel(observations, excludedReservationOrigins);
+        // Share the same proven, service-scoped Work aliases with saved-observation reconciliation.
+        var verifiedWorkAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (aliasKey, canonical) in identityContext.WorkAliases)
+            verifiedWorkAliases.TryAdd($"{aliasKey.ServiceIdentity}|{aliasKey.WorkKey}", canonical);
+        return AIrhythmDataState.ObserveLearnedUserModel(
+            observations, excludedReservationOrigins, verifiedWorkAliases);
     }
 
     private static double MaxLearnedWeight(Dictionary<string, double>? weights)
@@ -1135,6 +1200,35 @@ internal static partial class AIrhythmRecommendationEngine
         return result;
     }
 
+    // 推薦・学習 — Positive behavior confidence is continuous. A single recording contributes
+    // evidence, never an unconditional genre-wide acceptance. Group correlated terms/genre and
+    // work signals before combining them. Service/time requires semantic corroboration and
+    // can never become a standalone user preference or an automatic reservation.
+    private static AIrhythmEvidenceAssessment AssessBehaviorEvidence(
+        double workSupport, double genreSupport, double termsSupport,
+        double genreInterestSupport, double explicitSupport,
+        double serviceSupport, double hourSupport, double effectiveObservationCount)
+    {
+        var uncertainty = Math.Sqrt(1.0d + Math.Max(0.0d, effectiveObservationCount));
+        var contentSupport = Math.Max(Math.Max(genreSupport, termsSupport), genreInterestSupport);
+        var semanticSupport = Math.Max(workSupport, contentSupport) + explicitSupport;
+        var confidence = semanticSupport / (semanticSupport + uncertainty);
+        var contextSupport = Math.Sqrt(Math.Max(0.0d, serviceSupport * hourSupport));
+        var contextConfidence = contextSupport / (contextSupport + uncertainty);
+        return new(
+            1.0d - (1.0d - confidence) * (1.0d - contextConfidence * confidence),
+            confidence);
+    }
+
+    // 推薦・学習 — Available EPG genres express uncertainty about what may appear, not
+    // presumed likes. The availability prior fades as independently observed behavior grows.
+    private static double EstimateGenrePreference(
+        double observedGenreWeight, double observedTotalWeight,
+        double availableGenreFrequency, double availabilityPriorMass)
+        => (Math.Max(0.0d, observedGenreWeight)
+            + availabilityPriorMass * Math.Clamp(availableGenreFrequency, 0.0d, 1.0d))
+           / Math.Max(double.Epsilon, observedTotalWeight + availabilityPriorMass);
+
     private static IReadOnlyList<AIrhythmRecommendation> Score(AIrhythmRuntimeSnapshot snapshot, AIrhythmEvidenceIdentityContext identityContext)
     {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -1175,8 +1269,8 @@ internal static partial class AIrhythmRecommendationEngine
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var scoreSetupAfterHistory = GC.GetAllocatedBytesForCurrentThread();
 #endif
-        var genreCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var genreTotalCount = 0;
+        var genreCounts = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        var genreTotalCount = 0.0d;
         var interestSignals = AIrhythmDataState.GetInterestSignals();
         var now = DateTimeOffset.Now;
         var learnedUserModel = BuildOrUpdateLearnedUserModel(snapshot, identityContext, rulesById, ruleIndices.SearchCastById);
@@ -1202,9 +1296,9 @@ internal static partial class AIrhythmRecommendationEngine
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.ReportEvidenceCalibrationMemory();
 #endif
-        var learnedUserModelMaturity = learnedUserModel.ObservationCount <= 0
+        var learnedUserModelMaturity = learnedUserModel.EffectiveEvidenceCount <= 0
             ? 0.0d
-            : learnedUserModel.ObservationCount / (learnedUserModel.ObservationCount + 100.0d);
+            : learnedUserModel.EffectiveEvidenceCount / (learnedUserModel.EffectiveEvidenceCount + 100.0d);
         // 作品識別 — Interest signals are capped at 24. Normalize the stable signal side once per Score run and
         // reuse the same SeriesKey/GenreMatches semantics for all candidates.
         var preparedInterestSignals = interestSignals
@@ -1226,7 +1320,7 @@ internal static partial class AIrhythmRecommendationEngine
             string Title,
             int HistorySeriesCount,
             double ReservationSeriesWeight,
-            int GenreCount,
+            double GenreCount,
             double GenreShare,
             double GenreComponent,
             double SeriesComponent,
@@ -1235,10 +1329,10 @@ internal static partial class AIrhythmRecommendationEngine
             double HourComponent,
             double InterestComponent,
             double PreferredComponent,
-            double ScoreBeforeCap,
-            int ConfidenceCap,
-            int RawScore,
-            bool Convincing)>();
+            double ScoreBeforeCalibration,
+            double EvidenceConfidence,
+            double EvidenceRelevance,
+            int RawScore)>();
 #endif
 
         void Add<TKey>(Dictionary<TKey, double> map, TKey key, double value) where TKey : notnull
@@ -1254,6 +1348,10 @@ internal static partial class AIrhythmRecommendationEngine
         var scoreBehaviorBeforeHistory = GC.GetAllocatedBytesForCurrentThread();
 #endif
         var seenBehaviorCausalKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var recordedGenreCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var recordedServiceWeights = new Dictionary<AIrhythmServiceIdentity, double>();
+        var recordedHourWeights = new Dictionary<int, double>();
+        var recordedTermKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (var historyIndex = 0; historyIndex < historyEvidence.Count; historyIndex++)
         {
             var item = historyEvidence[historyIndex];
@@ -1267,9 +1365,21 @@ internal static partial class AIrhythmRecommendationEngine
             // 処理条件 — Stored facts never decay or turn negative. Each distinct recorded programme contributes one
             // point to every observable positive axis.
             const double weight = 1.0d;
-            if (axes.Service && item.ServiceIdentity.IsValid) Add(serviceWeights, item.ServiceIdentity, weight);
-            if (axes.Hour) Add(hourWeights, item.Hour, weight);
-            if (axes.Terms) foreach (var token in item.Terms) Add(termWeights, token, weight);
+            if (axes.Service && item.ServiceIdentity.IsValid)
+            {
+                Add(serviceWeights, item.ServiceIdentity, weight);
+                Add(recordedServiceWeights, item.ServiceIdentity, weight);
+            }
+            if (axes.Hour)
+            {
+                Add(hourWeights, item.Hour, weight);
+                Add(recordedHourWeights, item.Hour, weight);
+            }
+            if (axes.Terms) foreach (var token in item.Terms)
+            {
+                Add(termWeights, token, weight);
+                recordedTermKeys.Add(token);
+            }
             if (axes.Work)
             {
                 Increment(seriesHistoryCounts, item.SeriesKey);
@@ -1279,16 +1389,21 @@ internal static partial class AIrhythmRecommendationEngine
             if (axes.Genre && !string.IsNullOrWhiteSpace(item.GenreKey))
             {
                 genreCounts[item.GenreKey] = genreCounts.TryGetValue(item.GenreKey, out var count) ? count + 1 : 1;
+                recordedGenreCounts[item.GenreKey] = recordedGenreCounts.TryGetValue(item.GenreKey, out var recorded) ? recorded + 1 : 1;
                 genreTotalCount++;
             }
         }
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var scoreBehaviorAfterHistory = GC.GetAllocatedBytesForCurrentThread();
 #endif
+        var reservationEvidenceScales = AIrhythmPreferenceOriginPolicy.ReservationEvidenceScales(snapshot.Reservations);
         foreach (var item in snapshot.Reservations)
         {
+            if (string.IsNullOrWhiteSpace(item.ReservationId)
+                || !reservationEvidenceScales.TryGetValue(item.ReservationId, out var cohortScale))
+                continue;
             var facts = CanonicalEvidenceFacts(item, identityContext);
-            var reservationWeight = ReservationEvidenceWeight(item);
+            var reservationWeight = ReservationEvidenceWeight(item) * cohortScale;
             if (reservationWeight <= 0) continue;
             var axes = BehaviorEvidenceAxesForReservation(item, rulesById);
             var causalKey = AIrhythmDataState.ReservationEvidenceCausalIdentity(item);
@@ -1314,14 +1429,27 @@ internal static partial class AIrhythmRecommendationEngine
             }
             if (axes.Genre && !string.IsNullOrWhiteSpace(facts.GenreKey))
             {
-                genreCounts[facts.GenreKey] = genreCounts.TryGetValue(facts.GenreKey, out var count) ? count + 1 : 1;
-                genreTotalCount++;
+                genreCounts[facts.GenreKey] = genreCounts.TryGetValue(facts.GenreKey, out var count)
+                    ? count + reservationWeight : reservationWeight;
+                genreTotalCount += reservationWeight;
             }
         }
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         var scoreSetupAfterBehaviorWeights = GC.GetAllocatedBytesForCurrentThread();
 #endif
-        var genreTotal = Math.Max(1, genreTotalCount);
+        // 推薦・学習 — An EPG's available genres form an availability prior, not preference evidence.
+        // The prior prevents one first recording from making every other genre's likelihood collapse.
+        // Its mass grows sublinearly; independent accumulated behavior eventually dominates it.
+        var availableGenreCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var availableGenreTotal = 0;
+        foreach (var broadcastEvent in snapshot.Events)
+        {
+            var family = RecommendationGenreFamily(broadcastEvent.Genre);
+            if (family.Length == 0) continue;
+            availableGenreCounts[family] = availableGenreCounts.TryGetValue(family, out var value) ? value + 1 : 1;
+            availableGenreTotal++;
+        }
+        var availabilityPriorMass = Math.Sqrt(availableGenreCounts.Count + genreTotalCount);
         foreach (var tuner in snapshot.Tuners.Where(x =>
             x.IsInUse && string.Equals(x.UsageKind, "Viewing", StringComparison.OrdinalIgnoreCase)))
         {
@@ -1397,7 +1525,6 @@ internal static partial class AIrhythmRecommendationEngine
         var candidateLoopVisited = 0;
         var candidateLoopExcluded = 0;
         var candidateLoopDeduped = 0;
-        var candidateLoopBelowMinimum = 0;
         var evidenceVectorCheckCount = 0;
         var evidenceVectorMaxDelta = 0.0d;
         long evidenceVectorAllocatedBytes = 0;
@@ -1600,9 +1727,13 @@ internal static partial class AIrhythmRecommendationEngine
             }
             var genreKey = facts.GenreKey;
             var genreCount = FindGenreEvidence(genreCounts, genreKey);
-            var genreShare = genreCount / (double)genreTotal;
+            var availableFamily = RecommendationGenreFamily(genreKey);
+            var availabilityFrequency = availableGenreTotal > 0
+                && availableGenreCounts.TryGetValue(availableFamily, out var availableCount)
+                ? (double)availableCount / availableGenreTotal : 0.0d;
+            var genreShare = EstimateGenrePreference(
+                genreCount, genreTotalCount, availabilityFrequency, availabilityPriorMass);
             var hasSeriesIdentityEvidence = historySeriesCount > 0 || reservationSeriesWeight > 0;
-            var hasStrongSeriesEvidence = historySeriesCount > 0 || reservationSeriesWeight >= 1.0;
             var genreComponentScore = 0.0;
             var seriesComponentScore = 0.0;
             var termComponentScore = 0.0;
@@ -1613,12 +1744,16 @@ internal static partial class AIrhythmRecommendationEngine
 
             if (genreCount > 0)
             {
-                var genreEvidence = Math.Min(1.0, genreCount / 6.0);
+                var genreEvidence = genreCount / Math.Max(double.Epsilon, genreCount + availabilityPriorMass);
                 var genreComponent = Math.Min(20.0, 20.0 * Math.Sqrt(genreShare) * (0.55 + 0.45 * genreEvidence));
                 score += genreComponent;
                 genreComponentScore = genreComponent;
-                if (genreShare >= 0.12) reasons.Add("よく録るジャンル");
-                else if (genreShare >= 0.04) reasons.Add("録画傾向にあるジャンル");
+                var recordedGenreCount = recordedGenreCounts.TryGetValue(genreKey, out var recordedExact)
+                    ? recordedExact : recordedGenreCounts.Where(x => GenreMatches(x.Key, genreKey))
+                        .Select(x => x.Value).DefaultIfEmpty(0).Max();
+                if (recordedGenreCount > 1) reasons.Add("よく録るジャンル");
+                else if (recordedGenreCount > 0) reasons.Add("録画したジャンルと近い");
+                else reasons.Add("予約しているジャンルと近い");
             }
 
             if (historySeriesCount > 0)
@@ -1648,12 +1783,14 @@ internal static partial class AIrhythmRecommendationEngine
             // 処理条件 — Retain the existing OrdinalIgnoreCase substring semantics and top-3-by-weight contract, but
             // avoid a Where -> OrderByDescending -> Take -> ToArray allocation chain for every candidate.
             var matchedTermCount = 0;
+            var matchedRecordedTerm = false;
             var topTermWeight1 = double.NegativeInfinity;
             var topTermWeight2 = double.NegativeInfinity;
             var topTermWeight3 = double.NegativeInfinity;
             void AccountMatchingTerm(KeyValuePair<string, double> termWeight)
             {
                 matchedTermCount++;
+                if (recordedTermKeys.Contains(termWeight.Key)) matchedRecordedTerm = true;
                 var value = termWeight.Value;
                 if (value > topTermWeight1)
                 {
@@ -1715,7 +1852,7 @@ internal static partial class AIrhythmRecommendationEngine
                 if (matchedTermCount > 2) topTermScore += Math.Min(6, topTermWeight3 * 0.75);
                 termComponentScore = Math.Min(12, topTermScore);
                 score += termComponentScore;
-                reasons.Add("録画・予約の題名傾向と近い");
+                reasons.Add(matchedRecordedTerm ? "録画・予約の題名傾向と近い" : "予約した番組の題名傾向と近い");
             }
 
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -1728,14 +1865,18 @@ internal static partial class AIrhythmRecommendationEngine
             {
                 serviceComponentScore = Math.Min(6, Math.Log2(serviceWeight + 1) * 2.4);
                 score += serviceComponentScore;
-                if (serviceWeight >= 5) reasons.Add("よく録る放送局");
+                if (recordedServiceWeights.TryGetValue(itemService, out var recordedServiceWeight)
+                    && recordedServiceWeight > 0) reasons.Add("録画した放送局と近い");
+                else if (serviceWeight >= 0.1d) reasons.Add("予約した放送局と近い");
             }
             var hourWeight = 0.0d;
             if (hourWeights.TryGetValue(facts.Hour, out hourWeight))
             {
                 hourComponentScore = Math.Min(5, Math.Log2(hourWeight + 1) * 1.8);
                 score += hourComponentScore;
-                if (hourWeight >= 5) reasons.Add("よく録る時間帯");
+                if (recordedHourWeights.TryGetValue(facts.Hour, out var recordedHourWeight)
+                    && recordedHourWeight > 0) reasons.Add("録画した時間帯と近い");
+                else if (hourWeight >= 0.1d) reasons.Add("予約した時間帯と近い");
             }
 
             var exactInterest = false;
@@ -1800,49 +1941,14 @@ internal static partial class AIrhythmRecommendationEngine
 
             // 処理条件 — 放送までの近さは番組への嗜好ではない。嗜好スコアには混ぜず、必要な棚・検索側で時刻条件として扱う。
 
-            // 録画実績・復旧 — 録画実績がないジャンルは、別の強い根拠がない限り高得点にしない。 発見枠へ出すことと嗜好スコアは分離し、未知ジャンルの点数を偽装しない。
-            var confidenceCap = 98;
-            if (genreCount == 0 && !hasStrongSeriesEvidence && !preferredHit && !exactInterest)
-                confidenceCap = 44;
-            else if (genreCount <= 1 && genreShare < 0.02 && !hasStrongSeriesEvidence && !preferredHit)
-                confidenceCap = 55;
-            else if (genreShare < 0.05 && historySeriesCount == 0 && !preferredHit)
-                confidenceCap = 72;
-
-            var contentEvidence = 0;
-            if (genreShare >= 0.12) contentEvidence++;
-            if (matchedTermCount > 0) contentEvidence++;
-            if (interestScore > 0) contentEvidence++;
-            var contextualEvidence = 0;
-            if (itemService.IsValid && serviceWeights.TryGetValue(itemService, out var trustServiceWeight) && trustServiceWeight >= 5) contextualEvidence++;
-            if (hourWeights.TryGetValue(facts.Hour, out var trustHourWeight) && trustHourWeight >= 5) contextualEvidence++;
-
-            // 処理条件 — 局・時間帯は「それらしい」補助材料にはなるが、それだけで納得候補にはしない。 番組内容側の根拠が複数ある、または内容根拠に利用傾向が重なる場合だけ納得側へ寄せる。
-            var isConvincing = historySeriesCount > 0
-                || reservationSeriesWeight >= 1.0
-                || exactInterest
-                || preferredHit
-                || contentEvidence >= 2
-                || (contentEvidence >= 1 && contextualEvidence >= 1);
-            var hasContentConnection = genreCount > 0 || matchedTermCount > 0 || interestScore > 0 || preferredHit;
-            var isPlausibleDiscovery = !isConvincing && hasContentConnection && score >= 20;
+            // 推薦・学習 — All preference evidence, including verified contributor links,
+            // is evaluated exactly once after the common learned-affinity projection.
 
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             var candidatePhaseAfterContextInterest = GC.GetAllocatedBytesForCurrentThread();
             candidateContextInterestBytes += candidatePhaseAfterContextInterest - candidatePhaseAfterTerms;
 #endif
 
-            // 推薦・学習 — 偏差表示も既存の信頼度上限を共有し、丸めだけを行わない。 これにより推薦判定と表示スコアで評価基準が分岐しない。
-            var deviationRawScore = Math.Min(score, confidenceCap);
-            var rawScore = Math.Clamp((int)Math.Round(score), 0, confidenceCap);
-            if (rawScore < 8)
-            {
-#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-                candidateLocalExternalBytes += GC.GetAllocatedBytesForCurrentThread() - candidatePhaseAfterContextInterest;
-                candidateLoopBelowMinimum++;
-#endif
-                continue;
-            }
             var localContinuityEvaluation = EvaluateLocalContinuityFromCanonicalFacts(
                 item,
                 localEvidenceState.ContinuitySources,
@@ -1862,24 +1968,6 @@ internal static partial class AIrhythmRecommendationEngine
             var broadcast = itemService.IsValid && channelMap.TryGetValue(itemService, out var channel) ? channel.BroadcastType : string.Empty;
             var identity = new AIrhythmEventIdentity(item.NetworkId, item.TransportStreamId, item.ServiceId, item.EventNumber, item.Start);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-            baseScoreAuditRows.Add((
-                identity,
-                item.Title,
-                historySeriesCount,
-                reservationSeriesWeight,
-                genreCount,
-                genreShare,
-                genreComponentScore,
-                seriesComponentScore,
-                termComponentScore,
-                serviceComponentScore,
-                hourComponentScore,
-                interestComponentScore,
-                preferredComponentScore,
-                score,
-                confidenceCap,
-                rawScore,
-                isConvincing));
             var candidatePhaseAfterBroadcastIdentity = GC.GetAllocatedBytesForCurrentThread();
             candidateBroadcastIdentityBytes += candidatePhaseAfterBroadcastIdentity - candidatePhaseAfterLocalShadow;
 #endif
@@ -1907,11 +1995,12 @@ internal static partial class AIrhythmRecommendationEngine
                 out var localDominantFamily);
             if (localEvidenceAdjustmentValue > 0.0d)
             {
+                localEvidenceState.WorkAggregates.TryGetValue(localContinuityEvaluation.WorkKey, out var localSource);
+                var hasRecordedEvidence = localSource is not null && localSource.RecordingCount > 0;
                 reasons.Insert(0, localDominantFamily == AIrhythmLocalEvidenceFamily.ContinuityFamily
-                    ? "録画・予約した作品の続き"
-                    : "継続して録画・予約している作品");
+                    ? hasRecordedEvidence ? "録画した作品の続き" : "予約した作品の続き"
+                    : hasRecordedEvidence ? "継続して録画している作品" : "予約している作品と関連");
             }
-            var adjustedDeviationRawScore = deviationRawScore + externalEvidenceAdjustmentValue + localEvidenceAdjustmentValue;
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             var candidateBeforeContributorExtraction = GC.GetAllocatedBytesForCurrentThread();
 #endif
@@ -1921,6 +2010,31 @@ internal static partial class AIrhythmRecommendationEngine
 #endif
             var learnedAffinity = LearnedUserAffinityBreakdown(learnedAffinityContext, facts, contributorKeys);
             var learnedUserAffinity = learnedAffinity.Overall;
+            // 推薦・学習 — Production uses the same learned observation ledger for all
+            // semantic evidence. A contributor or learned work match is not discarded
+            // merely because the programme has no genre or title-term match.
+            var assessment = AssessBehaviorEvidence(
+                Math.Max(Math.Max(historySeriesCount, reservationSeriesWeight), learnedAffinity.Identity),
+                Math.Max(genreCount, learnedAffinity.Genre),
+                Math.Max(Math.Max(0.0d, termComponentScore / Math.Max(1.0d, evidenceVector.ContentStrength)), learnedAffinity.Terms),
+                exactInterest ? 0.0d : interestScore / (1.0d + interestScore),
+                (preferredHit ? 1.0d : 0.0d) + (exactInterest ? 1.0d : 0.0d),
+                serviceWeight, hourWeight, learnedUserModel.EffectiveEvidenceCount);
+            var evidenceConfidence = assessment.Confidence;
+            var evidenceRelevance = assessment.Relevance;
+            var deviationRawScore = 10.0d + (score - 10.0d) * evidenceRelevance;
+            var rawScore = Math.Clamp((int)Math.Round(deviationRawScore), 0, 98);
+            var adjustedDeviationRawScore = deviationRawScore + externalEvidenceAdjustmentValue + localEvidenceAdjustmentValue;
+            if (learnedAffinity.Contributor > 0.0d && !reasons.Any(reason => reason.Contains("人物", StringComparison.Ordinal)))
+                reasons.Add("出演者・制作陣との接点");
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+            baseScoreAuditRows.Add((
+                identity, item.Title, historySeriesCount, reservationSeriesWeight,
+                genreCount, genreShare, genreComponentScore, seriesComponentScore,
+                termComponentScore, serviceComponentScore, hourComponentScore,
+                interestComponentScore, preferredComponentScore, score,
+                evidenceConfidence, evidenceRelevance, rawScore));
+#endif
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             var candidateAfterLearnedAffinity = GC.GetAllocatedBytesForCurrentThread();
 #endif
@@ -2019,7 +2133,7 @@ internal static partial class AIrhythmRecommendationEngine
             candidateLocalAggregateAdjustmentBytes += candidatePhaseAfterLocalExternal - candidatePhaseAfterExternalProjection;
             candidateLocalExternalBytes += candidatePhaseAfterLocalExternal - candidatePhaseAfterContextInterest;
 #endif
-            scored.Add(new(item.Title, item.ServiceName, broadcast, item.Genre ?? string.Empty, item.Start, rawScore, TakeFirstFourDistinctReasons(reasons), seriesKey, identity, isConvincing, isPlausibleDiscovery, rawScore, adjustedDeviationRawScore, externalEvidenceSummary, externalEvidenceEvaluationFlags, externalEvidenceConfidenceGate, externalEvidenceAdjustmentCandidate, externalEvidenceAdjustmentKind, externalEvidenceAdjustmentStrength, externalEvidenceSupportingVerdictReason, externalEvidenceShadowAdjustmentValue, externalEvidenceAdjustmentValue, learnedUserAffinity, 0.0d, learnedUserModelMaturity));
+            scored.Add(new(item.Title, item.ServiceName, broadcast, genreKey, item.Start, rawScore, TakeFirstFourDistinctReasons(reasons), seriesKey, identity, evidenceRelevance, evidenceConfidence, rawScore, adjustedDeviationRawScore, externalEvidenceSummary, externalEvidenceEvaluationFlags, externalEvidenceConfidenceGate, externalEvidenceAdjustmentCandidate, externalEvidenceAdjustmentKind, externalEvidenceAdjustmentStrength, externalEvidenceSupportingVerdictReason, externalEvidenceShadowAdjustmentValue, externalEvidenceAdjustmentValue, learnedUserAffinity, 0.0d, learnedUserModelMaturity));
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
             candidateRecommendationBytes += GC.GetAllocatedBytesForCurrentThread() - candidatePhaseAfterLocalExternal;
 #endif
@@ -2201,7 +2315,7 @@ internal static partial class AIrhythmRecommendationEngine
             if (recommendation.ExternalEvidenceShadowAdjustmentValue > shadowAdjustmentValueMax) shadowAdjustmentValueMax = recommendation.ExternalEvidenceShadowAdjustmentValue;
             if (Math.Abs(recommendation.ExternalEvidenceAdjustmentValue) > 0.000001d) adjustmentValueNonZero++;
         }
-        AIrhythmDataState.WriteDeveloperLog($"external evidence recommendation projection total={scored.Count} noEvidence={projectionNoEvidence} unresolved={projectionUnresolved} supported={projectionSupported} conflicting={projectionConflicting} evaluationFlagNone={evaluationFlagNone} evaluationFlagUnresolved={evaluationFlagUnresolved} evaluationFlagSupported={evaluationFlagSupported} evaluationFlagConflicting={evaluationFlagConflicting} evaluationFlagMismatch={evaluationFlagMismatch} confidenceGateNotApplicable={confidenceGateNotApplicable} confidenceGateNeutral={confidenceGateNeutral} confidenceGateAllowed={confidenceGateAllowed} confidenceGateBlocked={confidenceGateBlocked} confidenceGateMismatch={confidenceGateMismatch} adjustmentCandidateNone={adjustmentCandidateNone} adjustmentCandidateEligible={adjustmentCandidateEligible} adjustmentCandidateMismatch={adjustmentCandidateMismatch} adjustmentKindNone={adjustmentKindNone} adjustmentKindIdentity={adjustmentKindIdentity} adjustmentKindEpisode={adjustmentKindEpisode} adjustmentKindRelation={adjustmentKindRelation} adjustmentKindMismatch={adjustmentKindMismatch} adjustmentStrengthNone={adjustmentStrengthNone} adjustmentStrengthWeak={adjustmentStrengthWeak} adjustmentStrengthModerate={adjustmentStrengthModerate} adjustmentStrengthMismatch={adjustmentStrengthMismatch} shadowAdjustmentValueNonZero={shadowAdjustmentValueNonZero} shadowAdjustmentValueMismatch={shadowAdjustmentValueMismatch} shadowAdjustmentValueTotal={shadowAdjustmentValueTotal:0.00} shadowAdjustmentValueMax={shadowAdjustmentValueMax:0.00} adjustmentValueNonZero={adjustmentValueNonZero} evaluationConsumer=read_only confidenceGateConsumer=read_only adjustmentCandidateConsumer=read_only adjustmentKindConsumer=read_only adjustmentStrengthConsumer=read_only adjustmentStrengthPolicy=identity_weak_episode_moderate_relation_weak_reserved shadowAdjustmentValuePolicy=raw_coordinate_applied_weak_0.25_moderate_0.75_supported_only shadowCoordinate=DeviationRawScore_post_confidence_cap_pre_deviation_normalization displayedScoreAdditivePath=retired adjustmentValuePolicy=raw_coordinate_supported_only recommendationMutation=supported_only scoreMutation=supported_only reasonMutation=False orderingMutation=score_derived diagnosticsAggregation=single_pass");
+        AIrhythmDataState.WriteDeveloperLog($"external evidence recommendation projection total={scored.Count} noEvidence={projectionNoEvidence} unresolved={projectionUnresolved} supported={projectionSupported} conflicting={projectionConflicting} evaluationFlagNone={evaluationFlagNone} evaluationFlagUnresolved={evaluationFlagUnresolved} evaluationFlagSupported={evaluationFlagSupported} evaluationFlagConflicting={evaluationFlagConflicting} evaluationFlagMismatch={evaluationFlagMismatch} confidenceGateNotApplicable={confidenceGateNotApplicable} confidenceGateNeutral={confidenceGateNeutral} confidenceGateAllowed={confidenceGateAllowed} confidenceGateBlocked={confidenceGateBlocked} confidenceGateMismatch={confidenceGateMismatch} adjustmentCandidateNone={adjustmentCandidateNone} adjustmentCandidateEligible={adjustmentCandidateEligible} adjustmentCandidateMismatch={adjustmentCandidateMismatch} adjustmentKindNone={adjustmentKindNone} adjustmentKindIdentity={adjustmentKindIdentity} adjustmentKindEpisode={adjustmentKindEpisode} adjustmentKindRelation={adjustmentKindRelation} adjustmentKindMismatch={adjustmentKindMismatch} adjustmentStrengthNone={adjustmentStrengthNone} adjustmentStrengthWeak={adjustmentStrengthWeak} adjustmentStrengthModerate={adjustmentStrengthModerate} adjustmentStrengthMismatch={adjustmentStrengthMismatch} shadowAdjustmentValueNonZero={shadowAdjustmentValueNonZero} shadowAdjustmentValueMismatch={shadowAdjustmentValueMismatch} shadowAdjustmentValueTotal={shadowAdjustmentValueTotal:0.00} shadowAdjustmentValueMax={shadowAdjustmentValueMax:0.00} adjustmentValueNonZero={adjustmentValueNonZero} evaluationConsumer=read_only confidenceGateConsumer=read_only adjustmentCandidateConsumer=read_only adjustmentKindConsumer=read_only adjustmentStrengthConsumer=read_only adjustmentStrengthPolicy=identity_weak_episode_moderate_relation_weak_reserved shadowAdjustmentValuePolicy=raw_coordinate_applied_weak_0.25_moderate_0.75_supported_only shadowCoordinate=DeviationRawScore_post_evidence_calibration_pre_deviation_normalization displayedScoreAdditivePath=retired adjustmentValuePolicy=raw_coordinate_supported_only recommendationMutation=supported_only scoreMutation=supported_only reasonMutation=False orderingMutation=score_derived diagnosticsAggregation=single_pass");
         var scoreAllocatedAfterPreDeviationDiagnostics = GC.GetAllocatedBytesForCurrentThread();
 #endif
         var learnedAffinityMean = scored.Count == 0 ? 0.0d : scored.Average(x => x.LearnedUserAffinity);
@@ -2297,7 +2411,7 @@ internal static partial class AIrhythmRecommendationEngine
             if (!baseScoreAuditByIdentity.TryGetValue(auditKey, out var audit))
                 continue;
             AIrhythmDataState.WriteDeveloperLog(
-                $"BASE_SCORE_COMPONENT_AUDIT rank={ranked.Rank} displayScore={ranked.Item.Score} title={audit.Title} historySeriesCount={audit.HistorySeriesCount} reservationSeriesWeight={audit.ReservationSeriesWeight:0.00} genreCount={audit.GenreCount} genreShare={audit.GenreShare:0.0000} components=base:10.00,genre:{audit.GenreComponent:0.00},series:{audit.SeriesComponent:0.00},terms:{audit.TermComponent:0.00},service:{audit.ServiceComponent:0.00},hour:{audit.HourComponent:0.00},interest:{audit.InterestComponent:0.00},preferred:{audit.PreferredComponent:0.00} scoreBeforeCap={audit.ScoreBeforeCap:0.00} confidenceCap={audit.ConfidenceCap} rawScore={audit.RawScore} convincing={audit.Convincing} policy=observe_only_no_score_mutation");
+                $"BASE_SCORE_COMPONENT_AUDIT rank={ranked.Rank} displayScore={ranked.Item.Score} title={audit.Title} historySeriesCount={audit.HistorySeriesCount} reservationSeriesWeight={audit.ReservationSeriesWeight:0.00} genreCount={audit.GenreCount} genreShare={audit.GenreShare:0.0000} components=base:10.00,genre:{audit.GenreComponent:0.00},series:{audit.SeriesComponent:0.00},terms:{audit.TermComponent:0.00},service:{audit.ServiceComponent:0.00},hour:{audit.HourComponent:0.00},interest:{audit.InterestComponent:0.00},preferred:{audit.PreferredComponent:0.00} scoreBeforeCalibration={audit.ScoreBeforeCalibration:0.00} evidenceConfidence={audit.EvidenceConfidence:0.000} evidenceRelevance={audit.EvidenceRelevance:0.000} rawScore={audit.RawScore} policy=continuous_evidence_no_fixed_admission");
         }
         AIrhythmDataState.WriteDeveloperLog(
             $"BASE_SCORE_COMPONENT_AUDIT_SUMMARY logged={Math.Min(24, deviationScored.Count)} componentPolicy=factual_decomposition_only scoreMutation=False");
@@ -2368,10 +2482,10 @@ internal static partial class AIrhythmRecommendationEngine
         // summaries verify that each applied family stays aligned with the same canonical evaluation used by
         // scoring; correlated evidence is never added twice.
         AIrhythmDataState.WriteDeveloperLog(
-            $"LOCAL_CONTINUITY_APPLIED_SUMMARY strongRaw=0.50 moderateRaw=0.25 candidates={localContinuityApplied} interestApplied={localInterestApplied} coordinate=DeviationRawScore_post_confidence_cap_pre_deviation_normalization");
+            $"LOCAL_CONTINUITY_APPLIED_SUMMARY strongRaw=0.50 moderateRaw=0.25 candidates={localContinuityApplied} interestApplied={localInterestApplied} coordinate=DeviationRawScore_post_evidence_calibration_pre_deviation_normalization");
 
         AIrhythmDataState.WriteDeveloperLog(
-            $"LOCAL_INTEREST_APPLIED_SUMMARY strongRaw=0.250 moderateRaw=0.125 weakRaw=0.000 candidates={localInterestApplied} continuityBaseline=applied coordinate=DeviationRawScore_post_confidence_cap_pre_deviation_normalization");
+            $"LOCAL_INTEREST_APPLIED_SUMMARY strongRaw=0.250 moderateRaw=0.125 weakRaw=0.000 candidates={localInterestApplied} continuityBaseline=applied coordinate=DeviationRawScore_post_evidence_calibration_pre_deviation_normalization");
         var scoreAllocatedAfterPostDeviationDiagnostics = GC.GetAllocatedBytesForCurrentThread();
 #endif
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -2383,13 +2497,13 @@ internal static partial class AIrhythmRecommendationEngine
         var postDeviationDiagnosticsBytes = scoreAllocatedAfterPostDeviationDiagnostics - scoreAllocatedAfterDeviation;
         var candidateSubphaseAccountedBytes = candidateCanonicalTextFilterBytes + candidateSeriesGenreBytes + candidateTermsBytes + candidateContextInterestBytes + candidateLocalExternalBytes + candidateRecommendationBytes;
         AIrhythmDataState.WriteDeveloperLog(
-            $"SCORE_CANDIDATE_ALLOCATION_PHASES canonicalTextFilterBytes={candidateCanonicalTextFilterBytes} seriesGenreBytes={candidateSeriesGenreBytes} termsBytes={candidateTermsBytes} contextInterestBytes={candidateContextInterestBytes} localExternalBytes={candidateLocalExternalBytes} recommendationBytes={candidateRecommendationBytes} accountedBytes={candidateSubphaseAccountedBytes} candidateLoopBytes={candidateLoopBytes} unaccountedBytes={candidateLoopBytes - candidateSubphaseAccountedBytes} visited={candidateLoopVisited} excluded={candidateLoopExcluded} deduped={candidateLoopDeduped} belowMinimum={candidateLoopBelowMinimum} scored={deviationScored.Count} scope=current_thread_exact checkpoints=aggregate_only_no_midphase_logging semantics=unchanged");
+            $"SCORE_CANDIDATE_ALLOCATION_PHASES canonicalTextFilterBytes={candidateCanonicalTextFilterBytes} seriesGenreBytes={candidateSeriesGenreBytes} termsBytes={candidateTermsBytes} contextInterestBytes={candidateContextInterestBytes} localExternalBytes={candidateLocalExternalBytes} recommendationBytes={candidateRecommendationBytes} accountedBytes={candidateSubphaseAccountedBytes} candidateLoopBytes={candidateLoopBytes} unaccountedBytes={candidateLoopBytes - candidateSubphaseAccountedBytes} visited={candidateLoopVisited} excluded={candidateLoopExcluded} deduped={candidateLoopDeduped} scored={deviationScored.Count} scope=current_thread_exact checkpoints=aggregate_only_no_midphase_logging semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
             $"SCORE_CANDIDATE_CANONICAL_DETAIL canonicalFactsBytes={candidateCanonicalFactsBytes} textBuildBytes={candidateTextBuildBytes} excludedFilterBytes={candidateExcludedFilterBytes} parentBytes={candidateCanonicalTextFilterBytes} accountedBytes={candidateCanonicalFactsBytes + candidateTextBuildBytes + candidateExcludedFilterBytes} unaccountedBytes={candidateCanonicalTextFilterBytes - (candidateCanonicalFactsBytes + candidateTextBuildBytes + candidateExcludedFilterBytes)} visited={candidateLoopVisited} excluded={candidateLoopExcluded} scope=current_thread_exact semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
             $"SCORE_CANONICAL_FACTS_INTERNAL preEvaluationTitleBytes={identityContext.CanonicalPreEvaluationTitleBytes} localWorkKeyBytes={identityContext.CanonicalLocalWorkKeyBytes} aliasResolutionBytes={identityContext.CanonicalAliasResolutionBytes} genreBytes={identityContext.CanonicalGenreBytes} tokensBytes={identityContext.CanonicalTokensBytes} replayBytes={identityContext.CanonicalReplayBytes} accountedBytes={identityContext.CanonicalPreEvaluationTitleBytes + identityContext.CanonicalLocalWorkKeyBytes + identityContext.CanonicalAliasResolutionBytes + identityContext.CanonicalGenreBytes + identityContext.CanonicalTokensBytes + identityContext.CanonicalReplayBytes} parentCanonicalFactsBytes={candidateCanonicalFactsBytes} unaccountedBytes={candidateCanonicalFactsBytes - (identityContext.CanonicalPreEvaluationTitleBytes + identityContext.CanonicalLocalWorkKeyBytes + identityContext.CanonicalAliasResolutionBytes + identityContext.CanonicalGenreBytes + identityContext.CanonicalTokensBytes + identityContext.CanonicalReplayBytes)} scope=candidate_loop_only_current_thread_exact semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
-            $"SCORE_CANDIDATE_LOCAL_EXTERNAL_DETAIL dedupeBytes={candidateDedupeBytes} localContinuityBytes={candidateLocalContinuityBytes} localShadowBytes={candidateLocalShadowBytes} broadcastIdentityBytes={candidateBroadcastIdentityBytes} externalProjectionBytes={candidateExternalProjectionBytes} localAggregateAdjustmentBytes={candidateLocalAggregateAdjustmentBytes} parentBytes={candidateLocalExternalBytes} accountedBytes={candidateDedupeBytes + candidateLocalContinuityBytes + candidateLocalShadowBytes + candidateBroadcastIdentityBytes + candidateExternalProjectionBytes + candidateLocalAggregateAdjustmentBytes} unaccountedBytes={candidateLocalExternalBytes - (candidateDedupeBytes + candidateLocalContinuityBytes + candidateLocalShadowBytes + candidateBroadcastIdentityBytes + candidateExternalProjectionBytes + candidateLocalAggregateAdjustmentBytes)} deduped={candidateLoopDeduped} belowMinimum={candidateLoopBelowMinimum} scored={deviationScored.Count} scope=current_thread_exact semantics=unchanged");
+            $"SCORE_CANDIDATE_LOCAL_EXTERNAL_DETAIL dedupeBytes={candidateDedupeBytes} localContinuityBytes={candidateLocalContinuityBytes} localShadowBytes={candidateLocalShadowBytes} broadcastIdentityBytes={candidateBroadcastIdentityBytes} externalProjectionBytes={candidateExternalProjectionBytes} localAggregateAdjustmentBytes={candidateLocalAggregateAdjustmentBytes} parentBytes={candidateLocalExternalBytes} accountedBytes={candidateDedupeBytes + candidateLocalContinuityBytes + candidateLocalShadowBytes + candidateBroadcastIdentityBytes + candidateExternalProjectionBytes + candidateLocalAggregateAdjustmentBytes} unaccountedBytes={candidateLocalExternalBytes - (candidateDedupeBytes + candidateLocalContinuityBytes + candidateLocalShadowBytes + candidateBroadcastIdentityBytes + candidateExternalProjectionBytes + candidateLocalAggregateAdjustmentBytes)} deduped={candidateLoopDeduped} scored={deviationScored.Count} scope=current_thread_exact semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
             $"SCORE_BEHAVIOR_ALLOCATION_DETAIL preHistoryBytes={scoreBehaviorBeforeHistory - scoreSetupAfterLearnedModel} recordedFactsBytes={scoreBehaviorAfterHistory - scoreBehaviorBeforeHistory} reservationFactsBytes={scoreSetupAfterBehaviorWeights - scoreBehaviorAfterHistory} accountedBytes={scoreSetupAfterBehaviorWeights - scoreSetupAfterLearnedModel} scope=current_thread_exact semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog(
@@ -2417,7 +2531,7 @@ internal static partial class AIrhythmRecommendationEngine
     {
         if (items.Count == 0) return Array.Empty<AIrhythmRecommendation>();
 
-        // 録画実績・復旧 — 偏差表示は、評価対象として残った全候補の未丸め・既存confidenceCap適用済みスコアを同じ母集団として扱う。
+        // 録画実績・復旧 — 偏差表示は、評価対象として残った全候補の未丸め・連続根拠校正済みスコアを同じ母集団として扱う。
         // 特定の棚・番組・ジャンル・録画件数による補正や母集団の選別は行わない。 表示値だけを標準的な偏差値（平均50、標準偏差10）へ変換する。
         if (items.Count <= 1)
             return items.Select(x => x with { Score = 50 }).ToArray();
@@ -2513,11 +2627,11 @@ internal static partial class AIrhythmRecommendationEngine
             || right.Contains(left, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static int FindGenreEvidence(IReadOnlyDictionary<string, int> counts, string genreKey)
+    private static double FindGenreEvidence(IReadOnlyDictionary<string, double> counts, string genreKey)
     {
-        if (genreKey.Length == 0) return 0;
+        if (genreKey.Length == 0) return 0.0d;
         if (counts.TryGetValue(genreKey, out var exact)) return exact;
-        return counts.Where(x => GenreMatches(x.Key, genreKey)).Select(x => x.Value).DefaultIfEmpty(0).Max();
+        return counts.Where(x => GenreMatches(x.Key, genreKey)).Select(x => x.Value).DefaultIfEmpty(0.0d).Max();
     }
 
 

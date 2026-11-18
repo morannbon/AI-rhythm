@@ -405,12 +405,17 @@ internal sealed class AIrhythmRenderer
         return reader.ReadToEnd();
     }
 
-    // 表示・テーマ — Both server rendering and runtime theme updates project values from the same embedded schema.
-    // The generated stylesheet contains resolved values for WebBrowser engines without CSS variable support.
+    // 初期描画 — CSSとC#生成HTMLのどちらも共通テーマ定義にない色は受け付けない。
+    // ランキングの棒色もC#内にあるため、CSSだけの参照検査では検出できない。
     private static readonly Regex ThemeCssVariable = new(@"var\(--([a-z0-9-]+)\)", RegexOptions.CultureInvariant);
     private static string ResolveThemeCss(string template, IReadOnlyDictionary<string, string> values)
         => ThemeCssVariable.Replace(template, match =>
-            values.TryGetValue(match.Groups[1].Value, out var value) ? value : match.Value);
+        {
+            var name = match.Groups[1].Value;
+            if (!values.TryGetValue(name, out var value))
+                throw new InvalidOperationException($"Theme token is undefined: {name}");
+            return value;
+        });
 
     private static readonly string ThemeSchemaJson = ReadResource(
         typeof(AIrhythmRenderer).Assembly, "AIrhythm.BasicPlugin.Assets.theme-spec.json");

@@ -2,19 +2,6 @@ namespace AIrhythm.BasicPlugin;
 
 internal static partial class AIrhythmRecommendationEngine
 {
-    private static bool IsRecordingFailure(TvAirRecordingHistoryDto value)
-    {
-        var state = $"{value.Result} {value.EndReason}";
-        if (ContainsAny(state, "cancel", "abort", "取消", "中止")) return false;
-        if (ContainsAny(state, "fail", "error", "失敗")) return true;
-        return value.FileCreated == false;
-    }
-
-    private static long QualitySeverity(TvAirRecordingHistoryDto value)
-        => Math.Max(0, value.ErrorCount ?? 0) * 1_000_000L
-            + Math.Max(0, value.ScrambleCount ?? 0) * 10_000L
-            + Math.Max(0, value.DropCount ?? 0);
-
     private static AIrhythmEventIdentity EventIdentityOf(TvAirProgramEventDto value)
         => new(value.NetworkId, value.TransportStreamId, value.ServiceId, value.EventNumber, value.Start);
 
@@ -109,6 +96,10 @@ internal static partial class AIrhythmRecommendationEngine
         if (value.Length == 0)
             return true;
 
+        // 作品識別 — Do not bypass the Work parser when a tournament day/part may need a separate axis.
+        if (MayContainTournamentScheduleSuffix(value))
+            return false;
+
         // 作品識別 — Admit only characters whose FormKC normalization cannot create a structural marker. This
         // deliberately leaves ambiguous punctuation/spacing on the established parser path.
         foreach (var ch in value)
@@ -148,6 +139,41 @@ internal static partial class AIrhythmRecommendationEngine
         return true;
     }
 
+    // 作品識別 — This is a lexical fallback gate only. The canonical parser below exclusively decides whether
+    // a tournament Work has an explicit day/session or broadcast-part suffix. No sport-specific title list is used.
+    private static bool MayContainTournamentScheduleSuffix(string value)
+        => value.Contains("Part", StringComparison.OrdinalIgnoreCase)
+            || value.Contains("パート", StringComparison.Ordinal)
+            || value.Contains("最終日", StringComparison.Ordinal)
+            || value.Contains("初日", StringComparison.Ordinal)
+            || value.Contains("日目", StringComparison.Ordinal)
+            || (value.IndexOf('第') >= 0 && value.IndexOf('日') >= 0);
+
+    // 作品識別 — The parser owns whether Part is a broadcast session or the Work itself.
+    // A numbered film/edition in Work is a distinct work, not a recurring headline to be
+    // inferred from a shared word prefix. Both selected-evidence aliases and persisted
+    // normalization proposals must obey this same decision before changing a Work key.
+    private static readonly Regex NumberedStandaloneWorkEdition = new(
+        @"(?<![\p{L}\p{N}])(?:part|パート|(?:the\s+)?movie|vol(?:ume)?\.?)\s*[-‐‑–—−－]?\s*[0-9０-９]{1,3}(?=$|[^\p{L}\p{N}])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static bool MustPreserveCompleteWorkIdentity(string? title, bool explicitFilm, string? recordedGenre = null)
+    {
+        if (explicitFilm || NormalizeGenre(recordedGenre) == "映画")
+            return true;
+        if (string.IsNullOrWhiteSpace(title) || !MayContainStandaloneWorkEdition(title))
+            return false;
+        // Only the Work axis is protected. A real tournament Part remains on the
+        // separate broadcast-session axis and continues to share its tournament Work.
+        return NumberedStandaloneWorkEdition.IsMatch(ParseCanonicalTitleParts(title).Work);
+    }
+
+    private static bool MayContainStandaloneWorkEdition(string title)
+        => title.Contains("Part", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("パート", StringComparison.Ordinal)
+            || title.Contains("Movie", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("Vol", StringComparison.OrdinalIgnoreCase);
+
     // 作品識別 — The structural probe operates on FormKC + canonical whitespace, so terminal derivative markers
     // can be checked without constructing a regex match for each scored EPG title. The canonical parser
     // remains the only owner of derivative classification and the separate PR/preview Work identity.
@@ -182,6 +208,11 @@ internal static partial class AIrhythmRecommendationEngine
         // second NFKC + whitespace normalization for every rejected title.
         normalizedForFallback = normalized;
 
+        // 作品識別 — The parser is the only owner of tournament day/part separation. This fast path may
+        // shortcut only titles for which that separation is structurally impossible.
+        if (MayContainTournamentScheduleSuffix(normalized))
+            return false;
+
         // 作品識別 — Explicit event numbers retain their distinct Work/episode structure.
         if (normalized.IndexOf('第') >= 0 && normalized.IndexOf('戦') >= 0
             && normalized.Any(ch => ch is >= '0' and <= '9' or >= '０' and <= '９')
@@ -192,12 +223,13 @@ internal static partial class AIrhythmRecommendationEngine
         // or broadcast-annotation stripping. Fall back instead of duplicating that logic.
         if (normalized.IndexOf('[') >= 0 || normalized.IndexOf(']') >= 0
             || normalized.IndexOf('【') >= 0 || normalized.IndexOf('】') >= 0
+            || normalized.IndexOf('<') >= 0 || normalized.IndexOf('>') >= 0
             || normalized.IndexOf('「') >= 0 || normalized.IndexOf('」') >= 0
             || normalized.IndexOf('『') >= 0 || normalized.IndexOf('』') >= 0
-            || normalized.IndexOf('▼') >= 0
+            || MayHaveAiredSupplementaryDetail(normalized)
             || normalized.IndexOf('(') >= 0 || normalized.IndexOf(')') >= 0
             || normalized.IndexOf('（') >= 0 || normalized.IndexOf('）') >= 0
-            || normalized.IndexOf('#') >= 0 || normalized.IndexOf('＃') >= 0
+            || normalized.IndexOf('#') >= 0 || normalized.IndexOf('＃') >= 0 || normalized.IndexOf('♯') >= 0
             || normalized.IndexOf('・') >= 0
             || normalized.IndexOf('~') >= 0 || normalized.IndexOf('～') >= 0
             || normalized.IndexOf('〜') >= 0 || normalized.IndexOf('→') >= 0)
@@ -321,7 +353,7 @@ internal static partial class AIrhythmRecommendationEngine
     private static readonly string[] BroadcastContainerSuffixes =
     {
         "アワー", "劇場", "ロードショー", "プレミアム", "シネマ", "アニメイズム",
-        "ドラマ", "映画", "セレクション", "コレクション", "特集", "映画祭", "ショーケース"
+        "ドラマ", "映画", "シアター", "セレクション", "コレクション", "特集", "映画祭", "ショーケース", "サスペンス"
     };
 
     // 作品識別 — Status-only EPG entries are not identifiable works. No per-programme exceptions: only
@@ -345,8 +377,26 @@ internal static partial class AIrhythmRecommendationEngine
             normalized = normalized.Replace(" ", string.Empty).Replace("　", string.Empty);
         if (normalized.Length < 2 || normalized.Length > 28) return false;
 
-        // 作品識別 — タイトル固有名の列挙ではなく、放送枠/編成ブランドで一般的な語尾だけを使う。 これに該当しない曖昧な前置きは Work から勝手に外さない。
-        return BroadcastContainerSuffixes.Any(suffix => normalized.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+        // 作品識別 — 独立した編成枠の接尾語、または「連続ドラマ＋一文字の枠識別子」という
+        // 文法だけを識別する。作品固有名や放送局名は登録しない。
+        return BroadcastContainerSuffixes.Any(suffix => normalized.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            || Regex.IsMatch(normalized,
+                @"^(?:連続|朝|夜)(?:テレビ|TV)?ドラマ[A-Z]$",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    // 作品識別 — A fully delimited broadcast-slot category is stronger evidence than an episode count.
+    // Classify only a grammatical category followed by an independently identifiable Work. A bracketed
+    // Work name, a genre-like substring, or an unknown bracket label does not establish this boundary.
+    private static bool IsExplicitLeadingBroadcastSlot(string container, string remainder)
+    {
+        if (string.IsNullOrWhiteSpace(container) || remainder.Count(char.IsLetterOrDigit) < 3)
+            return false;
+        var label = container.Normalize(NormalizationForm.FormKC).Trim();
+        return Regex.IsMatch(label,
+            @"^(?:(?:連続|朝|夜)(?:テレビ|TV)?(?:小説|ドラマ)|(?:テレビ|TV)(?:小説|ドラマ))$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            || LooksLikeBroadcastContainerLabel(label);
     }
 
     private readonly record struct CanonicalTitleStructureSignals(
@@ -506,14 +556,108 @@ internal static partial class AIrhythmRecommendationEngine
         return true;
     }
 
+    // 作品識別 — Parenthesized episode headlines are presentation details when the title itself
+    // has an independently named programme followed by complete 【...】 blocks, an explicit "ほか",
+    // or a ▼ segment inside the block. Do not treat leading 【...】 title/slot labels as episodes.
+    // Only recognize complete balanced groups; ambiguous brackets remain in Work unchanged.
+    private static bool TrySplitProgrammeEpisodeBrackets(string value, out string work, out string detail)
+    {
+        work = value;
+        detail = string.Empty;
+        var open = value.IndexOf('【');
+        if (open < 2) return false;
+        var prefix = value[..open].TrimEnd();
+        if (prefix.Count(char.IsLetterOrDigit) < 3) return false;
+        var close = value.IndexOf('】', open + 1);
+        if (close < open + 3 || value.AsSpan(open + 1, close - open - 1).IndexOfAny('【', '】') >= 0)
+            return false;
+        var firstBody = value[(open + 1)..close];
+        var suffix = value[(close + 1)..].Trim();
+        // An explicitly numbered airing after the bracket belongs to Episode, not Subtitle.
+        // Carry it forward to the same canonical episode parser instead of creating a competing path.
+        var numberedTail = Regex.IsMatch(suffix,
+            @"^(?:[#＃♯]\s*[0-9]{1,3}|第\s*[0-9]{1,3}\s*話)$");
+        var hasEpisodeBoundary = firstBody.IndexOf('▼') >= 0
+            || suffix.Equals("ほか", StringComparison.Ordinal) || numberedTail;
+        var scan = suffix;
+        if (scan.StartsWith("【", StringComparison.Ordinal))
+        {
+            hasEpisodeBoundary = true;
+            while (scan.Length > 0)
+            {
+                if (scan[0] != '【') return false;
+                var end = scan.IndexOf('】', 1);
+                if (end < 3 || scan.AsSpan(1, end - 1).IndexOfAny('【', '】') >= 0)
+                    return false;
+                scan = scan[(end + 1)..].Trim();
+            }
+        }
+        else if (suffix.Length > 0 && !suffix.Equals("ほか", StringComparison.Ordinal) && !numberedTail)
+        {
+            // A substantive trailing phrase may belong to the Work; never guess its role.
+            return false;
+        }
+        if (!hasEpisodeBoundary) return false;
+        work = numberedTail ? $"{prefix} {suffix}" : prefix;
+        detail = numberedTail ? value[open..(close + 1)] : value[open..].Trim();
+        return true;
+    }
+
+    // 作品識別 — A standalone exclamation/question boundary followed by whitespace and an
+    // independent description separates a recurring programme's title from that day's topic.
+    // Punctuation internal to a title or a terminal exclamation without a following segment
+    // is not a Work boundary. The punctuation itself remains in the programme name.
+    private static bool TrySplitPunctuatedProgrammeTopic(string value, out string work, out string topic)
+    {
+        work = value;
+        topic = string.Empty;
+        for (var i = 2; i < value.Length - 7; i++)
+        {
+            if (value[i] is not ('!' or '！' or '?' or '？')
+                || !char.IsWhiteSpace(value[i + 1]))
+                continue;
+            var prefix = value[..(i + 1)].TrimEnd();
+            var suffix = value[(i + 1)..].TrimStart();
+            if (prefix.Count(char.IsLetterOrDigit) < 4 || suffix.Count(char.IsLetterOrDigit) < 6)
+                continue;
+            work = prefix;
+            topic = suffix;
+            return true;
+        }
+        return false;
+    }
+
+    // 作品識別 — Explicit <slot> / ＜slot＞ syntax does not make the slot the Work.
+    // Only widely identifiable programme-container labels are recognized.
+    private static bool TrySplitAngleBracketBroadcastContainer(string value, out string container, out string work)
+    {
+        container = string.Empty;
+        work = value;
+        if (value.Length < 8 || value[0] is not ('<' or '＜')) return false;
+        var end = value.AsSpan().IndexOfAny('>', '＞');
+        if (end < 3 || end > 32) return false;
+        var label = value[1..end].Trim();
+        var remainder = value[(end + 1)..].Trim();
+        if (!LooksLikeBroadcastContainerLabel(label) || remainder.Count(char.IsLetterOrDigit) < 3)
+            return false;
+        container = label;
+        work = remainder;
+        return true;
+    }
+
     // 保存・読込 — Fixed canonical-title patterns are reused instead of competing for the process-wide Regex
     // static cache. The same patterns/options are retained; only their lifetime changes.
     private static readonly Regex CanonicalTitleRegex01 = new(@"^(?<container>[^「『]{2,28}?)[「『](?<work>[^」』]{2,120})[」』](?<tail>.*)$", RegexOptions.Compiled);
+    // 作品識別 — A programme genre followed by a separately credited creator and a quoted work is
+    // not the work title. Only the complete genre + person + quotation structure proves this boundary.
+    // Optional broadcast-brand letters belong to the genre wrapper. The creator remains available
+    // in the original EPG title; no work-specific exceptions are used.
+    private static readonly Regex CanonicalAttributedDramaPrefixRegex = new(@"^(?<type>連続ドラマ(?:\s*W)?|テレビドラマ|TVドラマ|ドラマ)\s+(?:(?:原作|脚本)\s*[:：]?\s*)?(?<credit>[\p{IsCJKUnifiedIdeographs}]{2,8})$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex02 = new(@"^(?<type>アニメ|ドラマ|映画|ドキュメンタリー)\s+(?<work>\S.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex03 = new(@"^(?<work>.+?)\s+(?<slot>(?:MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\s+(?:ANIME|DRAMA|MOVIE)\s+NIGHT)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex04 = new(@"^(?<type>[^「『]{1,12})[「『](?<work>[^」』]{2,120})[」』](?<tail>.*)$", RegexOptions.Compiled);
     private static readonly Regex CanonicalTitleRegex05 = new(@"(?:[!！?？]|＆|&|\bVS\b|参戦|大暴れ|密着|特集|クイズ|ランキング|スペシャル|\bSP\b|初公開|徹底|衝撃|爆笑|今夜|今週|ゲスト|ロケ|挑戦|対決)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex CanonicalTitleRegex06 = new(@"(?:第\s*[0-9０-９]+|[#＃]\s*[0-9０-９]+)$", RegexOptions.Compiled);
+    private static readonly Regex CanonicalTitleRegex06 = new(@"(?:第\s*[0-9０-９]+|[#＃♯]\s*[0-9０-９]+)$", RegexOptions.Compiled);
     private static readonly Regex CanonicalTitleRegex07 = new(@"(?<attr>【\s*(?:TV|テレビ|地上波|BS|CS)?\s*(?:初放送|初登場|初公開)\s*】)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex08 = new(@"(?:旅|紀行|路線バス|鉄道|街道|散歩|ドライブ|ツアー)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex09 = new(@"^(?<location>[^ ~～〜→]{2,24}(?:~|～|〜|→)[^ ~～〜→]{2,24})\s+(?<work>.+)$", RegexOptions.Compiled);
@@ -522,11 +666,60 @@ internal static partial class AIrhythmRecommendationEngine
     private static readonly Regex CanonicalTitleRegex12 = new(@"(?:選手権|大会|カップ|リーグ|オープン|グランプリ|杯|シリーズ)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex13 = new(@"^(?<work>.+?[\p{L}\p{N}])\s+第\s*(?<number>[0-9０-９]{1,3})\s*戦(?<tail>.*)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex14 = new(@"(?:^|[\s:：・/／（(【\[「『])(?<stage>フリー走行\s*[0-9０-９]+|FP\s*[0-9０-９]+|予選|決勝|スプリント(?:予選|シュートアウト)?|準々決勝|準決勝)(?=$|[\s:：・/／）)】\]」』])", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex CanonicalTitleRegex15 = new(@"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CanonicalTitleRegex15 = new(@"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃♯]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex16 = new(@"(?:【[^【】]{2,}】|\[[^\[\]]{2,}\])\s*$", RegexOptions.Compiled);
     private static readonly Regex CanonicalTitleRegex17 = new(@"^(?<work>.+?)\s+第[一二三四五六七八九十百千零〇]+(?:話|章)(?:\s*[:：].*)?$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex18 = new(@"\s+(?<part>第\s*[0-9０-９]+\s*部|前編|後編)(?<tail>(?:\s+.+)?)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CanonicalTitleRegex19 = new(@"(?:新番組|初回|最終回|再放送|アンコール|リピート|一挙放送)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // 作品識別 — Day and part identify a tournament broadcast, not the underlying tournament Work. Require
+    // an explicit separated suffix AND an independently named tournament; do not split generic programme parts.
+    private static readonly Regex TournamentWorkMarker = new(@"(?:選手権|トーナメント|クラシック|グランプリ|オープン|カップ|大会|杯|ツアー)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex TournamentBroadcastPartSuffix = new(@"^(?<work>.+?)\s+(?<part>(?:Part|パート)\s*[0-9０-９]{1,2}(?:\s*[+＋/&＆／〜～~-]\s*(?:(?:Part|パート)\s*)?[0-9０-９]{1,2})?)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex TournamentBroadcastDaySuffix = new(@"^(?<work>.+?)\s+(?<day>第\s*[0-9０-９]{1,2}\s*日(?:目)?|[0-9０-９]{1,2}\s*日目|初日|最終日)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // Bracketed EPG schedule variants are ordinary day metadata, including a broadcaster's
+    // replacement-square marker. Require a complete bracket pair and a true tournament Work.
+    private static readonly Regex TournamentBracketedDaySuffix = new(@"^(?<work>.+?)\s*[<＜]\s*(?<day>第\s*[0-9０-９]{1,2}\s*日(?:目)?|[0-9０-９]{1,2}\s*日目|初日|最終日)\s*[□]?[>＞]$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static bool HasTournamentWorkBoundary(string title)
+        => title.Count(char.IsLetterOrDigit) >= 6
+            && title.Any(char.IsLetter)
+            && TournamentWorkMarker.IsMatch(title);
+
+    // 作品識別 — The canonical parser is the only authority for recognized tournament schedule attributes.
+    // It is safe to keep the parsed Work against a legacy alias or learner promotion that still embeds its day.
+    private static bool HasParsedTournamentBroadcastSchedule(CanonicalTitleParts parts)
+        => HasTournamentWorkBoundary(parts.Work)
+            && (parts.Event.EndsWith("日", StringComparison.Ordinal)
+                || parts.Event.EndsWith("日目", StringComparison.Ordinal)
+                || parts.Part.StartsWith("Part", StringComparison.OrdinalIgnoreCase)
+                || parts.Part.StartsWith("パート", StringComparison.Ordinal));
+
+
+    // 作品識別 — A structurally settled on-air Work must not be shortened again by an older
+    // learned alias or a long-term learner promotion. This applies only when the new parser has
+    // actually separated a full bracketed episode, programme headline or broadcast container,
+    // or deliberately retained a complete quoted work in an otherwise ambiguous announcement.
+    private static bool HasSettledAiringWorkBoundary(string source, CanonicalTitleParts parts)
+    {
+        if (parts.Work.Length < 3) return false;
+        if (parts.Work.IndexOf('「') >= 0 || parts.Work.IndexOf('『') >= 0)
+            return true;
+        if (parts.Container.Length > 0
+            && source.AsSpan().TrimStart().StartsWith("<".AsSpan(), StringComparison.Ordinal))
+            return true;
+        if (parts.Subtitle.Length == 0) return false;
+        var normalized = NormalizeCanonicalWhitespace(StripNonIdentityBroadcastAnnotations(
+            source.Normalize(NormalizationForm.FormKC)));
+        if (TrySplitProgrammeEpisodeBrackets(normalized, out var bracketedWork, out _)
+            && string.Equals(CompactIdentity(bracketedWork), CompactIdentity(parts.Work), StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (TrySplitAiredTitleAndDetail(normalized, out var airedTitle, out _)
+            && string.Equals(CompactIdentity(ParseCanonicalTitleParts(airedTitle).Work),
+                CompactIdentity(parts.Work), StringComparison.OrdinalIgnoreCase))
+            return true;
+        return TrySplitPunctuatedProgrammeTopic(normalized, out var punctuatedWork, out _)
+            && string.Equals(CompactIdentity(punctuatedWork), CompactIdentity(parts.Work), StringComparison.OrdinalIgnoreCase);
+    }
 
     // 文字列解析 — A subtitle may include reading parentheses (e.g. 輿(こし)入れ). Check nesting without allocating
     // regex captures for each nested pair.
@@ -544,15 +737,72 @@ internal static partial class AIrhythmRecommendationEngine
         return depth == 0;
     }
 
-    // 作品識別 — Single structural boundary for a programme's aired title and its supplementary announcement.
-    // Quoted titles in the latter must never change this programme's Work or Episode Identity.
-    // Recommendation evidence must not learn title words from a different programme merely quoted in the
-    // supplementary announcement. The on-air boundary is identical to Work/Episode parsing; the full title
-    // is retained for display, search and audit.
+    // 作品識別 — A single structural Work/supplement boundary for recorded titles,
+    // aliases, scoring, normalization learning and external lookup. An announcement
+    // for another quoted Work and an explicitly marked broadcast presentation are
+    // not part of this Work. Plain decoration and quoted official titles stay intact.
+    private static readonly Regex MarkedAiredSupplement = new(
+        @"[★☆]\s*(?:(?:最新作|次回作|新作|公開記念|放送決定)\s*[「『]|(?:出演|主演|監督|原作)\s*[:：])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex BroadcastPresentationSuffix = new(
+        @"(?:[（(【\[]\s*(?:完全ノーカット(?:版|放送)?|ノーカット版|(?:日本語)?(?:字幕|吹替)(?:版)?)\s*[）)】\]]|(?<=\s)(?:完全ノーカット(?:版|放送)?|ノーカット版|(?:日本語)?(?:字幕|吹替)版))(?=$|\s|\[|【)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    // An explicitly delimited credit role (including multiple roles joined by a middle dot)
+    // or a named list is supplementary metadata. A bare diamond is insufficient to split a Work.
+    private static readonly Regex BroadcastCreditSuffix = new(
+        @"(?<=\s)◆\s*(?:(?:[\p{L}]{2,8}(?:[・／/][\p{L}]{2,8})?)\s*[:：]\s*[^\s◆]{2,}|[一-龯々]{2,6}(?:\s*[、,／/]\s*[一-龯々]{2,6})+)(?=$|\s|\[)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    // A structurally marked broadcast feature or descriptive cast sentence is
+    // editorial metadata. Neither a title-specific dictionary nor stripping every
+    // bracket/spaced phrase can establish such a boundary.
+    private static readonly Regex BroadcastEditorialSuffix = new(
+        @"(?:\s*【\s*(?:特集|出演|主演|監督|原作)\s*[:：][^【】]{3,100}】|\s+(?:特集|出演|主演|監督|原作)\s*[:：]\s*[^\r\n]{3,100})\s*$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex BroadcastCastDescriptionSuffix = new(
+        @"(?<=\s)[一-龯々]{2,8}\s*[×＆&]\s*[一-龯々]{2,8}(?:\s+[^\s]{2,}){1,8}[!！。](?=\s*$)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static bool MayHaveAiredSupplementaryDetail(string value)
+        => value.AsSpan().IndexOfAny('▼', '★', '☆') >= 0
+            || value.IndexOf('◆') >= 0
+            || value.Contains("ノーカット", StringComparison.Ordinal)
+            || value.Contains("字幕版", StringComparison.Ordinal)
+            || value.Contains("吹替版", StringComparison.Ordinal)
+            || value.Contains("日本語吹替", StringComparison.Ordinal)
+            || value.Contains("日本語字幕", StringComparison.Ordinal)
+            || (value.IndexOfAny([':', '：']) >= 0
+                && (value.Contains("特集", StringComparison.Ordinal)
+                    || value.Contains("出演", StringComparison.Ordinal)
+                    || value.Contains("主演", StringComparison.Ordinal)
+                    || value.Contains("監督", StringComparison.Ordinal)
+                    || value.Contains("原作", StringComparison.Ordinal)))
+            || (value.IndexOfAny(['×', '＆', '&']) >= 0
+                && value.IndexOfAny(['!', '！', '。']) >= 0
+                && value.IndexOf(' ') >= 0);
+
+    // A suffix delimiter within the original quoted Work is not a broadcast
+    // boundary. This common guard applies to every kind of supplementary suffix.
+    private static bool IsOutsideQuotedWork(string title, int separatorIndex)
+    {
+        var quoteDepth = 0;
+        for (var i = 0; i < separatorIndex; i++)
+        {
+            if (title[i] is '「' or '『')
+                quoteDepth++;
+            else if (title[i] is '」' or '』')
+                quoteDepth = Math.Max(0, quoteDepth - 1);
+        }
+        return quoteDepth == 0;
+    }
+
     private static string AiredTitleEvidenceText(string? title)
     {
         var raw = title ?? string.Empty;
-        if (raw.IndexOf('▼') < 0)
+        if (!MayHaveAiredSupplementaryDetail(raw))
             return raw;
         var normalized = StripNonIdentityBroadcastAnnotations(raw.Normalize(NormalizationForm.FormKC));
         return TrySplitAiredTitleAndDetail(normalized, out var airedTitle, out _)
@@ -564,16 +814,121 @@ internal static partial class AIrhythmRecommendationEngine
     {
         airedTitle = normalized;
         detail = string.Empty;
-        var divider = normalized.IndexOf('▼');
+        if (!MayHaveAiredSupplementaryDetail(normalized))
+            return false;
+
+        // Earliest *proved* outside-quote boundary wins; no per-title fallback or
+        // later display overwrite. The same original Work is used by every consumer.
+        var divider = -1;
+        var dividerWidth = 0;
+        for (var i = normalized.IndexOf('▼'); i >= 0; i = normalized.IndexOf('▼', i + 1))
+        {
+            if (!IsOutsideQuotedWork(normalized, i))
+                continue;
+            divider = i;
+            dividerWidth = 1;
+            break;
+        }
+
+        if (normalized.AsSpan().IndexOfAny('★', '☆') >= 0)
+        {
+            for (var marked = MarkedAiredSupplement.Match(normalized);
+                 marked.Success; marked = marked.NextMatch())
+            {
+                if (!IsOutsideQuotedWork(normalized, marked.Index))
+                    continue;
+                if (divider < 0 || marked.Index < divider)
+                {
+                    divider = marked.Index;
+                    dividerWidth = 1;
+                }
+                break;
+            }
+        }
+
+        if (normalized.Contains("ノーカット", StringComparison.Ordinal)
+            || normalized.Contains("字幕版", StringComparison.Ordinal)
+            || normalized.Contains("吹替版", StringComparison.Ordinal)
+            || normalized.Contains("日本語吹替", StringComparison.Ordinal)
+            || normalized.Contains("日本語字幕", StringComparison.Ordinal))
+        {
+            for (var presentation = BroadcastPresentationSuffix.Match(normalized);
+                 presentation.Success; presentation = presentation.NextMatch())
+            {
+                if (!IsOutsideQuotedWork(normalized, presentation.Index))
+                    continue;
+                if (divider < 0 || presentation.Index < divider)
+                {
+                    divider = presentation.Index;
+                    dividerWidth = 0;
+                }
+                break;
+            }
+        }
+
+        if (normalized.IndexOf('◆') >= 0)
+        {
+            for (var credit = BroadcastCreditSuffix.Match(normalized);
+                 credit.Success; credit = credit.NextMatch())
+            {
+                if (!IsOutsideQuotedWork(normalized, credit.Index))
+                    continue;
+                if (divider < 0 || credit.Index < divider)
+                {
+                    divider = credit.Index;
+                    dividerWidth = 0;
+                }
+                break;
+            }
+        }
+
+        if (normalized.Contains("特集", StringComparison.Ordinal)
+            || normalized.Contains("出演", StringComparison.Ordinal)
+            || normalized.Contains("主演", StringComparison.Ordinal)
+            || normalized.Contains("監督", StringComparison.Ordinal)
+            || normalized.Contains("原作", StringComparison.Ordinal))
+        {
+            var editorial = BroadcastEditorialSuffix.Match(normalized);
+            if (editorial.Success && IsOutsideQuotedWork(normalized, editorial.Index)
+                && (divider < 0 || editorial.Index < divider))
+            {
+                divider = editorial.Index;
+                dividerWidth = 0;
+            }
+        }
+        if (normalized.IndexOfAny(['×', '＆', '&']) >= 0)
+        {
+            var castSentence = BroadcastCastDescriptionSuffix.Match(normalized);
+            if (castSentence.Success && IsOutsideQuotedWork(normalized, castSentence.Index)
+                && (divider < 0 || castSentence.Index < divider))
+            {
+                divider = castSentence.Index;
+                dividerWidth = 0;
+            }
+        }
+
         if (divider < 2 || divider >= normalized.Length - 2)
             return false;
-        var prefix = normalized[..divider].TrimEnd();
-        var tail = normalized[(divider + 1)..].TrimStart();
+        var prefix = normalized[..divider].Trim();
+        var tail = normalized[(divider + dividerWidth)..].TrimStart();
         if (prefix.Count(char.IsLetterOrDigit) < 2 || tail.Count(char.IsLetterOrDigit) < 2)
             return false;
         airedTitle = prefix;
         detail = tail;
         return true;
+    }
+
+    // A standalone station-labelled on-air schedule guide is an announcement, not
+    // an episode of the films it advertises. Require two independent structural
+    // signals: an explicit BS/CS station token and a final guide-role marker.
+    // A normal programme such as "料理ナビ" or a quoted film title is not enough.
+    private static bool IsStandaloneBroadcastGuideTitle(string normalized)
+    {
+        if (normalized.IndexOfAny(['「', '」', '『', '』']) >= 0)
+            return false;
+        return Regex.IsMatch(normalized,
+            @"^(?:BS|CS)\s*[0-9]{1,3}\s*[\p{L}\p{N}・ー\s]{0,40}(?:NAVI|ナビ|番組案内|番組ガイド)$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
 
     private static CanonicalTitleParts ParseCanonicalTitleParts(string? value, bool alreadyNormalized = false)
@@ -590,8 +945,15 @@ internal static partial class AIrhythmRecommendationEngine
         // 録画実績・復旧 — The quoted Work remains attributable to the advertised series, but the broadcast itself has
         // a derivative identity (Work + derived:pr). This prevents both scoring from a generic "1分PR"
         // pseudo-series and accidental credit to the actual episode. Retain the raw title for display/history.
-        if (TryGetQuotedPromotionWork(normalized, out var advertisedWork))
+        // A quoted title in the separately marked announcement must not turn
+        // this aired film into a PR for another work, even if that announcement
+        // itself ends in PR.  Preserve the original title for later subtitle parsing.
+        if (TryGetQuotedPromotionWork(AiredTitleEvidenceText(normalized), out var advertisedWork))
             return new(string.Empty, string.Empty, string.Empty, advertisedWork,
+                string.Empty, string.Empty, string.Empty, string.Empty, string.Empty,
+                string.Empty, string.Empty, "derived:pr", string.Empty);
+        if (IsStandaloneBroadcastGuideTitle(normalized))
+            return new(string.Empty, string.Empty, string.Empty, normalized,
                 string.Empty, string.Empty, string.Empty, string.Empty, string.Empty,
                 string.Empty, string.Empty, "derived:pr", string.Empty);
         var structureSignals = DetectCanonicalTitleStructureSignals(normalized);
@@ -617,12 +979,49 @@ internal static partial class AIrhythmRecommendationEngine
         var broadcastAttribute = string.Empty;
         var workRoot = normalized;
 
+        // 作品識別 — Programme brackets describe individual segments, even when ▼ appears inside
+        // the bracket; split this complete structure before the general on-air ▼ announcement.
+        if (TrySplitProgrammeEpisodeBrackets(workRoot, out var bracketedWork, out var bracketedDetail))
+        {
+            workRoot = bracketedWork;
+            subtitle = bracketedDetail;
+        }
+
         // 作品識別 — Interpret the aired title before parsing quotations. Any later announcement is supplementary
         // content, never a replacement Work.
         if (TrySplitAiredTitleAndDetail(workRoot, out var airedTitle, out var detail))
         {
             workRoot = airedTitle;
-            subtitle = detail;
+            subtitle = subtitle.Length == 0 ? detail : $"{subtitle} {detail}";
+        }
+
+        // 作品識別 — The final complete 【...】 block is a separately delimited episode topic only when the
+        // preceding on-air programme name is independently present. Separate it before any promotional
+        // whitespace heuristic: the latter must never promote a subtitle fragment to the Work itself.
+        // Broadcast-status brackets with an explicit meaning remain on the attribute route below.
+        if (workRoot.Length > 0 && (workRoot[^1] == '】' || workRoot[^1] == ']')
+            && TrySplitTrailingBracketSubtitle(workRoot, requirePrefix: true,
+                out var bracketPrefix, out var bracketTopic)
+            && bracketPrefix.Count(char.IsLetterOrDigit) >= 2
+            && !CanonicalTitleRegex07.IsMatch(bracketTopic))
+        {
+            workRoot = bracketPrefix;
+            subtitle = subtitle.Length == 0 ? bracketTopic : $"{subtitle} {bracketTopic}";
+        }
+
+        // 作品識別 — An explicit programme-ending punctuation and whitespace separates the episode's
+        // editorial headline, independently of whether another airing corroborates the series title.
+        if (TrySplitPunctuatedProgrammeTopic(workRoot, out var punctuatedWork, out var punctuatedTopic))
+        {
+            workRoot = punctuatedWork;
+            subtitle = subtitle.Length == 0 ? punctuatedTopic : $"{subtitle} {punctuatedTopic}";
+        }
+
+        // 作品識別 — An explicit angular container precedes the programme Work.
+        if (TrySplitAngleBracketBroadcastContainer(workRoot, out var angularContainer, out var angularWork))
+        {
+            container = angularContainer;
+            workRoot = angularWork;
         }
 
         // 作品識別 — 1) 「枠名『作品名』」は最も強いローカル構造。引用内を Work とし、前置きを Container とする。 例: 日曜劇場「VIVANT」第18話 ...
@@ -630,6 +1029,7 @@ internal static partial class AIrhythmRecommendationEngine
             ? CanonicalTitleRegex01.Match(workRoot)
             : Match.Empty;
         var hasQuotedEpisodeSubtitle = false;
+        var originalQuotedTitle = workRoot;
         if (quotedWork.Success)
         {
             var quotedPrefix = quotedWork.Groups["container"].Value.Trim(' ', '・', '-', '－', ':', '：');
@@ -641,7 +1041,19 @@ internal static partial class AIrhythmRecommendationEngine
             var explicitBracketContainer = quotedPrefix.Length >= 4
                 && quotedPrefix[0] == '【' && quotedPrefix[^1] == '】'
                 && quotedPrefix.AsSpan(1, quotedPrefix.Length - 2).IndexOfAny('【', '】') < 0;
-            if (explicitBracketContainer || LooksLikeBroadcastContainerLabel(quotedPrefix))
+            var attributedDrama = quotedPrefix.IndexOf(' ') >= 0
+                ? CanonicalAttributedDramaPrefixRegex.Match(quotedPrefix)
+                : Match.Empty;
+            if (attributedDrama.Success && quotedBody.Count(char.IsLetterOrDigit) >= 2)
+            {
+                // 作品識別 — Genre and credited creator are separate from the quoted Work at the same
+                // parser authority used by ranking, recommendation, learning, search, and evidence.
+                contentType = attributedDrama.Groups["type"].Value;
+                workRoot = quotedBody;
+                if (tail.Length > 0)
+                    workRoot = $"{workRoot} {tail}";
+            }
+            else if (explicitBracketContainer || LooksLikeBroadcastContainerLabel(quotedPrefix))
             {
                 if (explicitBracketContainer)
                 {
@@ -702,15 +1114,25 @@ internal static partial class AIrhythmRecommendationEngine
                     RegexOptions.IgnoreCase);
                 if (editionOnlyTail)
                 {
-                    workRoot = normalized;
+                    workRoot = originalQuotedTitle;
                 }
-                else
+                else if (HasWorkBeforeExplicitEpisodeMarker(quotedPrefix)
+                    || Regex.IsMatch(quotedPrefix, @"\s+第\s*[0-9]{1,3}\s*夜$")
+                    || (tail.Length == 0 && quotedPrefix.Count(char.IsLetterOrDigit) >= 3
+                        && quotedPrefix.IndexOf('、') < 0))
                 {
+                    // The airing has a verified episode marker BEFORE the quoted subtitle.
                     workRoot = quotedPrefix;
                     hasQuotedEpisodeSubtitle = true;
                     subtitle = subtitle.Length == 0 ? quotedBody : $"{quotedBody} {subtitle}";
                     if (tail.Length > 0)
                         subtitle = $"{subtitle} {tail}";
+                }
+                else
+                {
+                    // A one-off announcement with a quoted subject is not proved to be a series.
+                    // Keep the quoted subject and original tail as part of Work until evidence exists.
+                    workRoot = originalQuotedTitle;
                 }
             }
         }
@@ -819,7 +1241,8 @@ internal static partial class AIrhythmRecommendationEngine
         {
             var leading = ParseLeadingContainerParts(workRoot);
             if (!string.IsNullOrWhiteSpace(leading.Container)
-                && HasWorkBeforeExplicitEpisodeMarker(leading.Remainder))
+                && (HasWorkBeforeExplicitEpisodeMarker(leading.Remainder)
+                    || IsExplicitLeadingBroadcastSlot(leading.Container, leading.Remainder)))
             {
                 container = leading.Container;
                 workRoot = leading.Remainder;
@@ -842,16 +1265,16 @@ internal static partial class AIrhythmRecommendationEngine
             {
                 var candidateWork = workRoot[..plainTailSpace];
                 var candidateTail = workRoot[(plainTailSpace + 1)..];
-                var promoLikeTail = CanonicalTitleRegex05.IsMatch(candidateTail);
-                // 作品識別 — A terminal bracketed broadcast announcement is not evidence that the preceding unbracketed
-                // words are promotional copy. For example, an installment subtitle followed by a series-wide
-                // announcement must retain the complete Work; step 7 will separately extract the bracket. Inspect only
-                // the unbracketed tail if the strong promo match came from the complete text. This is structural, never
-                // title-specific.
+                // A promotional cue somewhere INSIDE the remainder does not prove that all earlier
+                // words are editorial copy. Require a cue at the start of an independently separated
+                // topic, not a terminal ! or an embedded "特集" in a programme's proper name.
+                var promoLikeTail = CanonicalTitleRegex05.Match(candidateTail) is { Success: true, Index: 0 };
+                // 作品識別 — A terminal bracketed announcement is not a standalone promotional cue.
+                // Complete episode-topic brackets are already separated at the common title boundary.
                 if (promoLikeTail
                     && TrySplitTrailingBracketSubtitle(candidateTail, requirePrefix: true,
                         out var unbracketedTail, out _))
-                    promoLikeTail = CanonicalTitleRegex05.IsMatch(unbracketedTail);
+                    promoLikeTail = CanonicalTitleRegex05.Match(unbracketedTail) is { Success: true, Index: 0 };
                 // 作品識別 — A competition/series title in the tail is not mere promotional copy. Treat an explicit
                 // season/year + named event/series as identity-bearing, even when the same text contains promo terms.
                 // This is a generic structural veto and never learns or hardcodes a sponsor or work name.
@@ -862,6 +1285,7 @@ internal static partial class AIrhythmRecommendationEngine
                 if (promoLikeTail
                     && !hasNamedEditionInTail
                     && candidateWork.Count(char.IsLetterOrDigit) >= 3
+                    && candidateWork.Any(char.IsLetter)
                     && !CanonicalTitleRegex06.IsMatch(candidateWork))
                 {
                     workRoot = candidateWork;
@@ -899,18 +1323,6 @@ internal static partial class AIrhythmRecommendationEngine
             broadcastAttribute = broadcastAttribute.Length == 0 ? attr : $"{broadcastAttribute}/{attr}";
             workRoot = (workRoot[..explicitBroadcastBracket.Index] + " "
                 + workRoot[(explicitBroadcastBracket.Index + explicitBroadcastBracket.Length)..]).Trim();
-        }
-
-        // 作品識別 — 7) 末尾の角括弧は、明示話数がなくても番組本体の後ろに付く可変副題である場合だけ Subtitle へ分離する。 先頭【...】は Container
-        // 候補として別処理済み。ここでは「Work【各回副題】」型だけを扱う。 ARIB の短い放送属性は StripNonIdentityBroadcastAnnotations で先に除去されているため対象外。
-        if (workRoot.Length > 0 && (workRoot[^1] == '】' || workRoot[^1] == ']'))
-        {
-            if (TrySplitTrailingBracketSubtitle(workRoot, requirePrefix: true, out var prefix, out var candidateSubtitle)
-                && prefix.Count(char.IsLetterOrDigit) >= 2)
-            {
-                workRoot = prefix;
-                subtitle = candidateSubtitle;
-            }
         }
 
         // 処理条件 — 8) 「場所A～場所B 番組名」のような先頭ルート表現は、旅行・紀行・移動系の番組構造が 後続本文から明確な場合だけ Location へ分離する。地名辞書や個別タイトル登録は使わない。
@@ -984,6 +1396,29 @@ internal static partial class AIrhythmRecommendationEngine
             }
         }
 
+        // 作品識別 — Competition programme schedules are separate from Work identity. Remove a terminal
+        // broadcast part first, then its tournament day, so "第2日 Part1+2" and "最終日 Part2" resolve to
+        // the same tournament Work while retaining both details on their own canonical axes. A non-tournament
+        // series with "Part2" retains that text as part of Work. Different events and years remain distinct.
+        if (MayContainTournamentScheduleSuffix(workRoot))
+        {
+            var broadcastPart = TournamentBroadcastPartSuffix.Match(workRoot);
+            if (broadcastPart.Success && HasTournamentWorkBoundary(broadcastPart.Groups["work"].Value))
+            {
+                part = broadcastPart.Groups["part"].Value.Trim();
+                workRoot = broadcastPart.Groups["work"].Value.TrimEnd();
+            }
+
+            var tournamentDay = TournamentBroadcastDaySuffix.Match(workRoot);
+            if (!tournamentDay.Success)
+                tournamentDay = TournamentBracketedDaySuffix.Match(workRoot);
+            if (tournamentDay.Success && HasTournamentWorkBoundary(tournamentDay.Groups["work"].Value))
+            {
+                eventName = tournamentDay.Groups["day"].Value.Trim();
+                workRoot = tournamentDay.Groups["work"].Value.TrimEnd();
+            }
+        }
+
         // 文字列解析 — A parenthesized number followed immediately by a substantive subtitle is distinguishable from
         // an isolated ambiguous numeric suffix.  Retain a standalone (4), production year (2023), and embedded
         // series number untouched.
@@ -1031,7 +1466,7 @@ internal static partial class AIrhythmRecommendationEngine
 
         // 作品識別 — 12) 明示的な話数だけを Episode として分離する。
         var mayContainEpisodeMarker = workRoot.IndexOf('#') >= 0
-            || workRoot.IndexOf('＃') >= 0
+            || workRoot.IndexOf('＃') >= 0 || workRoot.IndexOf('♯') >= 0
             || workRoot.IndexOf('話') >= 0
             || workRoot.IndexOf('回') >= 0
             || workRoot.Contains("ep", StringComparison.OrdinalIgnoreCase);
@@ -1185,7 +1620,7 @@ internal static partial class AIrhythmRecommendationEngine
 
         // 外部情報 — Explicit episode/ordinal markers are deterministic local structure. They are handled internally
         // as episode or Work context and never, by themselves, justify an external lookup.
-        if (Regex.IsMatch(normalized, @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)", RegexOptions.IgnoreCase))
+        if (Regex.IsMatch(normalized, @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃♯]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)", RegexOptions.IgnoreCase))
             return new(false, AIrhythmExternalEvidenceNeedReason.None);
 
         return new(false, AIrhythmExternalEvidenceNeedReason.None);
@@ -1223,7 +1658,10 @@ internal static partial class AIrhythmRecommendationEngine
             return cleaned.Length <= 160 ? cleaned : cleaned[..160].Trim();
         }
 
-        var root = Clean(StripNonIdentityBroadcastAnnotations(title.Normalize(NormalizationForm.FormKC)).Trim());
+        // External evidence must search the aired Work, not a different title quoted
+        // in an appended broadcast announcement.  Share the canonical boundary.
+        var root = Clean(StripNonIdentityBroadcastAnnotations(
+            AiredTitleEvidenceText(title).Normalize(NormalizationForm.FormKC)).Trim());
         if (root.Length == 0)
             return Array.Empty<string>();
 
@@ -1252,7 +1690,7 @@ internal static partial class AIrhythmRecommendationEngine
         {
             var value = queue.Dequeue();
             Add(Regex.Replace(value, @"^【[^【】]{2,}】\s*", string.Empty).Trim());
-            Add(Regex.Replace(value, @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)(?:\s*[/／].*)?$", string.Empty, RegexOptions.IgnoreCase).Trim());
+            Add(Regex.Replace(value, @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃♯]\s*[0-9０-９]+|(?:episode|ep\.?)\s*[0-9０-９]+|[0-9０-９]+\s*話)(?:\s*[/／].*)?$", string.Empty, RegexOptions.IgnoreCase).Trim());
             Add(Regex.Replace(value, @"[（(]\s*[0-9０-９]+\s*[）)]\s*$", string.Empty).Trim());
             Add(Regex.Replace(value, @"(?:\s|　)*(?:PR|ＰＲ|予告|みどころ|総集編)(?:\s|　)*$", string.Empty, RegexOptions.IgnoreCase).Trim());
 

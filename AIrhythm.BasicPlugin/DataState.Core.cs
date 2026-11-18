@@ -2,9 +2,9 @@ namespace AIrhythm.BasicPlugin;
 
 internal static partial class AIrhythmDataState
 {
-    // 作品識別 — Reversible scoring-only quarantine for legacy unseparated multi-person credits. Never rewrite
+    // 作品識別 — Reversible scoring-only quarantine for unverified historical contributor identities. Never rewrite
     // the stored contributor map or observation IDs: the original evidence remains recoverable if a later,
-    // stronger parser can resolve the identity.
+    // stronger source evidence can establish the identity.
     private static bool IsStructurallyAmbiguousPersistedContributor(string key)
     {
         if (string.IsNullOrWhiteSpace(key) || key.StartsWith("tracked|", StringComparison.OrdinalIgnoreCase))
@@ -12,16 +12,10 @@ internal static partial class AIrhythmDataState
         var separator = key.IndexOf('|');
         if (separator <= 0 || separator >= key.Length - 1) return false;
         var entity = key[(separator + 1)..];
-        // 作品識別 — A role label fused to a person's name is not a person identity. Retain the original historical
-        // evidence but exclude that ambiguous key from the scoring projection. The role label is structural EPG
-        // metadata, not a person-specific exception; never guess or split the trailing person. Explicitly
-        // tracked search intent is protected by the early return above.
-        if (Regex.IsMatch(entity, @"^(?:(?:気象|ニュース|スポーツ)?キャスター)[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]{2,}$",
-            RegexOptions.CultureInvariant))
-            return true;
-        // 処理条件 — Mixed Japanese -> Latin -> Japanese without delimiters cannot safely denote a single
-        // contributor. Never split it into guessed identities.
-        return AIrhythmText.HasAmbiguousContributorBoundary(entity);
+        // The new parser and saved-score projection share one entity gate. Historical facts and
+        // observation IDs remain intact; only the scoring copy omits unverified identities.
+        var role = key[..separator];
+        return AIrhythmText.IsUnsupportedContributorIdentity(entity, role);
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -53,13 +47,13 @@ internal static partial class AIrhythmDataState
     private static readonly TimeSpan ExternalEvidenceTtl = TimeSpan.FromHours(12);
     private static readonly TimeSpan ExternalLookupAttemptTtl = TimeSpan.FromMinutes(30);
     private const int ExternalLookupProbeLimit = 32;
-    private const int UsageRecentIdentityLimit = 1024;
+    private static IReadOnlyList<TvAirReservationDto> _verifiedReservationHistory = Array.Empty<TvAirReservationDto>();
+    private static bool _verifiedReservationHistoryLoaded;
+    private static readonly HashSet<string> UsageCountedReservationKeys = new(StringComparer.Ordinal);
     private static AIrhythmUsageTotals _usageTotals;
     private static bool _usageTotalsInitialized;
     private static bool _usageTotalsDirty;
     private static readonly object UsageTotalsPersistenceGate = new();
-    private static readonly HashSet<string> UsageRecentReservationIds = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly Queue<string> UsageRecentReservationOrder = new();
     // 録画累計はHost確定済み履歴で計上する。加算済み識別子と累計は usage/totals に原子的に保存する。
     // 通知のファイル識別子をHost履歴の録画IDと同一視しない。表示更新・再起動時も履歴から補完する。
     private static readonly HashSet<string> UsageCountedRecordingKeys = new(StringComparer.Ordinal);
@@ -149,10 +143,10 @@ internal static partial class AIrhythmDataState
         return loaded;
     }
     private const int LearnedUserModelSchemaVersion = 1;
-    private const int ContributorLogicVersion = 6;
-    private const int BasePreferenceLogicVersion = 4;
+    private const int ContributorLogicVersion = 7;
+    private const int BasePreferenceLogicVersion = 5;
     private const string EvidenceCalibrationStorageKey = "evidenceCalibration-v1";
-    private const int EvidenceCalibrationSchemaVersion = 1;
+    private const int EvidenceCalibrationSchemaVersion = 2;
     private const int EvidenceCalibrationSeenLimit = 5000;
     private const string NormalizationLearnerStorageNamespace = "normalizationLearnerShadow";
     private const string NormalizationLearnerStorageKey = "memory-v1";
@@ -292,9 +286,10 @@ internal static partial class AIrhythmDataState
             _usageTotals = default;
             _usageTotalsInitialized = false;
             _usageTotalsDirty = false;
-            UsageRecentReservationIds.Clear();
-            UsageRecentReservationOrder.Clear();
             UsageCountedRecordingKeys.Clear();
+            UsageCountedReservationKeys.Clear();
+            _verifiedReservationHistory = Array.Empty<TvAirReservationDto>();
+            _verifiedReservationHistoryLoaded = false;
             _usageRecordingAccountingStart = default;
             _usageRecordingLedgerRevision = 0;
             RecordingFacts.Clear();
@@ -369,9 +364,10 @@ internal static partial class AIrhythmDataState
             _usageTotals = default;
             _usageTotalsInitialized = false;
             _usageTotalsDirty = false;
-            UsageRecentReservationIds.Clear();
-            UsageRecentReservationOrder.Clear();
             UsageCountedRecordingKeys.Clear();
+            UsageCountedReservationKeys.Clear();
+            _verifiedReservationHistory = Array.Empty<TvAirReservationDto>();
+            _verifiedReservationHistoryLoaded = false;
             _usageRecordingAccountingStart = default;
             _usageRecordingLedgerRevision = 0;
             RecordingFacts.Clear();
@@ -421,93 +417,76 @@ internal static partial class AIrhythmDataState
     private static void EnsureUsageTotalsInitialized(ITvAirPluginRuntimeContext context)
     {
         lock (Gate)
-        {
-            if (_usageTotalsInitialized || !ReferenceEquals(_runtimeContext, context))
-                return;
-        }
+            if (_usageTotalsInitialized || !ReferenceEquals(_runtimeContext, context)) return;
 
-        // 計数開始境界をHost履歴取得より先に確定する。初期化途中の録画終了を取りこぼさない。
-        var migrationAnchor = DateTimeOffset.UtcNow;
-        if (!TryReadUsageCounterState(context, out var stored))
-            return; // 処理条件 — Never overwrite an existing counter that cannot be read.
-        var resetCutoff = GetDataResetCutoff(context);
-        long recordingBaseline = 0;
-        string[] initialRecordingKeys = Array.Empty<string>();
-        long reservationBaseline = 0;
-        var recentReservationIds = new List<string>();
-        try
-        {
-            var recordings = context.Recordings.ListHistory(new TvAirRecordingHistoryQueryDto
-            {
-                IncludeSystemEntries = false,
-                Limit = 10000
-            });
-            var recordingKeys = recordings
-                .Where(x => resetCutoff is null || (x.ActualStart ?? x.Start) >= resetCutoff.Value)
-                .Select(UsageRecordingIdentity)
-                .Where(x => x.Length > 0)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            recordingBaseline = recordingKeys.LongLength;
-            initialRecordingKeys = recordingKeys;
-        }
-        catch { }
+        if (!TryReadUsageCounterState(context, out var stored)) return;
+        var cutoff = GetDataResetCutoff(context);
+        var isCurrent = stored?.Version == 3;
+        var existingCounted = new HashSet<string>(StringComparer.Ordinal);
+        var existingReservations = new HashSet<string>(StringComparer.Ordinal);
+        var recordingTotal = isCurrent ? stored!.RecordingTotal : 0L;
+        var reservationTotal = isCurrent ? stored!.ReservationTotal : 0L;
+        var accountingStart = isCurrent ? stored!.RecordingAccountingStart!.Value
+            : cutoff ?? DateTimeOffset.MinValue;
 
-        try
+        if (isCurrent)
         {
-            var activeReservations = context.Reservations.List(new TvAirReservationQueryDto
-            {
-                IncludeSystemEntries = false
-            });
-            var reservationHistory = context.Reservations.ListHistory(new TvAirReservationHistoryQueryDto
-            {
-                IncludeSystemEntries = false,
-                Limit = 10000
-            });
-            var reservationKeys = activeReservations
-                .Concat(reservationHistory)
-                .Where(x => resetCutoff is null || x.CreatedAt >= resetCutoff.Value)
-                .Select(x => x.ReservationId?.Trim() ?? string.Empty)
-                .Where(x => x.Length > 0)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            reservationBaseline = reservationKeys.LongLength;
-            recentReservationIds.AddRange(reservationKeys.Take(UsageRecentIdentityLimit));
+            existingCounted.UnionWith(stored!.CountedRecordingKeys ?? Array.Empty<string>());
+            existingReservations.UnionWith(stored.CountedReservationKeys ?? Array.Empty<string>());
         }
-        catch { }
-
-        // Version 1 には計上済み録画IDがない。過去の実績件数との差から勝手に加算しない。
-        // Version 2 では記録済みの件数を正本とし、未計上の確定履歴だけを後段で加算する。
-        var isRecordedLedger = stored?.Version == 2;
-        var accountingStart = isRecordedLedger
-            ? stored!.RecordingAccountingStart!.Value
-            : migrationAnchor;
-        var baselineAdopted = !isRecordedLedger && recordingBaseline >= (stored?.RecordingTotal ?? 0);
-        var next = new AIrhythmUsageTotals(
-            isRecordedLedger ? stored!.RecordingTotal : Math.Max(stored?.RecordingTotal ?? 0, recordingBaseline),
-            Math.Max(stored?.ReservationTotal ?? 0, reservationBaseline));
+        else
+        {
+            // Historical totals v1/v2 contain program-time-slot bookings without attribution.
+            // They must not be carried into v3. Rebuild only from verified origin and original
+            // recording occurrence. Unknown legacy rows stay preserved but contribute zero.
+            IReadOnlyList<TvAirReservationDto> active;
+            IReadOnlyList<TvAirReservationDto> allReservations;
+            IReadOnlyList<TvAirRecordingHistoryDto> hostHistory;
+            try
+            {
+                active = context.Reservations.List(new TvAirReservationQueryDto { IncludeSystemEntries = false });
+                allReservations = ReadReservationOrigins(context, active);
+                lock (Gate) if (!_verifiedReservationHistoryLoaded) return;
+                hostHistory = context.Recordings.ListHistory(new TvAirRecordingHistoryQueryDto
+                {
+                    IncludeSystemEntries = false, Limit = 10000
+                });
+            }
+            catch { return; }
+            if (!EnsureRecordingFactsLoaded(context)) return;
+            MergeFinalizedRecordingFacts(context, hostHistory, allReservations);
+            ReconcileRecordingOrigins(context, allReservations);
+            lock (Gate)
+            {
+                foreach (var fact in RecordingFacts.Values.Where(IsAdmittedRecordingFact))
+                    existingCounted.Add(UsageRecordingLedgerKey(fact.Identity));
+            }
+            foreach (var reservation in allReservations)
+            {
+                if (!AIrhythmPreferenceOriginPolicy.AllowsReservation(reservation)
+                    || cutoff is not null && reservation.CreatedAt < cutoff.Value)
+                    continue;
+                existingReservations.Add(UsageReservationLedgerKey(reservation));
+            }
+            recordingTotal = existingCounted.Count;
+            reservationTotal = existingReservations.Count;
+        }
 
         lock (Gate)
         {
-            if (!ReferenceEquals(_runtimeContext, context) || _usageTotalsInitialized)
-                return;
-            _usageTotals = next;
+            if (!ReferenceEquals(_runtimeContext, context) || _usageTotalsInitialized) return;
+            _usageTotals = new AIrhythmUsageTotals(recordingTotal, reservationTotal);
             _usageRecordingAccountingStart = accountingStart;
             UsageCountedRecordingKeys.Clear();
-            if (isRecordedLedger)
-                foreach (var key in stored!.CountedRecordingKeys ?? Array.Empty<string>())
-                    UsageCountedRecordingKeys.Add(key);
-            else if (baselineAdopted)
-                foreach (var id in initialRecordingKeys)
-                    UsageCountedRecordingKeys.Add(UsageRecordingLedgerKey(id));
+            UsageCountedRecordingKeys.UnionWith(existingCounted);
+            UsageCountedReservationKeys.Clear();
+            UsageCountedReservationKeys.UnionWith(existingReservations);
             _usageRecordingLedgerRevision = 0;
             _usageTotalsInitialized = true;
-            foreach (var id in recentReservationIds)
-                RememberUsageIdentity(UsageRecentReservationIds, UsageRecentReservationOrder, id);
         }
         PersistUsageCounterState(context);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-        WriteDeveloperLog($"usage totals initialized recordingTotal={next.RecordingTotal} reservationTotal={next.ReservationTotal} recordingBaseline={recordingBaseline} reservationBaseline={reservationBaseline} recordingPolicy=confirmed_history_with_persistent_receipts recordingLedger={UsageCountedRecordingKeys.Count} migratedFromV1={!isRecordedLedger} systemEntries=False");
+        WriteDeveloperLog($"usage totals initialized recordingTotal={recordingTotal} reservationTotal={reservationTotal} policy=verified_non_program_origins_only version=3 previousVersion={stored?.Version ?? 0} unverifiedLegacyExcluded=True");
 #endif
     }
 

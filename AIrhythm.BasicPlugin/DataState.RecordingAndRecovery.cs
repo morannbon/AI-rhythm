@@ -17,7 +17,12 @@ internal static partial class AIrhythmDataState
             return stored is not null
                 && (stored.Version == 1 || stored.Version == 2 && stored.RecordingAccountingStart is not null
                     && stored.CountedRecordingKeys is not null
-                    && stored.CountedRecordingKeys.All(x => x.Length == 64 && x.All(Uri.IsHexDigit)));
+                    && stored.CountedRecordingKeys.All(x => x.Length == 64 && x.All(Uri.IsHexDigit))
+                    || stored.Version == 3 && stored.RecordingAccountingStart is not null
+                    && stored.CountedRecordingKeys is not null
+                    && stored.CountedRecordingKeys.All(x => x.Length == 64 && x.All(Uri.IsHexDigit))
+                    && stored.CountedReservationKeys is not null
+                    && stored.CountedReservationKeys.All(x => x.Length == 64 && x.All(Uri.IsHexDigit)));
         }
         catch { return false; }
     }
@@ -32,6 +37,7 @@ internal static partial class AIrhythmDataState
             AIrhythmUsageTotals totals;
             DateTimeOffset accountingStart;
             string[] receiptKeys;
+            string[] reservationReceiptKeys;
             long receiptRevision;
             lock (Gate)
             {
@@ -41,12 +47,13 @@ internal static partial class AIrhythmDataState
                 accountingStart = _usageRecordingAccountingStart;
                 receiptRevision = _usageRecordingLedgerRevision;
                 receiptKeys = UsageCountedRecordingKeys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+                reservationReceiptKeys = UsageCountedReservationKeys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
             }
             try
             {
                 var json = JsonSerializer.Serialize(new AIrhythmUsageCounterState(
-                    totals.RecordingTotal, totals.ReservationTotal, Version: 2, RecordingAccountingStart: accountingStart,
-                    CountedRecordingKeys: receiptKeys), JsonOptions);
+                    totals.RecordingTotal, totals.ReservationTotal, Version: 3, RecordingAccountingStart: accountingStart,
+                    CountedRecordingKeys: receiptKeys, CountedReservationKeys: reservationReceiptKeys), JsonOptions);
                 var written = context.Storage.Set("usage", "totals", json, expectedRevision: null);
                 if (!written.Succeeded)
                     throw new InvalidOperationException("Usage totals write failed");
@@ -70,23 +77,11 @@ internal static partial class AIrhythmDataState
         }
     }
 
-    private static bool IsRecordingFailureForRecovery(TvAirRecordingHistoryDto item)
-    {
-        var state = $"{item.Result} {item.EndReason}";
-        if (state.Contains("cancel", StringComparison.OrdinalIgnoreCase)
-            || state.Contains("abort", StringComparison.OrdinalIgnoreCase)
-            || state.Contains("取消", StringComparison.OrdinalIgnoreCase)
-            || state.Contains("中止", StringComparison.OrdinalIgnoreCase)) return false;
-        return state.Contains("fail", StringComparison.OrdinalIgnoreCase)
-            || state.Contains("error", StringComparison.OrdinalIgnoreCase)
-            || state.Contains("失敗", StringComparison.OrdinalIgnoreCase)
-            || item.FileCreated == false;
-    }
-
-    // 録画実績・復旧 — Host recording IDs can be reused across reservation lifecycles. Persisted facts, recovery
-    // observations, and deduplication use the scoped recording identity derived from service, broadcast
-    // slot, and attempt discriminator, rather than treating the raw Host ID as globally unique.
-    private static string RecordingIdentity(
+    // 録画実績・復旧 — A Host ID and numeric service tuple alone cannot always distinguish historic
+    // broadcasts: some imported rows carry the same numeric tuple despite different station names.
+    // Bind the immutable broadcast occurrence to a normalized station, without using mutable programme
+    // titles, recording end times, EPG descriptions, or a particular title-specific exception.
+    private static string LegacyRecordingIdentity(
         string? recordingId, string? reservationId,
         int networkId, int transportStreamId, int serviceId, int eventId,
         DateTimeOffset scheduledStart, DateTimeOffset start)
@@ -99,30 +94,51 @@ internal static partial class AIrhythmDataState
         var reservation = reservationId?.Trim() ?? string.Empty;
         if (reservation.Length != 0)
             return $"{scope}:reservation:{reservation.Length}:{reservation}";
-        // 作品識別 — Without either Host ID, the event and scheduled start still identify the broadcast. Never use
-        // the changeable End/ActualEnd as identity.
         return $"{scope}:event:{eventId}:{start.UtcDateTime.Ticks}";
     }
+
+    private static string RecordingStationFingerprint(string? serviceName)
+    {
+        // Station spelling variations (full-width Latin digits/space) resolve to the same value.
+        // All projections use this one function. The digest does not expose programme metadata.
+        var normalized = new string((serviceName ?? string.Empty).Normalize(NormalizationForm.FormKC)
+            .Where(c => !char.IsWhiteSpace(c)).Select(char.ToUpperInvariant).ToArray());
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))[..24];
+    }
+
+    private static string RecordingIdentity(
+        string? recordingId, string? reservationId,
+        int networkId, int transportStreamId, int serviceId, int eventId,
+        DateTimeOffset scheduledStart, DateTimeOffset start, string? serviceName)
+    {
+        var legacy = LegacyRecordingIdentity(recordingId, reservationId,
+            networkId, transportStreamId, serviceId, eventId, scheduledStart, start);
+        return "recording:v3:" + legacy["recording:v2:".Length..]
+            + ":station:" + RecordingStationFingerprint(serviceName);
+    }
+
+    private static string LegacyUsageRecordingIdentity(TvAirRecordingHistoryDto item)
+        => LegacyRecordingIdentity(item.RecordingId, item.ReservationId,
+            item.NetworkId, item.TransportStreamId, item.ServiceId, item.EventId,
+            item.ScheduledStartTime, item.Start);
 
     private static string UsageRecordingIdentity(TvAirRecordingHistoryDto item)
         => RecordingIdentity(item.RecordingId, item.ReservationId,
             item.NetworkId, item.TransportStreamId, item.ServiceId, item.EventId,
-            item.ScheduledStartTime, item.Start);
+            item.ScheduledStartTime, item.Start, item.ServiceName);
 
-    // 録画実績・復旧 — Recording and its originating reservation represent one preference occurrence, even if the
-    // recording has several physical file segments. Reused Host reservation IDs from other broadcast slots
-    // are NOT the same occurrence. Never use this key to rewrite persisted user-model IDs.
+    // Reservation- and recording-origin evidence for one broadcast share this stable station scope.
     internal static string RecordingEvidenceCausalIdentity(TvAirRecordingHistoryDto item)
         => string.IsNullOrWhiteSpace(item.ReservationId)
             ? UsageRecordingIdentity(item)
             : RecordingIdentity(null, item.ReservationId, item.NetworkId,
                 item.TransportStreamId, item.ServiceId, item.EventId,
-                item.ScheduledStartTime, item.Start);
+                item.ScheduledStartTime, item.Start, item.ServiceName);
 
     internal static string ReservationEvidenceCausalIdentity(TvAirReservationDto item)
         => RecordingIdentity(null, item.ReservationId, item.NetworkId,
             item.TransportStreamId, item.ServiceId, item.EventNumber,
-            item.ScheduledStart ?? item.Start, item.Start);
+            item.ScheduledStart ?? item.Start, item.Start, item.ServiceName);
 
     internal static bool RecordingBelongsToReservationOccurrence(
         TvAirRecordingHistoryDto recording, TvAirReservationDto reservation)
@@ -131,11 +147,17 @@ internal static partial class AIrhythmDataState
             && recording.NetworkId == reservation.NetworkId
             && recording.TransportStreamId == reservation.TransportStreamId
             && recording.ServiceId == reservation.ServiceId
+            && RecordingStationFingerprint(recording.ServiceName) == RecordingStationFingerprint(reservation.ServiceName)
             && (recording.ScheduledStartTime == default ? recording.Start : recording.ScheduledStartTime)
                 == (reservation.ScheduledStart ?? reservation.Start);
 
     private static string CanonicalRecordingFactIdentity(AIrhythmRecordingFact fact)
         => RecordingIdentity(fact.RecordingId, fact.ReservationId,
+            fact.NetworkId, fact.TransportStreamId, fact.ServiceId, fact.EventId,
+            fact.ScheduledStartTime, fact.Start, fact.ServiceName);
+
+    private static string LegacyRecordingFactIdentity(AIrhythmRecordingFact fact)
+        => LegacyRecordingIdentity(fact.RecordingId, fact.ReservationId,
             fact.NetworkId, fact.TransportStreamId, fact.ServiceId, fact.EventId,
             fact.ScheduledStartTime, fact.Start);
 
@@ -163,11 +185,14 @@ internal static partial class AIrhythmDataState
     // collide across months.
     private static string CanonicalRecoveryAttemptIdentity(AIrhythmRecoveryAttempt row)
     {
-        if (row.Identity.StartsWith("recording:v2:", StringComparison.OrdinalIgnoreCase))
+        if (row.Identity.StartsWith("recording:v3:", StringComparison.OrdinalIgnoreCase))
             return row.Identity;
+        if (row.Identity.StartsWith("recording:v2:", StringComparison.OrdinalIgnoreCase))
+            return "recording:v3:" + row.Identity["recording:v2:".Length..]
+                + ":station:" + RecordingStationFingerprint(row.ServiceName);
         if (row.Identity.StartsWith("recording:", StringComparison.OrdinalIgnoreCase))
             return RecordingIdentity(null, null, row.NetworkId, row.TransportStreamId,
-                row.ServiceId, row.EventId, row.ScheduledStartTime, row.Start);
+                row.ServiceId, row.EventId, row.ScheduledStartTime, row.Start, row.ServiceName);
         if (row.Identity.StartsWith("reservation:", StringComparison.OrdinalIgnoreCase))
         {
             var endSeparator = row.Identity.LastIndexOf(':');
@@ -176,11 +201,19 @@ internal static partial class AIrhythmDataState
                 ? row.Identity["reservation:".Length..beginSeparator]
                 : row.Identity["reservation:".Length..];
             return RecordingIdentity(null, id, row.NetworkId, row.TransportStreamId,
-                row.ServiceId, row.EventId, row.ScheduledStartTime, row.Start);
+                row.ServiceId, row.EventId, row.ScheduledStartTime, row.Start, row.ServiceName);
         }
         return RecordingIdentity(row.Identity, null, row.NetworkId, row.TransportStreamId,
-            row.ServiceId, row.EventId, row.ScheduledStartTime, row.Start);
+            row.ServiceId, row.EventId, row.ScheduledStartTime, row.Start, row.ServiceName);
     }
+
+    // Legacy journals may be indexed without migrating their canonical month. Verify the actual
+    // historical row before suppressing the equivalent station-qualified attempt.
+    private static bool IsSameRecoveryObservation(AIrhythmRecoveryAttempt old, TvAirRecordingHistoryDto current)
+        => string.Equals(CanonicalRecoveryAttemptIdentity(old), UsageRecordingIdentity(current), StringComparison.OrdinalIgnoreCase)
+            && string.Equals(old.ProgramTitle.Trim(), current.ProgramTitle.Trim(), StringComparison.Ordinal)
+            && old.ScheduledStartTime == current.ScheduledStartTime
+            && old.Start == current.Start;
 
     private static AIrhythmRecordingFact ToRecordingFact(
         TvAirRecordingHistoryDto item, TvAirReservationDto? matchingReservation = null)
@@ -204,7 +237,8 @@ internal static partial class AIrhythmDataState
             item.QualitySource ?? string.Empty,
             matchingReservation is not null,
             matchingReservation?.Intent ?? TvAirReservationIntent.Unspecified,
-            matchingReservation?.Source ?? string.Empty);
+            matchingReservation?.Source ?? string.Empty,
+            item.Succeeded);
 
     private static TvAirRecordingHistoryDto FromRecordingFact(AIrhythmRecordingFact fact)
         => new()
@@ -227,13 +261,18 @@ internal static partial class AIrhythmDataState
             Result = fact.Result,
             EndReason = fact.EndReason,
             FileCreated = fact.FileCreated,
-            ResultFinalized = fact.ResultFinalized,
+            ResultFinalized = fact.ResultFinalized && (fact.Succeeded.HasValue
+                || AIrhythmRecoveryEvidencePolicy.HasConcreteLegacyRecoveryEvidence(fact.Result,
+                    fact.EndReason, fact.FileCreated, fact.QualityDataAvailable,
+                    fact.DropCount, fact.ErrorCount, fact.ScrambleCount)),
             DropCount = fact.DropCount,
             ErrorCount = fact.ErrorCount,
             ScrambleCount = fact.ScrambleCount,
             QualityDataAvailable = fact.QualityDataAvailable,
             QualityCompleteness = fact.QualityCompleteness,
-            QualitySource = fact.QualitySource
+            QualitySource = fact.QualitySource,
+            // Historical rows lacked the typed flag. Their success is never inferred from missing data.
+            Succeeded = fact.Succeeded ?? AIrhythmRecoveryEvidencePolicy.IsSuccessfulRecordingResult(fact.Result)
         };
 
     // 録画実績・復旧 — A finalized recording fact represents the original broadcast. A subsequent Host history row
@@ -242,7 +281,7 @@ internal static partial class AIrhythmDataState
     private static bool HasRecordingFactMetadataConflict(AIrhythmRecordingFact saved, AIrhythmRecordingFact incoming)
         => (!string.IsNullOrWhiteSpace(saved.ServiceName)
             && !string.IsNullOrWhiteSpace(incoming.ServiceName)
-            && !string.Equals(saved.ServiceName.Trim(), incoming.ServiceName.Trim(), StringComparison.Ordinal))
+            && RecordingStationFingerprint(saved.ServiceName) != RecordingStationFingerprint(incoming.ServiceName))
             || (!string.IsNullOrWhiteSpace(saved.ProgramTitle)
                 && !string.IsNullOrWhiteSpace(incoming.ProgramTitle)
                 && !string.Equals(saved.ProgramTitle.Trim(), incoming.ProgramTitle.Trim(), StringComparison.Ordinal))
@@ -263,7 +302,17 @@ internal static partial class AIrhythmDataState
     private static AIrhythmRecordingFact MergeRecordingFactMetadata(
         AIrhythmRecordingFact saved, AIrhythmRecordingFact incoming)
     {
-        var fillQuality = !saved.QualityDataAvailable && incoming.QualityDataAvailable;
+        var savedQuality = FromRecordingFact(saved);
+        var incomingQuality = FromRecordingFact(incoming);
+        // The same terminal-evidence policy owns persisted facts and the recovery journal.
+        // A partial later success must not silently erase an earlier finalized failure.
+        var terminalCorrection = AIrhythmRecoveryEvidencePolicy.IsVerifiedClean(incomingQuality)
+            || AIrhythmRecoveryEvidencePolicy.IsDefective(incomingQuality);
+        var adoptQuality = incoming.QualityDataAvailable
+            && (AIrhythmRecoveryEvidencePolicy.HasVerifiedCompleteQuality(incomingQuality)
+                || !saved.QualityDataAvailable
+                || (!AIrhythmRecoveryEvidencePolicy.HasAbnormalQuality(savedQuality)
+                    && AIrhythmRecoveryEvidencePolicy.HasAbnormalQuality(incomingQuality)));
         return saved with
         {
             ServiceName = string.IsNullOrWhiteSpace(saved.ServiceName) ? incoming.ServiceName : saved.ServiceName,
@@ -272,21 +321,27 @@ internal static partial class AIrhythmDataState
             Genre = string.IsNullOrWhiteSpace(saved.Genre) ? incoming.Genre : saved.Genre,
             GenreCodes = string.IsNullOrWhiteSpace(saved.GenreCodes) ? incoming.GenreCodes : saved.GenreCodes,
             ActualEnd = saved.ActualEnd ?? incoming.ActualEnd,
-            Result = string.IsNullOrWhiteSpace(saved.Result) ? incoming.Result : saved.Result,
-            EndReason = string.IsNullOrWhiteSpace(saved.EndReason) ? incoming.EndReason : saved.EndReason,
-            FileCreated = saved.FileCreated ?? incoming.FileCreated,
+            // New finalized information supersedes an incomplete earlier projection only for this
+            // exact recording occurrence. Never overwrite a different programme's metadata.
+            Result = terminalCorrection && !string.IsNullOrWhiteSpace(incoming.Result)
+                ? incoming.Result : saved.Result,
+            EndReason = terminalCorrection && !string.IsNullOrWhiteSpace(incoming.EndReason)
+                ? incoming.EndReason : saved.EndReason,
+            FileCreated = terminalCorrection && incoming.FileCreated.HasValue
+                ? incoming.FileCreated : saved.FileCreated,
             ResultFinalized = saved.ResultFinalized || incoming.ResultFinalized,
-            DropCount = fillQuality ? incoming.DropCount : saved.DropCount,
-            ErrorCount = fillQuality ? incoming.ErrorCount : saved.ErrorCount,
-            ScrambleCount = fillQuality ? incoming.ScrambleCount : saved.ScrambleCount,
+            DropCount = adoptQuality ? incoming.DropCount : saved.DropCount,
+            ErrorCount = adoptQuality ? incoming.ErrorCount : saved.ErrorCount,
+            ScrambleCount = adoptQuality ? incoming.ScrambleCount : saved.ScrambleCount,
             QualityDataAvailable = saved.QualityDataAvailable || incoming.QualityDataAvailable,
-            QualityCompleteness = fillQuality ? incoming.QualityCompleteness : saved.QualityCompleteness,
-            QualitySource = fillQuality ? incoming.QualitySource : saved.QualitySource,
-            // Only the same broadcast occurrence may supply previously missing provenance. Keep an established
-            // origin on later Host replays; an unverified replay cannot erase it.
+            QualityCompleteness = adoptQuality ? incoming.QualityCompleteness : saved.QualityCompleteness,
+            QualitySource = adoptQuality ? incoming.QualitySource : saved.QualitySource,
+            Succeeded = terminalCorrection ? incoming.Succeeded : saved.Succeeded,
+            // Reservation occurrence matching is performed before this merge. Verified new origin evidence
+            // updates provenance, including an exclusion; unverified Host replays retain saved provenance.
             ReservationOriginKnown = saved.ReservationOriginKnown || incoming.ReservationOriginKnown,
-            ReservationIntent = saved.ReservationOriginKnown ? saved.ReservationIntent : incoming.ReservationIntent,
-            ReservationSource = saved.ReservationOriginKnown ? saved.ReservationSource : incoming.ReservationSource
+            ReservationIntent = incoming.ReservationOriginKnown ? incoming.ReservationIntent : saved.ReservationIntent,
+            ReservationSource = incoming.ReservationOriginKnown ? incoming.ReservationSource : saved.ReservationSource
         };
     }
 
@@ -387,20 +442,36 @@ internal static partial class AIrhythmDataState
             return false;
         }
 
+        var usageReceiptAliasesAdded = false;
         lock (Gate)
         {
             if (!_recordingFactsLoaded)
             {
                 foreach (var pair in loaded)
+                {
                     RecordingFacts[pair.Key] = pair.Value;
+                    // The historical counted receipt belongs to this exact stored recording, not to
+                    // a different programme which only happened to reuse the v2 identity.
+                    var legacyReceipt = UsageRecordingLedgerKey(LegacyRecordingFactIdentity(pair.Value));
+                    if (_usageTotalsInitialized && UsageCountedRecordingKeys.Contains(legacyReceipt)
+                        && UsageCountedRecordingKeys.Add(UsageRecordingLedgerKey(pair.Key)))
+                        usageReceiptAliasesAdded = true;
+                }
                 foreach (var pair in revisions)
                     RecordingFactChunkRevisions[pair.Key] = pair.Value;
                 RecordingFactsDirtyMonths.UnionWith(migratedMonths);
                 _recordingFactsLoaded = true;
+                if (usageReceiptAliasesAdded)
+                {
+                    _usageRecordingLedgerRevision++;
+                    _usageTotalsDirty = true;
+                }
             }
         }
+        if (usageReceiptAliasesAdded)
+            PersistUsageCounterState(context);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
-        WriteDeveloperLog($"recording fact store loaded facts={loaded.Count} chunks={revisions.Count} identityMigratedMonths={migratedMonths.Count} identityVersion=2 policy=append_success_terminal_no_host_deletion");
+        WriteDeveloperLog($"recording fact store loaded facts={loaded.Count} chunks={revisions.Count} identityMigratedMonths={migratedMonths.Count} identityVersion=3 policy=append_success_terminal_no_host_deletion");
 #endif
         return true;
     }
@@ -489,7 +560,7 @@ internal static partial class AIrhythmDataState
         {
             if (!fact.QualityDataAvailable) { unavailable++; continue; }
             available++;
-            if ((fact.DropCount ?? 0) <= 0 && (fact.ErrorCount ?? 0) <= 0 && (fact.ScrambleCount ?? 0) <= 0)
+            if (!AIrhythmRecoveryEvidencePolicy.HasAbnormalQuality(fact))
                 continue;
             abnormal++;
             // 文字列解析 — Bounded recent samples, not a title-specific watch list.
@@ -509,19 +580,41 @@ internal static partial class AIrhythmDataState
     // clean replacement. Monthly storage writes touch changed buckets only. Episode-ambiguous titles are not
     // treated as confirmed episode matches and do not trigger automatic reservations. Indexed resolution
     // state remains a separate development item.
-    private static bool TryRecoveryEpisodeKey(string? title, out string key)
+    // One strict episode syntax for both the durable journal and the recovery display. A generic
+    // "ep" within an unrelated film title is never an episode without an adjacent number.
+    private const string RecoveryEpisodeMarkerPattern =
+        @"(?:[#＃♯]\s*(?<number>[0-9]{1,4})(?![0-9])|第\s*(?<number>[0-9]{1,4})\s*(?:話|章)|(?:episode|ep\.?)\s*(?<number>[0-9]{1,4})(?![0-9])|(?<number>[0-9]{1,4})\s*話)";
+
+    // 録画実績・復旧 — Some listings contract a multi-episode span as 第1・2話 or 第1・第2話.
+    // The first number has no standalone 話 marker, so counting parsed episode markers alone would
+    // incorrectly admit only the last number. Such a broadcast is never a single-episode recovery fact.
+    private const string RecoveryContractedEpisodeGroupPattern =
+        @"(?:第\s*[0-9]{1,4}|[0-9]{1,4})(?:\s*(?:話|章))?\s*(?:[-~〜～–—－]|[,，、・･/／&＆+＋])\s*(?:第\s*)?[0-9]{1,4}\s*(?:話|章)";
+
+    internal static bool HasContractedRecoveryEpisodeGroup(string? title)
+        => !string.IsNullOrWhiteSpace(title)
+            && Regex.IsMatch(title.Normalize(NormalizationForm.FormKC),
+                RecoveryContractedEpisodeGroupPattern, RegexOptions.IgnoreCase);
+
+    internal static bool HasRecoveryEpisodeSyntax(string? title)
+        => !string.IsNullOrWhiteSpace(title)
+            && Regex.IsMatch(title.Normalize(NormalizationForm.FormKC),
+                RecoveryEpisodeMarkerPattern, RegexOptions.IgnoreCase);
+
+    internal static bool TryRecoveryEpisodeKey(string? title, out string key)
     {
         key = string.Empty;
         if (string.IsNullOrWhiteSpace(title)) return false;
         var normalized = title.Normalize(NormalizationForm.FormKC);
+        if (HasContractedRecoveryEpisodeGroup(normalized)) return false;
         // 録画実績・復旧 — A broadcast carrying several episodes is not a single-episode identity. In particular #1-12,
         // #1~12, #1,2, #1/#2 and 第1～3話 must not silently degrade to episode 1. Never expand ranges into separate
         // recovery matches: they require independent recording-quality evidence.
         if (Regex.IsMatch(normalized,
-            @"(?:[#＃]\s*\d{1,4}|第\s*\d{1,4}\s*(?:話|章)?)\s*(?:[-~〜～–—－]|[,，、/／&＆+＋])\s*(?:[#＃]\s*|第\s*)?\d{1,4}"))
+            @"(?:[#＃♯]\s*\d{1,4}|(?:episode|ep\.?)\s*\d{1,4}|第\s*\d{1,4}\s*(?:話|章)?|\d{1,4}\s*話)\s*(?:[-~〜～–—－]|[,，、/／&＆+＋])\s*(?:(?:[#＃♯]|(?:episode|ep\.?)|第)\s*)?\d{1,4}",
+            RegexOptions.IgnoreCase))
             return false;
-        var matches = Regex.Matches(normalized,
-            @"(?:[#＃]\s*(?<number>[0-9]{1,4})(?![0-9])|第\s*(?<number>[0-9]{1,4})\s*(?:話|章))");
+        var matches = Regex.Matches(normalized, RecoveryEpisodeMarkerPattern, RegexOptions.IgnoreCase);
         // 作品識別 — Multiple individually stated episodes (e.g. 第1話・第2話) are also ambiguous for an episode-specific
         // repair attempt.
         if (matches.Count != 1) return false;
@@ -541,20 +634,20 @@ internal static partial class AIrhythmDataState
     // 録画実績・復旧 — A multi-episode EPG listing is a *coverage hint* only. It is never proof of episode-level
     // recording quality and cannot close or reserve a recovery case. Never expand arbitrary lists or titles
     // containing a second episode marker.
-    private static bool TryRecoveryMultiEpisodeRange(string? title, out string stem, out int first, out int last)
+    internal static bool TryRecoveryMultiEpisodeRange(string? title, out string stem, out int first, out int last)
     {
         stem = string.Empty;
         first = last = 0;
         if (string.IsNullOrWhiteSpace(title)) return false;
         var normalized = title.Normalize(NormalizationForm.FormKC);
         var range = Regex.Match(normalized,
-            @"(?:[#＃]\s*(?<a>[0-9]{1,4})|第\s*(?<a>[0-9]{1,4})\s*(?:話|章)?)\s*[-~〜～–—－]\s*(?:[#＃]\s*|第\s*)?(?<b>[0-9]{1,4})(?:\s*(?:話|章))?");
+            @"(?:[#＃♯]\s*(?<a>[0-9]{1,4})|第\s*(?<a>[0-9]{1,4})\s*(?:話|章)?)\s*[-~〜～–—－]\s*(?:[#＃♯]\s*|第\s*)?(?<b>[0-9]{1,4})(?:\s*(?:話|章))?");
         if (!range.Success || !int.TryParse(range.Groups["a"].Value, out first)
             || !int.TryParse(range.Groups["b"].Value, out last)
             || first < 1 || last <= first || last - first > 99) return false;
         // 作品識別 — If additional episode markers exist, the title is structurally ambiguous.
         var remainder = normalized.Remove(range.Index, range.Length);
-        if (Regex.IsMatch(remainder, @"(?:[#＃]\s*\d{1,4}|第\s*\d{1,4}\s*(?:話|章))")) return false;
+        if (Regex.IsMatch(remainder, @"(?:[#＃♯]\s*\d{1,4}|第\s*\d{1,4}\s*(?:話|章))")) return false;
         stem = new string(normalized[..range.Index]
             .Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
         return stem.Length >= 4;
@@ -563,7 +656,10 @@ internal static partial class AIrhythmDataState
     // 録画実績・復旧 — Read-only recovery candidate detection. Construct a snapshot-local hash index of future EPG
     // events; never reserve, resolve, or mutate recovery evidence here. No extra I/O, timers, background
     // tasks, or network requests.
-    private static void AuditRecoveryEpgCandidates(ITvAirPluginRuntimeContext context, IReadOnlyList<TvAirProgramEventDto> futureEvents)
+    private static void AuditRecoveryEpgCandidates(
+        ITvAirPluginRuntimeContext context,
+        IReadOnlyList<TvAirProgramEventDto> futureEvents,
+        IReadOnlySet<string> admittedRecoveryIdentities)
     {
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmRecoveryAttempt[] attempts = Array.Empty<AIrhythmRecoveryAttempt>();
@@ -579,6 +675,14 @@ internal static partial class AIrhythmDataState
             lookup = usedVerifiedLookup ? _verifiedRecoveryLookup.ToArray() : Array.Empty<AIrhythmRecoveryLookupEntry>();
             if (!usedVerifiedLookup) attempts = RecoveryAttempts.Values.ToArray();
         }
+        // Legacy journal entries are not authorization. Only this capture's verified
+        // non-program recordings may participate in recovery lookups and diagnostics.
+        if (usedVerifiedLookup)
+            lookup = lookup.Where(x => admittedRecoveryIdentities.Contains(x.Identity)).ToArray();
+        else
+            attempts = attempts.Where(x => admittedRecoveryIdentities.Contains(
+                CanonicalRecoveryAttemptIdentity(x))).ToArray();
+        journalCount = usedVerifiedLookup ? lookup.Length : attempts.Length;
         var byEpisode = new Dictionary<string, List<TvAirProgramEventDto>>(StringComparer.Ordinal);
         var indexedEvents = 0;
         foreach (var programme in futureEvents)
@@ -649,7 +753,8 @@ internal static partial class AIrhythmDataState
                 {
                     // 処理条件 — A partial month cannot make an old attempt disappear.
                     usedVerifiedLookup = false;
-                    lock (Gate) attempts = RecoveryAttempts.Values.ToArray();
+                    lock (Gate) attempts = RecoveryAttempts.Values
+                        .Where(x => admittedRecoveryIdentities.Contains(CanonicalRecoveryAttemptIdentity(x))).ToArray();
                     // 処理条件 — A failed lazy read cannot silently hide old attempts. Disable this diagnostic pass until the
                     // full canonical path is available.
                     if (_recoveryLazyIndexed) return;
@@ -789,6 +894,65 @@ internal static partial class AIrhythmDataState
         return bucket;
     }
 
+    private static TvAirRecordingHistoryDto FromRecoveryAttempt(AIrhythmRecoveryAttempt row)
+        => new()
+        {
+            ReservationId = row.ReservationId, RecordingId = row.RecordingId,
+            ServiceName = row.ServiceName,
+            ProgramTitle = row.ProgramTitle,
+            NetworkId = row.NetworkId, TransportStreamId = row.TransportStreamId,
+            ServiceId = row.ServiceId, EventId = row.EventId,
+            ScheduledStartTime = row.ScheduledStartTime,
+            Start = row.Start, End = row.End,
+            Result = row.Result, EndReason = row.EndReason, FileCreated = row.FileCreated,
+            Genre = row.Genre,
+            DropCount = row.DropCount, ErrorCount = row.ErrorCount,
+            ScrambleCount = row.ScrambleCount,
+            QualityDataAvailable = row.QualityDataAvailable,
+            QualitySource = row.QualitySource,
+            QualityCompleteness = row.QualityCompleteness,
+            ResultFinalized = (row.ResultFinalized ?? true) && (row.Succeeded.HasValue
+                || AIrhythmRecoveryEvidencePolicy.HasConcreteLegacyRecoveryEvidence(row.Result,
+                    row.EndReason, row.FileCreated, row.QualityDataAvailable,
+                    row.DropCount, row.ErrorCount, row.ScrambleCount)),
+            Succeeded = row.Succeeded ?? AIrhythmRecoveryEvidencePolicy.IsSuccessfulRecordingResult(row.Result)
+        };
+
+    private static AIrhythmRecoveryAttempt RefreshRecoveryAttempt(
+        AIrhythmRecoveryAttempt saved, AIrhythmRecoveryAttempt current)
+    {
+        // A complete finalized update can correct an earlier failure; legacy unknown remains unknown.
+        var savedQuality = FromRecoveryAttempt(saved);
+        var newQuality = FromRecoveryAttempt(current);
+        var incomingComplete = AIrhythmRecoveryEvidencePolicy.HasVerifiedCompleteQuality(newQuality);
+        var upgradeQuality = current.QualityDataAvailable
+            && (incomingComplete
+                || !saved.QualityDataAvailable
+                || (!AIrhythmRecoveryEvidencePolicy.HasAbnormalQuality(savedQuality)
+                    && AIrhythmRecoveryEvidencePolicy.HasAbnormalQuality(newQuality)));
+        var terminalCorrection = AIrhythmRecoveryEvidencePolicy.IsVerifiedClean(newQuality)
+            || AIrhythmRecoveryEvidencePolicy.IsDefective(newQuality);
+        return saved with
+        {
+            // A newer unknown or incomplete "success" must not erase a proven failure.
+            Result = terminalCorrection && !string.IsNullOrWhiteSpace(current.Result) ? current.Result : saved.Result,
+            EndReason = terminalCorrection && !string.IsNullOrWhiteSpace(current.EndReason)
+                ? current.EndReason : saved.EndReason,
+            FileCreated = terminalCorrection ? (current.FileCreated ?? saved.FileCreated) : saved.FileCreated,
+            Succeeded = terminalCorrection ? (current.Succeeded ?? saved.Succeeded) : saved.Succeeded,
+            ResultFinalized = current.ResultFinalized ?? saved.ResultFinalized,
+            QualityDataAvailable = saved.QualityDataAvailable || current.QualityDataAvailable,
+            DropCount = upgradeQuality ? current.DropCount : saved.DropCount,
+            ErrorCount = upgradeQuality ? current.ErrorCount : saved.ErrorCount,
+            ScrambleCount = upgradeQuality ? current.ScrambleCount : saved.ScrambleCount,
+            QualityCompleteness = upgradeQuality ? current.QualityCompleteness : saved.QualityCompleteness,
+            QualitySource = upgradeQuality ? current.QualitySource : saved.QualitySource,
+            Genre = string.IsNullOrWhiteSpace(saved.Genre) ? current.Genre : saved.Genre,
+            ReservationId = string.IsNullOrWhiteSpace(saved.ReservationId) ? current.ReservationId : saved.ReservationId,
+            RecordingId = string.IsNullOrWhiteSpace(saved.RecordingId) ? current.RecordingId : saved.RecordingId
+        };
+    }
+
     private static void MergeRecoveryAttempts(ITvAirPluginRuntimeContext context,
         IReadOnlyList<TvAirRecordingHistoryDto> hostHistory,
         IReadOnlyList<TvAirRecordingHistoryDto> durableHistory)
@@ -863,15 +1027,19 @@ internal static partial class AIrhythmDataState
         lock (Gate) updatedMonths.UnionWith(_recoveryDirtyMonths);
         var added = 0;
         // 推薦・学習 — Durable success-quality facts and still-visible unsuccessful Host records. Never write
-        // failed/cancelled attempts into positive preference evidence.
-        var candidates = durableHistory.Where(x => x.ResultFinalized && x.QualityDataAvailable &&
-            ((x.DropCount ?? 0) > 0 || (x.ErrorCount ?? 0) > 0 || (x.ScrambleCount ?? 0) > 0))
-            .Concat(hostHistory.Where(x => x.ResultFinalized && IsRecordingFailureForRecovery(x)));
+        // failed/cancelled attempts into positive preference evidence. Do not filter factual recovery by
+        // reservation-origin eligibility: that restriction applies to learning, not to repair evidence.
+        // Include clean finalized corrections ONLY to update an already persisted failed attempt.
+        // A first-time clean result never creates a recovery attempt.
+        var candidates = durableHistory.Where(x => x.ResultFinalized)
+            .Concat(hostHistory.Where(x => x.ResultFinalized));
+        var resetCutoff = GetDataResetCutoff(context);
         lock (Gate)
         {
             foreach (var item in candidates)
             {
-                if (string.IsNullOrWhiteSpace(item.ProgramTitle)) continue;
+                if (string.IsNullOrWhiteSpace(item.ProgramTitle)
+                    || (resetCutoff is not null && (item.ActualStart ?? item.Start) < resetCutoff.Value)) continue;
                 var identity = UsageRecordingIdentity(item);
                 if (string.IsNullOrWhiteSpace(identity)) continue;
                 var row = new AIrhythmRecoveryAttempt(identity, item.ServiceName ?? "", item.ProgramTitle ?? "",
@@ -879,11 +1047,16 @@ internal static partial class AIrhythmDataState
                     item.ScheduledStartTime, item.Start, item.End,
                     item.Result ?? "", item.EndReason ?? "", item.FileCreated,
                     item.DropCount, item.ErrorCount, item.ScrambleCount,
-                    item.QualityDataAvailable, item.QualitySource ?? "");
-                if (RecoveryAttempts.ContainsKey(identity) ||
-                    (_recoveryLazyIndexed && (VerifiedLegacyRecoveryAliases.Contains(identity) ||
-                        _verifiedRecoveryLookup.Any(e => string.Equals(e.Identity, identity, StringComparison.OrdinalIgnoreCase))))) continue;
+                    item.QualityDataAvailable, item.QualitySource ?? "",
+                    item.Succeeded, item.ResultFinalized, item.QualityCompleteness ?? "", item.Genre ?? "",
+                    item.ReservationId ?? "", item.RecordingId ?? "");
                 var rowMonth = row.Start.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+                // No reason to create an empty month for an ordinary successful recording.
+                if (!AIrhythmRecoveryEvidencePolicy.IsDefective(item)
+                    && !RecoveryAttempts.ContainsKey(identity)
+                    && !(_recoveryLazyIndexed && _verifiedRecoveryLookup.Any(e =>
+                        string.Equals(e.Identity, identity, StringComparison.OrdinalIgnoreCase))))
+                    continue;
                 if (_recoveryLazyIndexed && !RecoveryAttemptsByMonth.ContainsKey(rowMonth))
                 {
                     try
@@ -916,22 +1089,36 @@ internal static partial class AIrhythmDataState
                         continue;
                     }
                 }
-                // 録画実績・復旧 — Historic recovery months can still hold an unscoped ID. Never double-count the same
-                // failed/quality-impaired recording; unlike the ID alone, a different broadcast slot is distinct.
-                var legacyIdentity = LegacyRecoveryIdentity(item);
-                if (RecoveryAttemptsByMonth.TryGetValue(rowMonth, out var legacyBucket)
-                    && legacyBucket.TryGetValue(legacyIdentity, out var legacyAttempt)
-                    && IsSameLegacyRecoveryAttempt(legacyAttempt, item))
-                {
-                    // 処理条件 — The original month was fully read and verified against the authoritative manifest. Never
-                    // rehydrate it every refresh.
-                    if (_recoveryLazyIndexed)
-                        VerifiedLegacyRecoveryAliases.Add(identity);
-                    continue;
-                }
-                RecoveryAttempts.Add(identity, row);
                 if (!RecoveryAttemptsByMonth.TryGetValue(rowMonth, out var bucket))
                     RecoveryAttemptsByMonth[rowMonth] = bucket = new Dictionary<string, AIrhythmRecoveryAttempt>(StringComparer.OrdinalIgnoreCase);
+                // Earlier journal entries may still have unscoped legacy IDs. Verify all occurrence
+                // coordinates before treating the observation as an update.
+                var existing = bucket.TryGetValue(identity, out var exact) ? exact
+                    : bucket.Values.FirstOrDefault(old => IsSameRecoveryObservation(old, item)
+                        || IsSameLegacyRecoveryAttempt(old, item));
+                if (existing is not null)
+                {
+                    // Never update an earlier row with unrelated programme metadata.
+                    if (!string.Equals((existing.ProgramTitle ?? string.Empty).Trim(),
+                            (item.ProgramTitle ?? string.Empty).Trim(), StringComparison.Ordinal)
+                        || existing.NetworkId != item.NetworkId
+                        || existing.TransportStreamId != item.TransportStreamId
+                        || existing.ServiceId != item.ServiceId
+                        || existing.ScheduledStartTime != item.ScheduledStartTime
+                        || existing.Start != item.Start)
+                        continue;
+                    var refreshed = RefreshRecoveryAttempt(existing, row);
+                    if (refreshed != existing)
+                    {
+                        bucket[existing.Identity] = refreshed;
+                        if (RecoveryAttempts.ContainsKey(existing.Identity))
+                            RecoveryAttempts[existing.Identity] = refreshed;
+                        updatedMonths.Add(rowMonth);
+                    }
+                    continue;
+                }
+                if (!AIrhythmRecoveryEvidencePolicy.IsDefective(item)) continue;
+                RecoveryAttempts[identity] = row;
                 bucket.Add(identity, row);
                 updatedMonths.Add(rowMonth);
                 added++;
@@ -1198,7 +1385,106 @@ internal static partial class AIrhythmDataState
 #endif
     }
 
-    private static int MergeUsefulRecordingFacts(
+    // All raw recording facts remain stored. Only recordings with confirmed eligible reservation
+    // provenance may influence totals, dashboards, preference learning, recommendation or recovery.
+    internal static bool IsAdmittedRecording(TvAirRecordingHistoryDto item)
+    {
+        lock (Gate)
+            return RecordingFacts.TryGetValue(UsageRecordingIdentity(item), out var fact)
+                && IsAdmittedRecordingFact(fact);
+    }
+
+    private static bool IsAdmittedRecordingFact(AIrhythmRecordingFact fact)
+        => (fact.Succeeded ?? true) && IsUsefulHistory(FromRecordingFact(fact))
+            && AIrhythmPreferenceOriginPolicy.AllowsRecordingPreference(
+                fact.ReservationOriginKnown, fact.ReservationIntent, fact.ReservationSource);
+
+    // The Host's reservation history is the only way to resolve a legacy fact that arrived
+    // before this plugin tracked origin. An ID alone is insufficient: validate station and slot.
+    private static int ReconcileRecordingOrigins(
+        ITvAirPluginRuntimeContext context, IReadOnlyList<TvAirReservationDto> reservations)
+    {
+        if (!EnsureRecordingFactsLoaded(context)) return 0;
+        var byId = reservations.Where(x => !string.IsNullOrWhiteSpace(x.ReservationId))
+            .GroupBy(x => x.ReservationId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+        var months = new HashSet<string>(StringComparer.Ordinal);
+        var changed = 0;
+        lock (Gate)
+        {
+            foreach (var pair in RecordingFacts.ToArray())
+            {
+                var fact = pair.Value;
+                if (byId.TryGetValue(fact.ReservationId, out var candidates))
+                {
+                    var recording = FromRecordingFact(fact);
+                    var origin = candidates.FirstOrDefault(x => RecordingBelongsToReservationOccurrence(recording, x));
+                    // A verified exclusion overrides stale previously admitted provenance.
+                    if (origin is not null && (!fact.ReservationOriginKnown
+                        || fact.ReservationIntent != origin.Intent
+                        || !string.Equals(fact.ReservationSource, origin.Source, StringComparison.OrdinalIgnoreCase)))
+                        fact = fact with
+                        {
+                            ReservationOriginKnown = true,
+                            ReservationIntent = origin.Intent,
+                            ReservationSource = origin.Source
+                        };
+                }
+                // Provenance is retained even when excluded. Removing the underlying historical fact
+                // would irreversibly destroy evidence needed for later origin reconciliation and backup.
+                // Only the admission projection and accounted receipt can change.
+                if (!IsAdmittedRecordingFact(fact)
+                    && _usageTotalsInitialized
+                    && UsageCountedRecordingKeys.Remove(UsageRecordingLedgerKey(pair.Key)))
+                {
+                    _usageTotals = _usageTotals with
+                    {
+                        RecordingTotal = Math.Max(0L, _usageTotals.RecordingTotal - 1)
+                    };
+                    _usageRecordingLedgerRevision++;
+                    _usageTotalsDirty = true;
+                }
+                if (fact != pair.Value)
+                {
+                    RecordingFacts[pair.Key] = fact;
+                    months.Add(RecordingFactMonthKey(fact));
+                    _recordingFactsGeneration++;
+                    changed++;
+                }
+            }
+        }
+        PersistRecordingFactChunks(context, months);
+        bool usageChanged;
+        lock (Gate) usageChanged = _usageTotalsDirty;
+        if (usageChanged) PersistUsageCounterState(context);
+        return changed;
+    }
+
+    private static IReadOnlyList<TvAirRecordingHistoryDto> SelectAdmittedHostHistory(
+        IReadOnlyList<TvAirRecordingHistoryDto> history,
+        IReadOnlyList<TvAirReservationDto> origins)
+    {
+        var byId = origins.Where(x => !string.IsNullOrWhiteSpace(x.ReservationId))
+            .GroupBy(x => x.ReservationId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.ToArray(), StringComparer.OrdinalIgnoreCase);
+        var admitted = new List<TvAirRecordingHistoryDto>(history.Count);
+        foreach (var recording in history)
+        {
+            TvAirReservationDto? origin = null;
+            if (!string.IsNullOrWhiteSpace(recording.ReservationId)
+                && byId.TryGetValue(recording.ReservationId, out var matches))
+                origin = matches.FirstOrDefault(x => RecordingBelongsToReservationOccurrence(recording, x));
+            if (origin is not null)
+            {
+                if (AIrhythmPreferenceOriginPolicy.AllowsReservation(origin)) admitted.Add(recording);
+            }
+            else if (IsAdmittedRecording(recording))
+                admitted.Add(recording);
+        }
+        return admitted;
+    }
+
+    private static int MergeFinalizedRecordingFacts(
         ITvAirPluginRuntimeContext context,
         IEnumerable<TvAirRecordingHistoryDto> source,
         IReadOnlyList<TvAirReservationDto>? reservationRecords = null)
@@ -1223,7 +1509,7 @@ internal static partial class AIrhythmDataState
         {
             foreach (var item in source)
             {
-                if (!IsUsefulHistory(item))
+                if (!item.ResultFinalized || string.IsNullOrWhiteSpace(item.ProgramTitle))
                     continue;
                 if (resetCutoff is not null && (item.ActualStart ?? item.Start) < resetCutoff.Value)
                     continue;
@@ -1231,6 +1517,8 @@ internal static partial class AIrhythmDataState
                 if (!string.IsNullOrWhiteSpace(item.ReservationId)
                     && reservationsById.TryGetValue(item.ReservationId, out var candidates))
                     matchingReservation = candidates.FirstOrDefault(x => RecordingBelongsToReservationOccurrence(item, x));
+                // Preserve raw verified/excluded and unresolved recording facts without teaching from them.
+                // The common admission gate alone owns all productive snapshots and aggregates.
                 var fact = ToRecordingFact(item, matchingReservation);
                 if (fact.Identity.Length == 0)
                     continue;
@@ -1284,6 +1572,86 @@ internal static partial class AIrhythmDataState
         }
     }
 
+    private static IReadOnlyList<TvAirRecordingHistoryDto> GetAllFactualRecordingHistory(
+        ITvAirPluginRuntimeContext context)
+    {
+        if (!EnsureRecordingFactsLoaded(context)) return Array.Empty<TvAirRecordingHistoryDto>();
+        lock (Gate)
+            return RecordingFacts.Values.Where(x => x.ResultFinalized)
+                .Select(FromRecordingFact).ToArray();
+    }
+
+    // Journal rows are retained independently of positive learning. Read only relevant months from
+    // the verified index, using episode NUMBER as a coarse filter; the canonical full-content
+    // identity in Discovery is still the authority. Unnumbered film rows must also be considered.
+    private static IReadOnlyList<TvAirRecordingHistoryDto> GetPersistedRecoveryHistory(
+        ITvAirPluginRuntimeContext context, IReadOnlyList<TvAirProgramEventDto> future)
+    {
+        AIrhythmRecoveryAttempt[] pending;
+        AIrhythmRecoveryLookupEntry[] indexed;
+        bool ready, lazy;
+        lock (Gate)
+        {
+            ready = _recoveryAttemptsLoaded;
+            lazy = _recoveryLazyIndexed;
+            pending = RecoveryAttempts.Values.ToArray();
+            indexed = _verifiedRecoveryLookup.ToArray();
+        }
+        if (!ready) return Array.Empty<TvAirRecordingHistoryDto>();
+        var rows = new Dictionary<string, AIrhythmRecoveryAttempt>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in pending) rows[row.Identity] = row;
+        if (lazy)
+        {
+            var numbers = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var e in future)
+                if (TryRecoveryEpisodeKey(e.Title, out var key))
+                {
+                    var separator = key.LastIndexOf('#');
+                    if (separator >= 0) numbers.Add(key[(separator + 1)..]);
+                }
+            var months = indexed.Where(e => e.EpisodeKey.Length == 0
+                    || (e.EpisodeKey.LastIndexOf('#') is var separator && separator >= 0
+                        && numbers.Contains(e.EpisodeKey[(separator + 1)..])))
+                .Select(e => e.Month).Distinct(StringComparer.Ordinal).ToArray();
+            try
+            {
+                // The sidecar was verified against every authoritative monthly SHA256 at load.
+                // Any subsequent source-month change aborts this projection rather than display partial facts.
+                var manifestEntry = context.Storage.Get(RecoveryLookupStorageNamespace, RecoveryLookupStorageKey);
+                if (!manifestEntry.Succeeded || manifestEntry.Value?.Value is null)
+                    return Array.Empty<TvAirRecordingHistoryDto>();
+                var manifest = JsonSerializer.Deserialize<AIrhythmRecoveryLookupManifest>(
+                    manifestEntry.Value.Value.ToString() ?? "", JsonOptions);
+                if (manifest?.SchemaVersion != 2 || manifest.Months is null)
+                    return Array.Empty<TvAirRecordingHistoryDto>();
+                foreach (var month in months)
+                {
+                    var evidence = manifest.Months.FirstOrDefault(x => x.Month == month);
+                    var actual = context.Storage.Get(RecoveryAttemptStorageNamespace, month);
+                    if (evidence is null || !actual.Succeeded || actual.Value?.Value is null)
+                        return Array.Empty<TvAirRecordingHistoryDto>();
+                    var json = actual.Value.Value.ToString() ?? string.Empty;
+                    var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json)));
+                    if (!string.Equals(hash, evidence.Sha256, StringComparison.OrdinalIgnoreCase))
+                        return Array.Empty<TvAirRecordingHistoryDto>();
+                    var bucket = JsonSerializer.Deserialize<AIrhythmRecoveryAttempt[]>(json, JsonOptions)
+                        ?? throw new InvalidOperationException("Recovery journal month invalid");
+                    if (bucket.Length != evidence.RowCount) return Array.Empty<TvAirRecordingHistoryDto>();
+                    foreach (var row in bucket)
+                    {
+                        if (string.IsNullOrWhiteSpace(row.Identity)) return Array.Empty<TvAirRecordingHistoryDto>();
+                        if (!rows.ContainsKey(row.Identity)) rows.Add(row.Identity, row);
+                    }
+                }
+            }
+            catch (Exception) { return Array.Empty<TvAirRecordingHistoryDto>(); }
+        }
+        var cutoff = GetDataResetCutoff(context);
+        return rows.Values.Where(x => cutoff is null || x.Start >= cutoff.Value)
+            .Select(FromRecoveryAttempt).Where(AIrhythmRecoveryEvidencePolicy.IsDefective)
+            .ToArray();
+    }
+
     private static IReadOnlyList<TvAirRecordingHistoryDto> GetRecordingFactHistory(
         ITvAirPluginRuntimeContext context,
         IEnumerable<TvAirRecordingHistoryDto> hostHistory,
@@ -1291,36 +1659,25 @@ internal static partial class AIrhythmDataState
         out int seeded)
     {
         var latest = hostHistory.ToArray();
-        seeded = MergeUsefulRecordingFacts(context, latest, reservationRecords);
+        seeded = MergeFinalizedRecordingFacts(context, latest, reservationRecords);
+        ReconcileRecordingOrigins(context, reservationRecords);
         bool loaded;
         TvAirRecordingHistoryDto[] facts;
         lock (Gate)
         {
             loaded = _recordingFactsLoaded;
-            facts = loaded ? RecordingFacts.Values.Select(FromRecordingFact).ToArray() : Array.Empty<TvAirRecordingHistoryDto>();
+            facts = loaded ? RecordingFacts.Values.Where(IsAdmittedRecordingFact)
+                .Select(FromRecordingFact).ToArray() : Array.Empty<TvAirRecordingHistoryDto>();
         }
         if (loaded)
         {
             // 録画実績・復旧 — Retry an incomplete save even when no new recording facts have arrived.
             PersistRecordingFactChunks(context, Array.Empty<string>());
-            ReconcileFinalizedRecordingUsage(context, latest.Concat(facts), "history_snapshot");
+            ReconcileFinalizedRecordingUsage(context, facts, "history_snapshot");
             return facts.OrderByDescending(x => x.ActualStart ?? x.Start).ToArray();
         }
-        ReconcileFinalizedRecordingUsage(context, latest, "history_snapshot");
-        return latest.Where(IsUsefulHistory).OrderByDescending(x => x.ActualStart ?? x.Start).ToArray();
-    }
-
-    private static bool RememberUsageIdentity(HashSet<string> set, Queue<string> order, string identity)
-    {
-        if (string.IsNullOrWhiteSpace(identity) || !set.Add(identity))
-            return false;
-        order.Enqueue(identity);
-        while (order.Count > UsageRecentIdentityLimit)
-        {
-            var removed = order.Dequeue();
-            set.Remove(removed);
-        }
-        return true;
+        // A failed persistent read must not turn unknown Host history into preference evidence.
+        return Array.Empty<TvAirRecordingHistoryDto>();
     }
 
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
@@ -1353,7 +1710,8 @@ internal static partial class AIrhythmDataState
         if (!string.Equals(eventType, "ReservationAdded", StringComparison.OrdinalIgnoreCase))
             return;
         var reservation = resolvedAddedReservation;
-        if (reservation is null || string.IsNullOrWhiteSpace(reservation.ReservationId))
+        if (reservation is null || string.IsNullOrWhiteSpace(reservation.ReservationId)
+            || !AIrhythmPreferenceOriginPolicy.AllowsReservation(reservation))
         {
             WriteDeveloperLog($"EVIDENCE_CALIBRATION_SAMPLE result=SKIPPED observation={envelope.EntityId ?? "-"} reason=reservation_payload_unresolved targetLeakagePrevented=True nonSelectionNegative=False scoreMutation=False");
             return;

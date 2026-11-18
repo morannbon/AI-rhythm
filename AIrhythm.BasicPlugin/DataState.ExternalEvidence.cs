@@ -665,7 +665,7 @@ internal static partial class AIrhythmDataState
             score += 20;
 
         // 作品識別 — Episode markers are useful as source evidence, but search itself should start at work level.
-        if (Regex.IsMatch(value, @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃]\s*[0-9０-９]+)", RegexOptions.IgnoreCase))
+        if (Regex.IsMatch(value, @"(?:第\s*[0-9０-９]+\s*(?:話|回)|[#＃♯]\s*[0-9０-９]+)", RegexOptions.IgnoreCase))
             score -= 25;
 
         return score;

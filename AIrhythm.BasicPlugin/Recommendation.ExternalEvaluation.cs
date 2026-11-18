@@ -221,6 +221,16 @@ internal static partial class AIrhythmRecommendationEngine
         return workKey.Length >= 3 ? workKey : RecommendationIdentityKey(item);
     }
 
+    // A scored recommendation already carries the genre resolved by CanonicalEvidenceFacts.
+    // Comparison and diagnosis use the broad genre family, not EPG subgenre detail.
+    // Unknown genres stay unknown; no genre is inferred from a title or a user preference.
+    private static string RecommendationGenreFamily(string? canonicalGenre)
+    {
+        var genre = NormalizeGenre(canonicalGenre);
+        var detailSeparator = genre.IndexOf('/');
+        return detailSeparator > 0 ? genre[..detailSeparator] : genre;
+    }
+
     private static AIrhythmRecommendation[] InterleaveRecommendationsByWork(
         IReadOnlyList<AIrhythmRecommendation> orderedCandidates,
         int limit,
@@ -262,67 +272,38 @@ internal static partial class AIrhythmRecommendationEngine
 
     private static AIrhythmRecommendation[] SelectRecommendations(IReadOnlyList<AIrhythmRecommendation> candidates, int limit, AIrhythmEvidenceIdentityContext identityContext)
     {
-        var convincingPool = candidates.Where(x => x.IsConvincing).ToArray();
-        var discoveryPool = candidates.Where(x => !x.IsConvincing && x.IsPlausibleDiscovery).ToArray();
-        var convincingDensity = Math.Min(convincingPool.Length, limit);
-
-        // 処理条件 — 「納得」が十分に成立してからだけ、説明できる意外性を少量混ぜる。 件数比率を固定せず、その時点の信頼できる候補密度を優先する。
-        var discoveryAllowance = convincingDensity switch
-        {
-            < 4 => 0,
-            < 8 => 1,
-            < 14 => 2,
-            _ => Math.Min(4, Math.Max(2, limit / 6))
-        };
-        discoveryAllowance = Math.Min(discoveryAllowance, discoveryPool.Length);
-
-        // 作品識別 — Scoreそのものは変更せず、同一Workの第2候補以降だけを次ラウンドへ回す。 まず異なるWorkの最高順位候補を一巡し、候補不足時だけ2巡目・3巡目を戻す。
-        // 固定件数上限ではないため、候補母集団が少ない場合は同一Workも通常どおり復帰する。
-        var convincingTarget = Math.Max(0, limit - discoveryAllowance);
-        var convincing = InterleaveRecommendationsByWork(convincingPool, convincingTarget, identityContext);
-        var discovery = InterleaveRecommendationsByWork(discoveryPool, discoveryAllowance, identityContext);
-        var combinedByScore = convincing
-            .Concat(discovery)
-            .OrderByDescending(x => x.Score)
-            .ThenBy(x => x.Start)
+        // 推薦・学習 — The same continuous, behavior-calibrated evidence drives the main list
+        // and all discovery shelves. A zero value means literally no independent content,
+        // work or explicit user evidence; it is not a tunable confidence threshold.
+        // Ranking is relative to the current learned population, never a genre quota.
+        var supported = candidates
+            .Where(item => item.EvidenceRelevance > 0.0d)
+            .OrderByDescending(item => item.DeviationRawScore)
+            .ThenByDescending(item => item.EvidenceConfidence)
+            .ThenBy(item => item.Start)
             .ToArray();
-        var selected = InterleaveRecommendationsByWork(combinedByScore, limit, identityContext).ToList();
-
-        // 作品識別 — 選抜枠が不足した場合だけ、未選択の納得候補を同じWork-aware順で戻す。
-        if (selected.Count < limit)
-        {
-            var selectedKeys = selected.Select(RecommendationIdentityKey).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var remainingConvincing = convincingPool
-                .Where(x => selectedKeys.Add(RecommendationIdentityKey(x)))
-                .ToArray();
-            if (remainingConvincing.Length > 0)
-            {
-                var refill = InterleaveRecommendationsByWork(remainingConvincing, limit - selected.Count, identityContext);
-                selected.AddRange(refill);
-                selected = InterleaveRecommendationsByWork(
-                    selected.OrderByDescending(x => x.Score).ThenBy(x => x.Start).ToArray(),
-                    limit,
-                    identityContext).ToList();
-            }
-        }
-
+        var selected = InterleaveRecommendationsByWork(supported, limit, identityContext);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        static int DistinctSelectionGenres(IEnumerable<AIrhythmRecommendation> items)
+            => items.Select(item => RecommendationGenreFamily(item.Genre))
+                .Where(genre => genre.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
+        AIrhythmDataState.WriteDeveloperLog(
+            $"RECOMMENDATION_GENRE_COVERAGE eligible={supported.Length} eligibleGenres={DistinctSelectionGenres(supported)} selectedGenres={DistinctSelectionGenres(selected)} unknownSelected={selected.Count(item => RecommendationGenreFamily(item.Genre).Length == 0)} selected={selected.Length} policy=continuous_learned_evidence_no_forced_quota");
+        AIrhythmDataState.WriteDeveloperLog(
+            $"RECOMMENDATION_EVIDENCE_CALIBRATION scored={candidates.Count} supported={supported.Length} meanConfidence={supported.Select(x => x.EvidenceConfidence).DefaultIfEmpty(0.0d).Average():0.000} meanRelevance={supported.Select(x => x.EvidenceRelevance).DefaultIfEmpty(0.0d).Average():0.000} topSelectedConfidence={selected.Select(x => x.EvidenceConfidence).DefaultIfEmpty(0.0d).Average():0.000} topSelectedRelevance={selected.Select(x => x.EvidenceRelevance).DefaultIfEmpty(0.0d).Average():0.000} genreQuotas=False independentEvidenceRequired=True");
         var selectedOccupancy = selected
-            .Select((item, index) => new
-            {
-                Work = RecommendationSelectionWorkKey(item, identityContext),
-                Rank = index + 1
-            })
+            .Select((item, index) => new { Work = RecommendationSelectionWorkKey(item, identityContext), Rank = index + 1 })
             .GroupBy(x => x.Work, StringComparer.OrdinalIgnoreCase)
             .Select(group => new { Work = group.Key, Count = group.Count(), BestRank = group.Min(x => x.Rank) })
             .OrderByDescending(x => x.Count)
             .ThenBy(x => x.BestRank)
             .ToArray();
         AIrhythmDataState.WriteDeveloperLog(
-            $"LOCAL_WORK_SELECTION_INTERLEAVE selected={selected.Count} uniqueWorks={selectedOccupancy.Length} repeatedWorks={selectedOccupancy.Count(x => x.Count > 1)} maxPerWork={(selectedOccupancy.Length == 0 ? 0 : selectedOccupancy.Max(x => x.Count))} samples=[{string.Join(",", selectedOccupancy.Take(8).Select(x => $"{x.Work}:{x.Count}@{x.BestRank}"))}] policy=work_round_interleave_no_score_mutation");
+            $"LOCAL_WORK_SELECTION_INTERLEAVE selected={selected.Length} uniqueWorks={selectedOccupancy.Length} repeatedWorks={selectedOccupancy.Count(x => x.Count > 1)} maxPerWork={(selectedOccupancy.Length == 0 ? 0 : selectedOccupancy.Max(x => x.Count))} samples=[{string.Join(",", selectedOccupancy.Take(8).Select(x => $"{x.Work}:{x.Count}@{x.BestRank}"))}] policy=work_round_interleave_no_score_mutation");
 #endif
-
-        return selected.ToArray();
+        return selected;
     }
 
     private static string RecommendationIdentityKey(AIrhythmRecommendation item)
@@ -404,6 +385,14 @@ internal static partial class AIrhythmRecommendationEngine
         public IReadOnlyDictionary<AIrhythmLocalWorkAliasKey, string> WorkAliases { get; }
         public IReadOnlyDictionary<string, string> ExternalCanonicalTitles { get; }
         public IReadOnlyDictionary<string, string> NormalizationPromotions { get; }
+        // Current-snapshot independent EPG corroboration. Never stored as a learned user preference.
+        // Only an unambiguous repeated broadcast classification can correct contradictory stored history.
+        internal IReadOnlyDictionary<BroadcastGenreEvidenceKey, string> CorroboratedWorkGenres { get; set; }
+            = new Dictionary<BroadcastGenreEvidenceKey, string>();
+        // Read-only, service-scoped historical Work genre. Built once and shared
+        // by every consumer of the canonical evidence facts.
+        internal IReadOnlyDictionary<HistoricalWorkGenreKey, HistoricalWorkGenreAssessment> HistoricalWorkGenres { get; set; }
+            = new Dictionary<HistoricalWorkGenreKey, HistoricalWorkGenreAssessment>();
 
         // 保存・読込 — Build() creates one identity context per immutable runtime snapshot. Cache canonical facts by
         // DTO reference so Score / charts / discovery / search share the exact same canonical result instead of
@@ -419,6 +408,13 @@ internal static partial class AIrhythmRecommendationEngine
         // name occurs across services/dates; never cache service-dependent work decisions.
         internal Dictionary<string, string[]> TitleTokens { get; } = new(StringComparer.Ordinal);
         internal Dictionary<string, string> PromotionLookupKeys { get; } = new(StringComparer.Ordinal);
+        // Same title, same broadcast form/explicit-genre evidence for the life of this snapshot.
+        // The context is discarded on refresh, so no global unbounded title cache is retained.
+        internal Dictionary<string, BroadcastTitleEvidence> BroadcastTitles { get; } = new(StringComparer.Ordinal);
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        internal int BroadcastTitleHits { get; set; }
+        internal int BroadcastTitleMisses { get; set; }
+#endif
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         internal int TitleTokenCacheHits { get; set; }
         internal int TitleTokenCacheMisses { get; set; }

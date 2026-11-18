@@ -25,6 +25,11 @@ internal static partial class AIrhythmDataState
                 return new(false, picked.Message ?? "保存先を選択できませんでした");
 
             var payload = CapturePersistentStorage(context);
+            // A backup must represent one stable set of values. A second complete read catches
+            // concurrent updates or disappearing keys, instead of emitting a valid hash of a
+            // partial, internally inconsistent capture.
+            if (!SamePersistentStorage(payload, CapturePersistentStorage(context)))
+                throw new InvalidOperationException("Persistent storage changed during backup capture");
             var payloadJson = JsonSerializer.Serialize(payload, JsonOptions);
             var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payloadJson))).ToLowerInvariant();
             var envelope = new AIrhythmBackupEnvelope(
@@ -149,8 +154,8 @@ internal static partial class AIrhythmDataState
             var emptyCalibration = JsonSerializer.Serialize(new AIrhythmEvidenceCalibrationState(
                 EvidenceCalibrationSchemaVersion, 0, resetAt, Array.Empty<string>(),
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), JsonOptions);
-            var zeroUsage = JsonSerializer.Serialize(new AIrhythmUsageCounterState(0, 0, Version: 2, RecordingAccountingStart: resetAt,
-                CountedRecordingKeys: Array.Empty<string>()), JsonOptions);
+            var zeroUsage = JsonSerializer.Serialize(new AIrhythmUsageCounterState(0, 0, Version: 3, RecordingAccountingStart: resetAt,
+                CountedRecordingKeys: Array.Empty<string>(), CountedReservationKeys: Array.Empty<string>()), JsonOptions);
             var marker = JsonSerializer.Serialize(new AIrhythmDataResetMarker(resetAt), JsonOptions);
 
             foreach (var storageNamespace in new[] { RecordingFactStorageNamespace, RecoveryAttemptStorageNamespace, RecoveryLookupStorageNamespace, NormalizationLearnerStorageNamespace, NormalizationPromotionStorageNamespace })
@@ -239,9 +244,10 @@ internal static partial class AIrhythmDataState
     {
         foreach (var key in keys)
         {
+            if (!context.Storage.Exists(storageNamespace, key)) continue;
             var result = context.Storage.Get(storageNamespace, key);
             if (!result.Succeeded || result.Value?.Value is null)
-                continue;
+                throw new InvalidOperationException("Stored backup item could not be read");
             if (!target.TryGetValue(storageNamespace, out var bucket))
                 target[storageNamespace] = bucket = new Dictionary<string, string>(StringComparer.Ordinal);
             bucket[key] = result.Value.Value.ToString() ?? string.Empty;
@@ -311,14 +317,38 @@ internal static partial class AIrhythmDataState
                         throw new InvalidOperationException($"write:{storageNamespace}/{item.Key}");
                 }
             }
+            // A completed write is not enough: verify the complete set, not merely each JSON's hash.
+            if (!SamePersistentStorage(CapturePersistentStorage(context), desired))
+                throw new InvalidOperationException("Restored storage did not match the backup");
             return true;
         }
         catch
         {
-            try { RestoreStorageSnapshot(context, before); } catch { }
-            error = "復元中に保存データを書き換えられなかったため、元の状態へ戻しました";
+            var rolledBack = false;
+            try
+            {
+                RestoreStorageSnapshot(context, before);
+                rolledBack = SamePersistentStorage(CapturePersistentStorage(context), before);
+            }
+            catch { }
+            error = rolledBack ? "復元できなかったため元のデータを保持しました"
+                : "復元できませんでした。保存データを確認してください";
             return false;
         }
+    }
+
+    private static bool SamePersistentStorage(AIrhythmBackupPayload left, AIrhythmBackupPayload right)
+    {
+        if (left.Storage.Count != right.Storage.Count) return false;
+        foreach (var source in left.Storage)
+        {
+            if (!right.Storage.TryGetValue(source.Key, out var other)
+                || source.Value.Count != other.Count) return false;
+            foreach (var entry in source.Value)
+                if (!other.TryGetValue(entry.Key, out var value)
+                    || !string.Equals(entry.Value, value, StringComparison.Ordinal)) return false;
+        }
+        return true;
     }
 
     private static void RestoreStorageSnapshot(ITvAirPluginRuntimeContext context, AIrhythmBackupPayload snapshot)
@@ -338,11 +368,13 @@ internal static partial class AIrhythmDataState
                     _ => new[] { DataResetCutoffStorageKey }.Where(key => context.Storage.Exists(storageNamespace, key))
                 };
             foreach (var key in currentKeys.ToArray())
-                context.Storage.Delete(storageNamespace, key, expectedRevision: null);
+                if (!context.Storage.Delete(storageNamespace, key, expectedRevision: null).Succeeded)
+                    throw new InvalidOperationException("Original storage cannot be restored");
             if (!snapshot.Storage.TryGetValue(storageNamespace, out var bucket))
                 continue;
             foreach (var item in bucket)
-                context.Storage.Set(storageNamespace, item.Key, item.Value, expectedRevision: null);
+                if (!context.Storage.Set(storageNamespace, item.Key, item.Value, expectedRevision: null).Succeeded)
+                    throw new InvalidOperationException("Original storage cannot be restored");
         }
     }
 
@@ -361,9 +393,10 @@ internal static partial class AIrhythmDataState
             _usageTotalsDirty = false;
             _lastManualExternalRefreshDate = null;
             _lastManualExternalRefreshDateLoaded = false;
-            UsageRecentReservationIds.Clear();
-            UsageRecentReservationOrder.Clear();
             UsageCountedRecordingKeys.Clear();
+            UsageCountedReservationKeys.Clear();
+            _verifiedReservationHistory = Array.Empty<TvAirReservationDto>();
+            _verifiedReservationHistoryLoaded = false;
             _usageRecordingAccountingStart = default;
             _usageRecordingLedgerRevision = 0;
             RecordingFacts.Clear();

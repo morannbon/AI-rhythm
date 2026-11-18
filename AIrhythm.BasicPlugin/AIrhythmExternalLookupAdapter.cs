@@ -88,18 +88,6 @@ internal static class AIrhythmExternalLookupAdapter
             return new ProviderRefreshState(this, now >= CooldownUntilAt, RequestBudgetPerRefresh);
         }
 
-        internal void StopAndEnterCooldown(ProviderRefreshState refreshState)
-        {
-            if (!ReferenceEquals(refreshState.Provider, this))
-                throw new InvalidOperationException("External lookup refresh state/provider mismatch.");
-
-            var now = DateTimeOffset.UtcNow;
-            refreshState.Stop();
-            CooldownUntilAt = now + RateLimitCooldown;
-            if (CooldownUntilAt > NextAllowedAt)
-                NextAllowedAt = CooldownUntilAt;
-        }
-
         internal async Task<AIrhythmExternalEvidenceResult> ExecuteAsync(
             ProviderRefreshState refreshState,
             ITvAirPluginRuntimeContext context,

@@ -2,17 +2,7 @@ namespace AIrhythm.BasicPlugin;
 
 internal static partial class AIrhythmRecommendationEngine
 {
-    private static readonly IReadOnlyDictionary<string, string> ContributorRoleMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-    {
-        ["出演"] = "cast", ["出演者"] = "cast", ["キャスト"] = "cast", ["主演"] = "cast",
-        ["声の出演"] = "voice", ["声優"] = "voice",
-        ["司会"] = "host", ["mc"] = "host", ["ＭＣ"] = "host", ["ゲスト"] = "guest",
-        ["解説"] = "commentator", ["実況"] = "commentator",
-        ["原作"] = "author", ["原作者"] = "author",
-        ["監督"] = "director", ["脚本"] = "writer", ["演出"] = "director",
-        ["プロデューサー"] = "producer", ["制作"] = "production", ["製作"] = "production",
-        ["音楽"] = "music", ["アーティスト"] = "artist", ["歌"] = "artist"
-    };
+    private static readonly IReadOnlyDictionary<string, string> ContributorRoleMap = AIrhythmText.ContributorRoleMap;
     private static readonly Regex ContributorMetadataRegex = new(
         $@"(?:^|[\r\n;；])\s*(?<role>{string.Join("|", ContributorRoleMap.Keys.OrderByDescending(x => x.Length).Select(Regex.Escape))})\s*[:：]\s*(?<value>[^\r\n;；]+)",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
@@ -21,9 +11,6 @@ internal static partial class AIrhythmRecommendationEngine
     private static readonly Regex ContributorNestedRolePrefixRegex = new(
         $@"^\s*(?:{string.Join("|", ContributorRoleMap.Keys.OrderByDescending(x => x.Length).Select(Regex.Escape))})\s*[:：]?\s*",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
-    private static readonly HashSet<string> ContributorNonEntityTokens = new(
-        ContributorRoleMap.Keys.Concat(new[] { "MC", "ＭＣ", "出演", "出演者", "キャスト", "主演", "声の出演", "声優", "司会", "ゲスト", "解説", "実況", "原作", "原作者", "監督", "脚本", "演出", "プロデューサー", "制作", "製作", "音楽", "アーティスト", "歌", "スケーター", "選手", "アナウンサー", "ほか", "他", "ほか多数", "その他" }),
-        StringComparer.OrdinalIgnoreCase);
     // 作品識別 — Precompute identity-normalized role labels once, in the original longest-first order.
     // Contributor normalization runs for every candidate; sorting and Unicode normalization on each credit
     // allocates without adding any evidence.
@@ -31,8 +18,6 @@ internal static partial class AIrhythmRecommendationEngine
         .OrderByDescending(x => x.Length)
         .Select(ContributorEntityKey)
         .ToArray();
-    private static readonly HashSet<string> ContributorCompactNonEntityTokens = new(
-        ContributorNonEntityTokens.Select(ContributorEntityKey), StringComparer.OrdinalIgnoreCase);
     private static readonly object ScoreResultCacheGate = new();
     private static AIrhythmRuntimeSnapshot? CachedScoreSnapshot;
     private static long CachedScoreExternalEvidenceGeneration = -1;
@@ -53,6 +38,7 @@ internal static partial class AIrhythmRecommendationEngine
         ushort NetworkId,
         ushort TransportStreamId,
         ushort ServiceId,
+        string ServiceName,
         string ReservationId,
         string RecordingId,
         long ScheduledStartUtcTicks,
@@ -132,6 +118,7 @@ internal static partial class AIrhythmRecommendationEngine
             item.NetworkId,
             item.TransportStreamId,
             item.ServiceId,
+            item.ServiceName ?? string.Empty,
             item.ReservationId ?? string.Empty,
             item.RecordingId ?? string.Empty,
             item.ScheduledStartTime.UtcDateTime.Ticks,
@@ -145,6 +132,7 @@ internal static partial class AIrhythmRecommendationEngine
             && signature.NetworkId == item.NetworkId
             && signature.TransportStreamId == item.TransportStreamId
             && signature.ServiceId == item.ServiceId
+            && string.Equals(signature.ServiceName, item.ServiceName ?? string.Empty, StringComparison.Ordinal)
             && string.Equals(signature.ReservationId, item.ReservationId ?? string.Empty, StringComparison.Ordinal)
             && string.Equals(signature.RecordingId, item.RecordingId ?? string.Empty, StringComparison.Ordinal)
             && signature.ScheduledStartUtcTicks == item.ScheduledStartTime.UtcDateTime.Ticks
@@ -201,8 +189,18 @@ internal static partial class AIrhythmRecommendationEngine
         LogNormalizationLearnerDisplayedRecognition(recommendations, normalizationLearnerShadow);
 #endif
         var recommendationDiscoveryPool = recommendationEligible
-            .Where(x => x.IsConvincing || x.IsPlausibleDiscovery)
+            .Where(x => x.EvidenceRelevance > 0.0d)
             .ToArray();
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        static string Distribution(IEnumerable<AIrhythmRecommendation> population)
+            => string.Join(",", population.Select(x => RecommendationGenreFamily(x.Genre))
+                .Where(g => g.Length > 0)
+                .GroupBy(g => g, StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(g => g.Count()).ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(g => $"{g.Key}:{g.Count()}"));
+        AIrhythmDataState.WriteDeveloperLog(
+            $"DISCOVERY_ADMISSION_GENRE_AUDIT scored={recommendationEligible.Length} admitted={recommendationDiscoveryPool.Length} admittedGenres=[{Distribution(recommendationDiscoveryPool)}] allScoredGenres=[{Distribution(recommendationEligible)}] meanRelevance={recommendationDiscoveryPool.Select(x => x.EvidenceRelevance).DefaultIfEmpty(0.0d).Average():0.000} provenance=canonical_scored_genre decision=continuous_independent_behavior_evidence scoreMutation=inside_common_scoring preferenceMutation=False");
+#endif
         var cards = string.Join(string.Empty, recommendations.Select(item => RenderCard(context, item, snapshot)));
         var charts = BuildCharts(snapshot, identityContext);
         var discovery = BuildDiscovery(context, snapshot, recommendationEligible, recommendationDiscoveryPool, identityContext);
@@ -215,6 +213,7 @@ internal static partial class AIrhythmRecommendationEngine
             : AIrhythmHtml.Encode(snapshot.Error);
 #if AIRHYTHM_DEVELOPER_DIAGNOSTICS
         AIrhythmDataState.WriteDeveloperLog($"CANONICAL_FACT_CACHE hits={identityContext.CanonicalFactsHits} misses={identityContext.CanonicalFactsMisses} programCached={identityContext.ProgramFactsCount} reservationCached={identityContext.ReservationFactsCount} historyCached={identityContext.HistoryFactsCount} scope=single_render_snapshot semantics=unchanged");
+        AIrhythmDataState.WriteDeveloperLog($"BROADCAST_TITLE_EVIDENCE_CACHE hits={identityContext.BroadcastTitleHits} misses={identityContext.BroadcastTitleMisses} cached={identityContext.BroadcastTitles.Count} scope=single_render_snapshot provenance=title_only evidenceDecision=per_broadcast semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog($"LOCAL_WORK_KEY_CACHE hits={identityContext.LocalWorkKeyCacheHits} misses={identityContext.LocalWorkKeyCacheMisses} cached={identityContext.LocalWorkKeys.Count} scope=single_render_snapshot key=title_shared_except_trailing_parenthesis_service_scope semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog($"LOCAL_WORK_KEY_ALLOCATION_DETAIL canonicalHits={identityContext.CanonicalLocalWorkKeyHitCalls} canonicalHitBytes={identityContext.CanonicalLocalWorkKeyHitBytes} canonicalMisses={identityContext.CanonicalLocalWorkKeyMissCalls} canonicalMissBytes={identityContext.CanonicalLocalWorkKeyMissBytes} canonicalTotalBytes={identityContext.CanonicalLocalWorkKeyHitBytes + identityContext.CanonicalLocalWorkKeyMissBytes} scope=canonical_facts_across_render_snapshot allocationScope=current_thread_exact measurement=existing_outer_probe_no_extra_gc_probe cacheBranch=miss_counter_delta semantics=unchanged");
         AIrhythmDataState.WriteDeveloperLog($"LOCAL_EPISODE_IDENTITY_CACHE hits={identityContext.LocalEpisodeIdentityCacheHits} misses={identityContext.LocalEpisodeIdentityCacheMisses} cached={identityContext.LocalEpisodeIdentities.Count} scope=single_render_snapshot key=title_plus_service negativeResultsCached=True continuityTimeComparisonCached=False semantics=unchanged");
@@ -1754,7 +1753,10 @@ internal static partial class AIrhythmRecommendationEngine
 
     private static string NormalizationLearnerComparableTitle(string value)
     {
-        var normalized = value.Normalize(NormalizationForm.FormKC);
+        // The learner may retain the source EPG title for audit, but it must
+        // learn the aired work rather than a separately advertised title.
+        // This is the same boundary used by the production Work authority.
+        var normalized = AiredTitleEvidenceText(value).Normalize(NormalizationForm.FormKC);
         normalized = StripNonIdentityBroadcastAnnotations(normalized);
         normalized = Regex.Replace(normalized, @"\s+", " ").Trim();
         normalized = Regex.Replace(normalized, @"\s*[（(]\s*(?:月|火|水|木|金|土|日)\s*[）)]\s*$", " ").Trim();
@@ -1794,7 +1796,7 @@ internal static partial class AIrhythmRecommendationEngine
     }
 
     private static string SnapLearnerBoundary(string value)
-        => value.Trim().TrimEnd('・', '･', '-', '－', '―', '—', ':', '：', '/', '／', '|', '｜', '▼', '▽', '▶', '►', '>', '＞', '「', '『', '【', '(', '（', '#', '＃');
+        => value.Trim().TrimEnd('・', '･', '-', '－', '―', '—', ':', '：', '/', '／', '|', '｜', '▼', '▽', '▶', '►', '>', '＞', '「', '『', '【', '(', '（', '#', '＃', '♯');
 
     private static double LearnerBoundaryQuality(string[] matches, string core, int matchIndex)
         => matches.Length == 0 ? 0.0d : matches.Average(title => LearnerBoundaryQuality(title, matchIndex, core.Length));

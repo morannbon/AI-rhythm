@@ -91,7 +91,7 @@ internal static partial class AIrhythmDataState
         // marker is more likely an episode subtitle and is deliberately not extracted (avoids short
         // subtitle-only lookups such as "約束").
         var episodeMarker = Regex.Match(normalized,
-            @"(?:[#＃]\s*[0-9０-９]+(?:\s*[-~〜～]\s*[0-9０-９]+)?|(?:第\s*)?[0-9０-９]+\s*(?:話|回)|(?:episode|ep\.?)\s*[0-9０-９]+)",
+            @"(?:[#＃♯]\s*[0-9０-９]+(?:\s*[-~〜～]\s*[0-9０-９]+)?|(?:第\s*)?[0-9０-９]+\s*(?:話|回)|(?:episode|ep\.?)\s*[0-9０-９]+)",
             RegexOptions.IgnoreCase);
         var quotedWork = Regex.Match(normalized, @"[「『]([^」』]{2,80})[」』]");
         var work = quotedWork.Success && episodeMarker.Success && quotedWork.Index < episodeMarker.Index
@@ -101,10 +101,10 @@ internal static partial class AIrhythmDataState
         // 作品識別 — A bracketed block immediately before a deterministic episode marker behaves like an episode
         // subtitle instead of the Work. Strip only in that positional structure.
         work = Regex.Replace(work,
-            @"(?:\s|　)*【[^【】]{2,100}】(?=(?:\s|　)*(?:[#＃]\s*[0-9０-９]+|(?:第\s*)?[0-9０-９]+\s*(?:話|回)|(?:episode|ep\.?)\s*[0-9０-９]+))",
+            @"(?:\s|　)*【[^【】]{2,100}】(?=(?:\s|　)*(?:[#＃♯]\s*[0-9０-９]+|(?:第\s*)?[0-9０-９]+\s*(?:話|回)|(?:episode|ep\.?)\s*[0-9０-９]+))",
             string.Empty, RegexOptions.IgnoreCase).Trim();
         work = Regex.Replace(work,
-            @"(?:\s|　)*(?:[#＃]\s*[0-9０-９]+(?:\s*[-~〜～]\s*[0-9０-９]+)?|(?:第\s*)?[0-9０-９]+\s*(?:話|回)|(?:episode|ep\.?)\s*[0-9０-９]+)(?:\s*[/／].*)?$",
+            @"(?:\s|　)*(?:[#＃♯]\s*[0-9０-９]+(?:\s*[-~〜～]\s*[0-9０-９]+)?|(?:第\s*)?[0-9０-９]+\s*(?:話|回)|(?:episode|ep\.?)\s*[0-9０-９]+)(?:\s*[/／].*)?$",
             string.Empty, RegexOptions.IgnoreCase).Trim();
 
         // 作品識別 — A leading broadcast container is not the work identity when a usable work candidate is already

@@ -588,7 +588,8 @@ internal static partial class AIrhythmRecommendationEngine
             x.NetworkId == identity.NetworkId &&
             x.TransportStreamId == identity.TransportStreamId &&
             x.ServiceId == identity.ServiceId &&
-            x.EventNumber == identity.EventNumber);
+            x.EventNumber == identity.EventNumber &&
+            x.Start == identity.Start);
         if (program is null || program.End <= now)
             return string.Empty;
 
@@ -597,9 +598,10 @@ internal static partial class AIrhythmRecommendationEngine
             x.TransportStreamId == identity.TransportStreamId &&
             x.ServiceId == identity.ServiceId &&
             x.EventNumber == identity.EventNumber &&
+            (x.ScheduledStart ?? x.Start) == identity.Start &&
             !ContainsAny($"{x.Status} {x.Source} {x.Route}", "cancel", "removed", "取消", "削除"));
         var css = compact ? "reserve-button reserve-button-compact" : "reserve-button";
-        var reservationKey = $"{identity.NetworkId}:{identity.TransportStreamId}:{identity.ServiceId}:{identity.EventNumber}";
+        var reservationKey = $"{identity.NetworkId}:{identity.TransportStreamId}:{identity.ServiceId}:{identity.EventNumber}:{identity.Start.UtcDateTime.Ticks}";
         if (reservation is not null)
         {
             var state = $"{reservation.Status} {reservation.Source} {reservation.Route}";

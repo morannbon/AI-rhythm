@@ -174,27 +174,6 @@
       "fallback": "selected-bg"
     },
     {
-      "name": "selected-hover-bg",
-      "keys": [
-        "selectedHoverBackground"
-      ],
-      "fallback": "selected-bg"
-    },
-    {
-      "name": "selected-hover-text",
-      "keys": [
-        "selectedHoverText"
-      ],
-      "fallback": "selected-text"
-    },
-    {
-      "name": "selected-hover-border",
-      "keys": [
-        "selectedHoverBorder"
-      ],
-      "fallback": "selected-border"
-    },
-    {
       "name": "disabled-bg",
       "keys": [
         "disabledBackground"
@@ -380,14 +359,11 @@
     "viz-red": "#ef4444",
     "viz-red-line": "#ef444466",
     "viz-pink": "#ec4899",
-    "viz-blue2": "#3b82f6",
     "viz-green2": "#22c55e",
     "viz-teal": "#5ad8a6",
     "summary-blue": "#60a5fa55",
     "summary-purple": "#a78bfa22",
     "summary-green": "#34d39955",
-    "summary-cyan": "#22d3ee22",
-    "summary-orange": "#f59e0b55",
-    "summary-red": "#fb718522"
+    "summary-cyan": "#22d3ee22"
   }
 }

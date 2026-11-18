@@ -122,7 +122,7 @@ internal static partial class AIrhythmRecommendationEngine
             .GroupBy(x => x)
             .ToDictionary(x => x.Key, x => x.Count());
         var maxServiceCount = Math.Max(1, serviceCounts.Values.DefaultIfEmpty(0).Max());
-        var genreCounts = preferenceRecordings.Select(x => NormalizeGenre(x.Genre))
+        var genreCounts = preferenceRecordings.Select(x => RecommendationGenreFamily(CanonicalEvidenceFacts(x, identityContext).GenreKey))
             .Where(x => x.Length > 0)
             .GroupBy(x => x, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
@@ -138,21 +138,20 @@ internal static partial class AIrhythmRecommendationEngine
 
         double GenreNovelty(AIrhythmRecommendation item)
         {
-            var genre = NormalizeGenre(item.Genre);
+            var genre = CandidateGenre(item);
             if (genre.Length == 0 || !genreCounts.TryGetValue(genre, out var count)) return 0.75d;
             return Math.Clamp(1.0d - Math.Sqrt((double)count / maxGenreCount), 0.0d, 1.0d);
         }
 
         double Plausibility(AIrhythmRecommendation item)
         {
-            // 推薦・学習 — Discovery combines learned affinity with current evidence; rendering never teaches.
-            var legacyEvidence = Math.Clamp((item.RawScore - 8.0d) / 62.0d, 0.0d, 1.0d);
-            if (item.IsConvincing) legacyEvidence = Math.Max(legacyEvidence, 0.65d);
-            else if (item.IsPlausibleDiscovery) legacyEvidence = Math.Max(legacyEvidence, 0.40d);
+            // 推薦・学習 — The discovery shelves inherit the same continuously assessed
+            // evidence as main scoring. Learned preference gains influence with maturity;
+            // no binary score/pseudo-confidence floors are inserted here.
             var maturity = Math.Clamp(item.LearnedUserModelMaturity, 0.0d, 1.0d);
             return Math.Clamp(
                 item.LearnedUserAffinity * maturity
-                + legacyEvidence * (1.0d - maturity),
+                + item.EvidenceRelevance * (1.0d - maturity),
                 0.0d,
                 1.0d);
         }
@@ -239,6 +238,16 @@ internal static partial class AIrhythmRecommendationEngine
                 ? $"{item.EventIdentity.NetworkId}:{item.EventIdentity.TransportStreamId}:{item.EventIdentity.ServiceId}:{item.EventIdentity.EventNumber}:{item.EventIdentity.Start.UtcDateTime.Ticks}"
                 : $"{item.SeriesKey}|{item.ServiceName}|{item.Start.UtcDateTime.Ticks}|{item.Title}";
 
+        // The same canonical genre is shared by novelty, semantic distance and diagnostics.
+        // A reference-keyed render cache avoids creating an additional semantic key on each greedy round.
+        var candidateGenres = new Dictionary<AIrhythmRecommendation, string>(ReferenceEqualityComparer.Instance);
+        string CandidateGenre(AIrhythmRecommendation item)
+        {
+            if (candidateGenres.TryGetValue(item, out var genre)) return genre;
+            genre = RecommendationGenreFamily(item.Genre);
+            candidateGenres.Add(item, genre);
+            return genre;
+        }
         var semanticCache = new Dictionary<string, (string Work, string Genre, string Service, HashSet<string> Terms)>(StringComparer.Ordinal);
         (string Work, string Genre, string Service, HashSet<string> Terms) SemanticFeatures(AIrhythmRecommendation item)
         {
@@ -247,7 +256,7 @@ internal static partial class AIrhythmRecommendationEngine
                 return cached;
             var features = (
                 Work: item.SeriesKey ?? string.Empty,
-                Genre: NormalizeGenre(item.Genre),
+                Genre: CandidateGenre(item),
                 Service: (item.ServiceName ?? string.Empty).Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant(),
                 Terms: Tokens($"{item.SeriesKey} {AiredTitleEvidenceText(item.Title)}").Distinct(StringComparer.OrdinalIgnoreCase).ToHashSet(StringComparer.OrdinalIgnoreCase));
             semanticCache[key] = features;
@@ -319,8 +328,8 @@ internal static partial class AIrhythmRecommendationEngine
                 pageMaxSimilarities.Add(candidate, maximum);
             }
             var maturity = remaining.Select(x => x.LearnedUserModelMaturity).DefaultIfEmpty(0.0d).Average();
-            // 推薦・学習 — More evidence allows the model to spend more of its utility budget on coverage instead of
-            // repeatedly taking the nearest neighbour of an already-known preference cluster.
+            // Selection uses the established shelf and page semantic-distance objectives.
+            // Genre is measured from the canonical source but is not an artificial quota or multiplier.
             var shelfRedundancyWeight = 0.20d + 0.25d * Math.Clamp(maturity, 0.0d, 1.0d);
             var pageRedundancyWeight = 0.08d + 0.17d * Math.Clamp(maturity, 0.0d, 1.0d);
 
@@ -416,9 +425,7 @@ internal static partial class AIrhythmRecommendationEngine
         // selecting any shelf. Recaps and replays remain eligible; the broader scored population remains
         // available for user search.
         var firstSeenPool = discoveryAxisRows
-            .Where(x => x.Axes.Knownness <= 0.10d)
-            .Where(x => x.Axes.Novelty >= 0.60d)
-            .Where(x => x.Axes.Plausibility >= 0.20d)
+            .Where(x => x.Axes.Knownness == 0.0d)
             .Select(x => x.Item)
             .ToArray();
         var firstSeenItems = SelectLearnedSet("first_seen", firstSeenPool, FirstSeenObjective, 6);
@@ -432,9 +439,7 @@ internal static partial class AIrhythmRecommendationEngine
 
         var surprisePool = discoveryAxisRows
             .Where(x => x.Item.EventIdentity is null || !firstSeenIdentities.Contains(x.Item.EventIdentity))
-            .Where(x => x.Axes.Knownness <= 0.45d)
-            .Where(x => x.Axes.Novelty >= 0.58d)
-            .Where(x => x.Axes.Plausibility >= 0.28d)
+            .Where(x => x.Axes.Knownness < 1.0d)
             .Select(x => x.Item)
             .ToArray();
         var surpriseItems = SelectLearnedSet("surprise", surprisePool, SurpriseObjective, 6);
@@ -462,42 +467,40 @@ internal static partial class AIrhythmRecommendationEngine
             ("first_seen", firstSeen), ("surprise", surprise)
         };
         var qualityTotal = 0;
-        var qualityWeakPlausibility = 0;
         var qualityNoReasons = 0;
         var qualityRepeatedWorks = 0;
+        var qualityConfidenceSum = 0.0d;
+        var qualityRelevanceSum = 0.0d;
         var qualitySeenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var qualityWeakReasons = new List<string>();
         foreach (var group in qualityShelves)
         {
-            var groupBelowThreshold = 0;
+            var shelfConfidence = 0.0d;
+            var shelfRelevance = 0.0d;
             foreach (var item in group.Items)
             {
                 var axes = DiscoveryAxes(item);
-                var minimumPlausibility = group.Name == "first_seen" ? 0.20d : group.Name == "surprise" ? 0.28d : 0.0d;
-                var belowGate = minimumPlausibility > 0.0d && axes.Plausibility + 0.0000001d < minimumPlausibility;
-                if (belowGate) { qualityWeakPlausibility++; groupBelowThreshold++; }
                 if (item.Reasons.Count == 0) qualityNoReasons++;
                 if (!string.IsNullOrWhiteSpace(item.SeriesKey) && !qualitySeenKeys.Add(item.SeriesKey)) qualityRepeatedWorks++;
                 qualityTotal++;
-                // 処理条件 — The real card reasons are reported alongside the model axes so a reviewer can distinguish
-                // explainable behavior from merely high novelty or generic fallback text.
+                shelfConfidence += item.EvidenceConfidence;
+                shelfRelevance += item.EvidenceRelevance;
+                qualityConfidenceSum += item.EvidenceConfidence;
+                qualityRelevanceSum += item.EvidenceRelevance;
                 AIrhythmDataState.WriteDeveloperLog(
-                    $"RECOMMENDATION_QUALITY_SAMPLE shelf={group.Name} station={item.ServiceName} title={item.Title} start={item.Start:yyyy-MM-ddTHH:mm:sszzz} work={item.SeriesKey} knownness={axes.Knownness:0.000} novelty={axes.Novelty:0.000} plausibility={axes.Plausibility:0.000} affinity={item.LearnedUserAffinity:0.000} score={item.Score} reasons=[{string.Join(" / ", item.Reasons.Take(2))}] discoveryBelowGate={belowGate} observationOnly=True");
-                if (belowGate && qualityWeakReasons.Count < 6)
-                    qualityWeakReasons.Add($"{group.Name}:{item.ServiceName}/{item.Title}");
+                    $"RECOMMENDATION_QUALITY_SAMPLE shelf={group.Name} station={item.ServiceName} title={item.Title} start={item.Start:yyyy-MM-ddTHH:mm:sszzz} work={item.SeriesKey} knownness={axes.Knownness:0.000} novelty={axes.Novelty:0.000} plausibility={axes.Plausibility:0.000} evidenceConfidence={item.EvidenceConfidence:0.000} evidenceRelevance={item.EvidenceRelevance:0.000} affinity={item.LearnedUserAffinity:0.000} score={item.Score} reasons=[{string.Join(" / ", item.Reasons.Take(2))}] observationOnly=True");
             }
             AIrhythmDataState.WriteDeveloperLog(
-                $"RECOMMENDATION_QUALITY_SHELF shelf={group.Name} selected={group.Items.Count} belowPlausibilityGate={groupBelowThreshold} model=real_selected_cards observationOnly=True");
+                $"RECOMMENDATION_QUALITY_SHELF shelf={group.Name} selected={group.Items.Count} meanConfidence={(group.Items.Count == 0 ? 0.0d : shelfConfidence / group.Items.Count):0.000} meanRelevance={(group.Items.Count == 0 ? 0.0d : shelfRelevance / group.Items.Count):0.000} model=continuous_evidence_actual_cards observationOnly=True");
         }
         AIrhythmDataState.WriteDeveloperLog(
-            $"RECOMMENDATION_QUALITY_SUMMARY selected={qualityTotal} uniqueWorks={qualitySeenKeys.Count} repeatedWorks={qualityRepeatedWorks} missingCardReasons={qualityNoReasons} discoveryBelowPlausibilityGate={qualityWeakPlausibility} weakSamples=[{string.Join(";", qualityWeakReasons)}] criteria=actual_selection_reason_trace_and_discovery_guardrails outcome=requires_human_relevance_review scoreMutation=False storageMutation=False");
+            $"RECOMMENDATION_QUALITY_SUMMARY selected={qualityTotal} uniqueWorks={qualitySeenKeys.Count} repeatedWorks={qualityRepeatedWorks} missingCardReasons={qualityNoReasons} meanConfidence={(qualityTotal == 0 ? 0.0d : qualityConfidenceSum / qualityTotal):0.000} meanRelevance={(qualityTotal == 0 ? 0.0d : qualityRelevanceSum / qualityTotal):0.000} criteria=behavioral_confidence_without_discovery_quality_threshold outcome=requires_human_relevance_review scoreMutation=False storageMutation=False");
         var learnedPage = pageLearnedSelections.ToArray();
         var pairSimilarities = new List<double>();
         for (var i = 0; i < learnedPage.Length; i++)
         for (var j = i + 1; j < learnedPage.Length; j++)
             pairSimilarities.Add(SemanticSimilarity(learnedPage[i], learnedPage[j]));
         var uniquePageWorks = learnedPage.Select(x => x.SeriesKey).Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).Count();
-        var uniquePageGenres = learnedPage.Select(x => NormalizeGenre(x.Genre)).Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+        var uniquePageGenres = learnedPage.Select(CandidateGenre).Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).Count();
         var uniquePageServices = learnedPage.Select(x => x.ServiceName).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).Count();
         AIrhythmDataState.WriteDeveloperLog(
             $"AI_PAGE_SET_MODEL_SUMMARY selected={learnedPage.Length} uniqueWorks={uniquePageWorks} uniqueGenres={uniquePageGenres} uniqueServices={uniquePageServices} meanPairSimilarity={pairSimilarities.DefaultIfEmpty(0.0d).Average():0.000} maxPairSimilarity={pairSimilarities.DefaultIfEmpty(0.0d).Max():0.000} meanLearnedAffinity={learnedPage.Select(x => x.LearnedUserAffinity).DefaultIfEmpty(0.0d).Average():0.000} objective=shelf_specific_learned_utility_x_semantic_marginal_value features=work+genre+terms+service modelMaturity={learnedPage.Select(x => x.LearnedUserModelMaturity).DefaultIfEmpty(0.0d).Max():0.000} renderingDoesNotTeach=True titleSpecificRules=False");
@@ -528,53 +531,110 @@ internal static partial class AIrhythmRecommendationEngine
             .Select(x => new AIrhythmRecommendation(x.ProgramTitle, x.ServiceName, string.Empty, "録画中", x.Start, 0, new[] { $"{x.TunerName}で録画中", $"終了予定 {x.ScheduledEnd:HH:mm}" }, CanonicalWorkKey(x.ProgramTitle, new AIrhythmServiceIdentity(x.NetworkId, x.TransportStreamId, x.ServiceId), identityContext), null))
             .Take(6).ToArray();
 
-        var qualityIssues = snapshot.RecoveryHistory
-            .Where(x => x.ResultFinalized)
-            .Where(x => IsRecordingFailure(x)
-                || (x.QualityDataAvailable && ((x.DropCount ?? 0) > 0 || (x.ErrorCount ?? 0) > 0 || (x.ScrambleCount ?? 0) > 0)))
-            .Select(x => new
-            {
-                SeriesKey = CanonicalWorkKey(x, identityContext),
-                Severity = IsRecordingFailure(x) ? long.MaxValue / 4 : QualitySeverity(x),
-                Failure = IsRecordingFailure(x),
-                x.ProgramTitle
-            })
-            .Where(x => x.SeriesKey.Length > 0)
-            .ToArray();
+        // 録画実績・復旧 — This shelf is a factual repair offer, not a preference score or a fuzzy Work search.
+        // Build one immutable occurrence index from admitted quality/failure facts and reuse the canonical
+        // single-episode identity and film-form contract for every past and future programme.
+        var cleanReplacements = new Dictionary<AIrhythmRecoveryBroadcastIdentity, DateTimeOffset>();
+        foreach (var cleanRecording in snapshot.RecoveryCleanHistory ?? Array.Empty<TvAirRecordingHistoryDto>())
+        {
+            if (!AIrhythmRecoveryEvidencePolicy.IsVerifiedClean(cleanRecording)
+                || !TryCanonicalRecoveryBroadcastIdentity(cleanRecording.ProgramTitle, cleanRecording.Genre,
+                    ServiceIdentityOf(cleanRecording), identityContext, out var identity))
+                continue;
+            var started = cleanRecording.ScheduledStartTime == default ? cleanRecording.Start : cleanRecording.ScheduledStartTime;
+            if (!cleanReplacements.TryGetValue(identity, out var latest) || latest < started)
+                cleanReplacements[identity] = started;
+        }
 
-        // 録画実績・復旧 — 取り直し候補は推薦スコア・嗜好学習とは別の録画リカバリー表示。 録画失敗または品質異常の事実と再放送候補の一致だけで提示する。
-        var recovery = allRecommendations
-            .Select(x => new
+        var unresolvedIssues = new Dictionary<AIrhythmRecoveryBroadcastIdentity,
+            (TvAirRecordingHistoryDto Source, DateTimeOffset BroadcastStart, bool Failure, long Severity)>();
+        var rejectedIdentity = 0;
+        var alreadyReplaced = 0;
+        foreach (var source in snapshot.RecoveryHistory)
+        {
+            if (!AIrhythmRecoveryEvidencePolicy.IsDefective(source)) continue;
+            var failed = AIrhythmRecoveryEvidencePolicy.IsFailure(source);
+            if (!TryCanonicalRecoveryBroadcastIdentity(source.ProgramTitle, source.Genre,
+                    ServiceIdentityOf(source), identityContext, out var identity))
             {
-                Item = x,
-                Match = qualityIssues
-                    .Where(q => WorkMatches(q.SeriesKey, x.SeriesKey))
-                    .OrderByDescending(q => string.Equals(q.SeriesKey, x.SeriesKey, StringComparison.OrdinalIgnoreCase))
-                    .ThenByDescending(q => q.Severity)
-                    .FirstOrDefault()
-            })
-            .Where(x => x.Match is not null)
-            .Where(x =>
+                rejectedIdentity++;
+                continue;
+            }
+            var started = source.ScheduledStartTime == default ? source.Start : source.ScheduledStartTime;
+            if (cleanReplacements.TryGetValue(identity, out var latest)
+                && !AIrhythmRecoveryEvidencePolicy.StillUnresolved(started, latest))
             {
-                var text = $"{x.Item.Title} {EventOf(x.Item)?.Summary} {EventOf(x.Item)?.Detail}";
-                return ContainsAny(text, "[再]", "【再】", "再放送", "アンコール", "リピート", "一挙");
-            })
-            .OrderByDescending(x => string.Equals(x.Match!.SeriesKey, x.Item.SeriesKey, StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(x => x.Match!.Severity)
-            .ThenByDescending(x => x.Item.Score)
+                alreadyReplaced++;
+                continue;
+            }
+            var severity = failed ? long.MaxValue / 4 : AIrhythmRecoveryEvidencePolicy.QualitySeverity(source);
+            if (!unresolvedIssues.TryGetValue(identity, out var previous)
+                || started > previous.BroadcastStart
+                || (started == previous.BroadcastStart && severity > previous.Severity))
+                unresolvedIssues[identity] = (source, started, failed, severity);
+        }
+
+        // Match factual recovery against *all* future EPG occurrences. Recommendation scoring,
+        // user exclusions, candidate de-duplication and positive-learning origin are not
+        // allowed to remove the one future episode which is actually repairable.
+        var scoredByEvent = allRecommendations.Where(x => x.EventIdentity is not null)
+            .GroupBy(x => x.EventIdentity!)
+            .ToDictionary(g => g.Key, g => g.First());
+        var candidateMatches = new Dictionary<AIrhythmRecoveryBroadcastIdentity,
+            (AIrhythmRecommendation Item, TvAirRecordingHistoryDto Source, DateTimeOffset BroadcastStart,
+                bool Failure, long Severity)>();
+        foreach (var eventRow in snapshot.Events)
+        {
+            if (!TryCanonicalRecoveryBroadcastIdentity(eventRow.Title, eventRow.Genre,
+                    ServiceIdentityOf(eventRow), identityContext, out var identity)
+                || !unresolvedIssues.TryGetValue(identity, out var issue)
+                || !AIrhythmRecoveryEvidencePolicy.IsLaterFutureBroadcast(issue.BroadcastStart,
+                    eventRow.Start, now))
+                continue;
+            var eventIdentity = EventIdentityOf(eventRow);
+            // A scored presentation may be reused, but is never required for factual recovery.
+            var item = scoredByEvent.TryGetValue(eventIdentity, out var scored)
+                ? scored : new AIrhythmRecommendation(eventRow.Title, eventRow.ServiceName,
+                    string.Empty, CanonicalEvidenceFacts(eventRow, identityContext).GenreKey, eventRow.Start, 0, Array.Empty<string>(),
+                    identity.Work, eventIdentity);
+            var match = (Item: item, Source: issue.Source, BroadcastStart: issue.BroadcastStart,
+                Failure: issue.Failure, Severity: issue.Severity);
+            // One earliest re-airing per unresolved episode; do not let six slots fill with
+            // repeats of the same episode while unrelated failed episodes are hidden.
+            if (!candidateMatches.TryGetValue(identity, out var previous)
+                || item.Start < previous.Item.Start)
+                candidateMatches[identity] = match;
+        }
+        var selectedRecovery = candidateMatches.Values
+            .OrderByDescending(x => x.Failure)
+            .ThenByDescending(x => x.Severity)
             .ThenBy(x => x.Item.Start)
-            .Select(x => x.Item with { Reasons = x.Match!.Failure
-                ? new[] { "録画できなかった番組", "同じ番組の再放送候補" }
-                : new[] { "録画品質に問題があった番組", "同じ番組の再放送候補" } })
             .Take(6)
             .ToArray();
+        var recovery = selectedRecovery
+            .Select(x => x.Item with { Reasons = x.Failure
+                ? new[] { "録画できなかった番組", "同じ放送回を取り直せる候補" }
+                : new[] { "録画品質に問題があった番組", "同じ放送回を取り直せる候補" } })
+            .ToArray();
+#if AIRHYTHM_DEVELOPER_DIAGNOSTICS
+        AIrhythmDataState.WriteDeveloperLog(
+            $"RECOVERY_SHELF_VERIFICATION history={snapshot.RecoveryHistory.Count} unresolved={unresolvedIssues.Count}"
+            + $" identityDeferred={rejectedIdentity} cleanReplacement={alreadyReplaced} candidateMatches={candidateMatches.Count} selected={recovery.Length}"
+            + " policy=canonical_episode_or_exact_film later_broadcast_only fuzzyWork=False learningMutation=False storageMutation=False reservationMutation=False");
+        foreach (var row in selectedRecovery)
+            AIrhythmDataState.WriteDeveloperLog(
+                $"RECOVERY_SHELF_MATCH sourceStation={row.Source.ServiceName} sourceProgramme={row.Source.ProgramTitle}"
+                + $" sourceStart={row.BroadcastStart:yyyy-MM-dd HH:mm} candidateStation={row.Item.ServiceName}"
+                + $" candidateProgramme={row.Item.Title} candidateStart={row.Item.Start:yyyy-MM-dd HH:mm}"
+                + $" cause={(row.Failure ? "failed" : "quality")} evidence=same_broadcast_content");
+#endif
 
         return string.Concat(
             "<div class='discovery-group-heading'><strong>今</strong><span>録画中のもの、今夜の候補</span></div>",
             Shelf("shelf-active", "REC", "いま録画中", "現在進行中の録画セッション", active),
             Shelf("shelf-tonight", "✦", "今夜のおすすめ", "夜6時から翌朝4時までの候補", tonight),
             "<div class='discovery-group-heading'><strong>もう一度</strong><span>再放送や、録画し直せる候補</span></div>",
-            Shelf("shelf-recovery", "FIX", "取り直し候補", "録画できなかった、または品質情報に問題があった番組", recovery),
+            Shelf("shelf-recovery", "FIX", "取り直し候補", "録画できなかった、または品質に問題があった放送回", recovery),
             Shelf("shelf-replay", "↻", "再放送を見つける", "未予約・未録画の再放送候補", replayFinds),
             "<div class='discovery-group-heading'><strong>発見</strong><span>まだ録画していない作品や、いつもと少し違う候補</span></div>",
             Shelf("shelf-first-seen", "NEW", "はじめて見る作品", "未録画・未予約・自動追跡外から見つけた候補", firstSeen),
